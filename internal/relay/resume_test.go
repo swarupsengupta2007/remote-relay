@@ -428,6 +428,147 @@ func TestGlobalBufferBudget(t *testing.T) {
 	_ = c2.inW.Close()
 }
 
+func TestBudgetReleaseWakesExistingSession(t *testing.T) {
+	const bufSize = 8 * 1024
+	destLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer destLn.Close()
+	accepted := make(chan *net.TCPConn, 8)
+	go func() {
+		for {
+			c, err := destLn.Accept()
+			if err != nil {
+				return
+			}
+			accepted <- c.(*net.TCPConn)
+		}
+	}()
+
+	cfg := config.DefaultServer()
+	cfg.ListenTCP = "127.0.0.1:0"
+	cfg.DefaultDestination = destLn.Addr().String()
+	cfg.AllowDestinations = []string{destLn.Addr().String(), "*"}
+	cfg.Transports = []string{"tcp"}
+	cfg.BufferBytes = bufSize
+	cfg.TotalBufferBytes = bufSize + bufSize/2
+	cfg.SendWindow = bufSize
+	cfg.DataChunkBytes = 1024
+	cfg.IdleTimeout = config.Duration(30 * time.Second)
+	cfg.HoldTimeout = config.Duration(15 * time.Second)
+	srv, relayAddr, _ := startRelayCfg(t, cfg)
+
+	type clog struct {
+		inW  *io.PipeWriter
+		outR *io.PipeReader
+		stop context.CancelFunc
+	}
+	startBlocked := func() clog {
+		inR, inW := io.Pipe()
+		outR, outW := io.Pipe()
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		ccfg := config.DefaultClient()
+		ccfg.Server = relayAddr
+		ccfg.Destination = destLn.Addr().String()
+		ccfg.Transport = "tcp"
+		ccfg.BufferBytes = bufSize
+		ccfg.SendWindow = bufSize
+		go func() {
+			_ = RunClient(ctx, ccfg, inR, outW, logging.New(io.Discard, "error", "text"))
+			_ = outW.Close()
+		}()
+		return clog{inW: inW, outR: outR, stop: cancel}
+	}
+
+	c3 := startBlocked()
+	defer c3.stop()
+	var d3 *net.TCPConn
+	select {
+	case d3 = <-accepted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("dest 3 did not accept")
+	}
+
+	c1 := startBlocked()
+	defer c1.stop()
+	var d1 *net.TCPConn
+	select {
+	case d1 = <-accepted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("dest 1 did not accept")
+	}
+	c2 := startBlocked()
+	defer c2.stop()
+	var d2 *net.TCPConn
+	select {
+	case d2 = <-accepted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("dest 2 did not accept")
+	}
+
+	stopFlood := make(chan struct{})
+	flood := func(c *net.TCPConn) {
+		chunk := bytes.Repeat([]byte("n"), 1024)
+		for {
+			select {
+			case <-stopFlood:
+				return
+			default:
+			}
+			if _, err := c.Write(chunk); err != nil {
+				return
+			}
+		}
+	}
+	go flood(d1)
+	go flood(d2)
+
+	waitUntil(t, 3*time.Second, func() bool {
+		return srv.budget.Exhausted() || srv.budgetUsed() >= int64(cfg.TotalBufferBytes)
+	})
+	if zeros(srv.sessionBufferLens()) < 1 {
+		t.Fatalf("session 3 sendLog should still be empty: %v", srv.sessionBufferLens())
+	}
+
+	if _, err := d3.Write(bytes.Repeat([]byte("z"), 4096)); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(80 * time.Millisecond)
+	if z := zeros(srv.sessionBufferLens()); z < 1 {
+		t.Fatalf("session 3 should still be blocked on budget: %v", srv.sessionBufferLens())
+	}
+	before := srv.sessionCount()
+
+	close(stopFlood)
+	_ = d1.CloseWrite()
+	_ = d2.CloseWrite()
+	go func() { _, _ = io.Copy(io.Discard, c1.outR) }()
+	go func() { _, _ = io.Copy(io.Discard, c2.outR) }()
+
+	waitUntil(t, 3*time.Second, func() bool {
+		return zeros(srv.sessionBufferLens()) == 0
+	})
+	if srv.sessionCount() != before {
+		t.Fatalf("link flap: sessions %d -> %d", before, srv.sessionCount())
+	}
+
+	_ = c1.inW.Close()
+	_ = c2.inW.Close()
+	_ = c3.inW.Close()
+	_ = d3.Close()
+}
+
+func zeros(v []int) int {
+	n := 0
+	for _, x := range v {
+		if x == 0 {
+			n++
+		}
+	}
+	return n
+}
+
 func TestHalfCloseAcrossResume(t *testing.T) {
 	const downN = 128 << 10
 	downWant := makePattern(downN)

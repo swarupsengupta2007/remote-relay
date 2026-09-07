@@ -144,6 +144,67 @@ func TestRingBudgetCapsGrowth(t *testing.T) {
 	}
 }
 
+func TestBudgetReleaseWakesOtherRing(t *testing.T) {
+	b := NewBudget(8)
+	a := NewRing(8, b)
+	c := NewRing(8, b)
+	if err := a.TryAppend([]byte("abcdefgh")); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	errc := make(chan error, 1)
+	go func() {
+		errc <- c.Append(ctx, []byte("xyz"))
+	}()
+	time.Sleep(30 * time.Millisecond)
+	select {
+	case err := <-errc:
+		t.Fatalf("append should block on budget, got %v", err)
+	default:
+	}
+	if c.Len() != 0 {
+		t.Fatalf("blocked ring grew to %d", c.Len())
+	}
+	a.AdvanceTo(8)
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("budget release did not wake the other ring")
+	}
+	if c.Len() != 3 {
+		t.Fatalf("len=%d", c.Len())
+	}
+}
+
+func TestBudgetWaitUnblocksOnClose(t *testing.T) {
+	b := NewBudget(4)
+	a := NewRing(4, b)
+	c := NewRing(4, b)
+	if err := a.TryAppend([]byte("abcd")); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	errc := make(chan error, 1)
+	go func() {
+		errc <- c.Append(ctx, []byte("x"))
+	}()
+	time.Sleep(20 * time.Millisecond)
+	c.Close()
+	select {
+	case err := <-errc:
+		if !errors.Is(err, ErrClosed) {
+			t.Fatalf("got %v want closed", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("close did not wake budget waiter")
+	}
+}
+
 func TestRingConcurrentAppendAdvance(t *testing.T) {
 	r := NewRing(1024, nil)
 	ctx, cancel := context.WithCancel(context.Background())

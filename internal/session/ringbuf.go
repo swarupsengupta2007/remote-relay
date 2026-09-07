@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 )
 
 var (
@@ -22,7 +23,7 @@ type Ring struct {
 	capMax   int
 	soft     int // 0 = no soft cap (use capMax)
 	base     uint64
-	closed   bool
+	closed   atomic.Bool
 	budget   *Budget
 	budgeted int
 	notify   chan struct{}
@@ -90,10 +91,13 @@ func (r *Ring) Notify() <-chan struct{} {
 
 func (r *Ring) Close() {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.closed = true
+	r.closed.Store(true)
 	r.cond.Broadcast()
 	r.pokeLocked()
+	r.mu.Unlock()
+	if r.budget != nil {
+		r.budget.wake()
+	}
 }
 
 func (r *Ring) Release() {
@@ -157,7 +161,7 @@ func (r *Ring) appendSome(ctx context.Context, p []byte, wait bool) (int, error)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for {
-		if r.closed {
+		if r.closed.Load() {
 			return 0, ErrClosed
 		}
 		if err := ctx.Err(); err != nil {
@@ -198,7 +202,15 @@ func (r *Ring) appendSome(ctx context.Context, p []byte, wait bool) (int, error)
 				if !wait {
 					return 0, ErrOverflow
 				}
-				r.cond.Wait()
+				r.mu.Unlock()
+				err := r.budget.Wait(ctx, r.closed.Load)
+				r.mu.Lock()
+				if r.closed.Load() {
+					return 0, ErrClosed
+				}
+				if err != nil {
+					return 0, err
+				}
 				continue
 			}
 			n = int(got)

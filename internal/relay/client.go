@@ -66,10 +66,7 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 		log:       log,
 	}, sendLog)
 	p.startIO()
-	defer func() {
-		p.shutdown()
-		_ = bw.Flush()
-	}()
+	defer p.shutdown()
 
 	err = p.serveConn(p.sessCtx, conn, 0)
 	if se := p.sessionErr(); se != nil {
