@@ -29,7 +29,7 @@ func startUpgrade(ctx context.Context, p *pump, cfg config.Client, tcpConn trans
 	if udp == nil || tcpConn == nil || tcpConn.Kind() != transport.KindTCP {
 		return nil, nop
 	}
-	if target != "quic" {
+	if target != "quic" && target != "kcp" {
 		return nil, nop
 	}
 	upgCtx, cancel := context.WithCancel(ctx)
@@ -43,7 +43,7 @@ func startUpgrade(ctx context.Context, p *pump, cfg config.Client, tcpConn trans
 				return
 			}
 		}
-		ch <- tryUpgrade(upgCtx, p, cfg, tcpConn, sessionID, token, udp, log)
+		ch <- tryUpgrade(upgCtx, p, cfg, tcpConn, sessionID, token, target, udp, log)
 	}()
 	return ch, cancel
 }
@@ -64,7 +64,7 @@ func takeUpgrade(ch <-chan upgradeResult, cancel context.CancelFunc, p *pump) up
 	}
 }
 
-func tryUpgrade(ctx context.Context, p *pump, cfg config.Client, tcpConn transport.Conn, sessionID, token string, udp *proto.UdpInfo, log *slog.Logger) (res upgradeResult) {
+func tryUpgrade(ctx context.Context, p *pump, cfg config.Client, tcpConn transport.Conn, sessionID, token, target string, udp *proto.UdpInfo, log *slog.Logger) (res upgradeResult) {
 	tok, ok := transport.ParseProbeToken(udp.ProbeToken)
 	if !ok {
 		res.err = proto.NewError(proto.CodeProto, "bad probe token")
@@ -116,14 +116,19 @@ func tryUpgrade(ctx context.Context, p *pump, cfg config.Client, tcpConn transpo
 	p.upgrading.Store(true)
 	defer p.upgrading.Store(false)
 
-	if testFailQUICDial.Load() {
+	if testFailQUICDial.Load() && target != "kcp" {
 		p.abortQuiesce()
 		res.err = errors.New("test: quic dial fail")
 		return res
 	}
 
-	qconf := transport.NewQUICConfig(p.cfg.idle, p.cfg.keepalive, p.cfg.window)
-	qconn, err := transport.DialQUIC(ctx, mux.QUIC(), addr, qconf)
+	var uconn transport.Conn
+	if target == "kcp" {
+		uconn, err = transport.DialKCP(ctx, mux.KCP(), addr)
+	} else {
+		qconf := transport.NewQUICConfig(p.cfg.idle, p.cfg.keepalive, p.cfg.window)
+		uconn, err = transport.DialQUIC(ctx, mux.QUIC(), addr, qconf)
+	}
 	if err != nil {
 		p.abortQuiesce()
 		res.err = err
@@ -134,21 +139,21 @@ func tryUpgrade(ctx context.Context, p *pump, cfg config.Client, tcpConn transpo
 		From:   "tcp",
 		Offset: proto.SwitchOffset{Up: up, Down: down},
 	}); err != nil {
-		_ = qconn.Close()
+		_ = uconn.Close()
 		p.abortQuiesce()
 		res.err = err
 		return res
 	}
-	rok, err := writeResumeOn(ctx, qconn, cfg, sessionID, token, p.delivered.Load())
+	rok, err := writeResumeOn(ctx, uconn, cfg, sessionID, token, p.delivered.Load())
 	if err != nil {
-		_ = qconn.Close()
+		_ = uconn.Close()
 		p.abortQuiesce()
 		res.err = err
 		return res
 	}
 	cleanup = false
 	_ = tcpConn.Close()
-	res.conn = qconn
+	res.conn = uconn
 	res.rok = rok
 	res.hold = mux
 	return res

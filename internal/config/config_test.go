@@ -146,10 +146,26 @@ func TestClientPositionalDest(t *testing.T) {
 	}
 }
 
-func TestKCPNotImplemented(t *testing.T) {
-	_, err := LoadClient(ClientOptions{KCP: true, Server: "127.0.0.1:1"})
-	if err == nil || err.Error() != "kcp: not implemented yet" {
-		t.Fatalf("got %v", err)
+func TestKCPFlagSelectsKCP(t *testing.T) {
+	cfg, err := LoadClient(ClientOptions{KCP: true, Server: "127.0.0.1:1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Transport != "kcp" {
+		t.Fatalf("transport %q", cfg.Transport)
+	}
+	if got := cfg.TransportPreference(); len(got) != 1 || got[0] != "kcp" {
+		t.Fatalf("pref %v", got)
+	}
+}
+
+func TestTCPFlagOverridesKCP(t *testing.T) {
+	cfg, err := LoadClient(ClientOptions{TCP: true, KCP: true, Server: "127.0.0.1:1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Transport != "tcp" {
+		t.Fatalf("transport %q", cfg.Transport)
 	}
 }
 
@@ -162,13 +178,21 @@ func TestTransportPreference(t *testing.T) {
 	if got := c.TransportPreference(); len(got) != 1 || got[0] != "tcp" {
 		t.Fatalf("tcp pref %v", got)
 	}
+	c.Transport = "kcp"
+	if got := c.TransportPreference(); len(got) != 1 || got[0] != "kcp" {
+		t.Fatalf("kcp pref %v", got)
+	}
 	s := DefaultServer()
-	if !s.QUICEnabled() {
-		t.Fatal("default server should enable quic")
+	if !s.QUICEnabled() || !s.KCPEnabled() {
+		t.Fatal("default server should enable quic and kcp")
 	}
 	s.Transports = []string{"tcp"}
-	if s.QUICEnabled() {
+	if s.QUICEnabled() || s.KCPEnabled() {
 		t.Fatal("tcp-only")
+	}
+	s.Transports = []string{"kcp"}
+	if s.QUICEnabled() || !s.KCPEnabled() {
+		t.Fatal("kcp-only")
 	}
 }
 

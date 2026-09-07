@@ -90,7 +90,7 @@ func runClient(args []string) int {
 	server := fs.String("server", "", "relay server host:port")
 	dest := fs.String("dest", "", "destination host:port")
 	tcp := fs.Bool("tcp", false, "use TCP data plane")
-	kcp := fs.Bool("kcp", false, "use KCP data plane (not implemented yet)")
+	kcp := fs.Bool("kcp", false, "use KCP data plane")
 	logLevel := fs.String("log-level", "", "log level")
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {

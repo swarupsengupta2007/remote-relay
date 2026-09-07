@@ -577,8 +577,13 @@ func (l *live) writeResumeOK(req attachReq, heldMs int) error {
 	if l.srv != nil {
 		selected, udp = l.srv.pickTransport(pref, l.id, req.conn.LocalAddr())
 	}
-	if req.conn != nil && req.conn.Kind() == transport.KindQUIC {
-		selected = "quic"
+	if req.conn != nil {
+		switch req.conn.Kind() {
+		case transport.KindQUIC:
+			selected = "quic"
+		case transport.KindKCP:
+			selected = "kcp"
+		}
 	}
 	ok := proto.ResumeOK{
 		V:           1,

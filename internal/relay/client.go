@@ -50,6 +50,14 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 	if helloOK.Limits.SwitchTimeoutMs > 0 {
 		st = time.Duration(helloOK.Limits.SwitchTimeoutMs) * time.Millisecond
 	}
+	keepalive := cfg.KeepaliveInterval.Duration()
+	if keepalive <= 0 {
+		keepalive = 5 * time.Second
+	}
+	idle := cfg.IdleTimeout.Duration()
+	if idle <= 0 {
+		idle = 30 * time.Second
+	}
 	p := newPump(ctx, sessionIO{
 		conn:      conn,
 		src:       src,
@@ -62,8 +70,8 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 		chunk:         chunk,
 		window:        window,
 		buffer:        bufCap,
-		keepalive:     5 * time.Second,
-		idle:          30 * time.Second,
+		keepalive:     keepalive,
+		idle:          idle,
 		switchTimeout: st,
 		log:           log,
 	}, sendLog)

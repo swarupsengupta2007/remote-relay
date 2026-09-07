@@ -52,6 +52,10 @@ func ListenUDPMux(addr string) (*UDPMux, error) {
 	if err != nil {
 		return nil, err
 	}
+	if uc, ok := pc.(*net.UDPConn); ok {
+		_ = uc.SetReadBuffer(4 << 20)
+		_ = uc.SetWriteBuffer(4 << 20)
+	}
 	return NewUDPMux(pc), nil
 }
 
@@ -337,7 +341,7 @@ func (c *taggedConn) deliver(p []byte, addr net.Addr) {
 	select {
 	case c.ch <- datagram{buf: p, addr: addr}:
 	default:
-		// drop: UDP-like when the stack is slow or (for KCP in M2) nobody is listening
+		// drop: UDP-like when the stack is slow or nobody is listening
 	}
 }
 
@@ -439,3 +443,22 @@ func (c *taggedConn) SetReadDeadline(t time.Time) error {
 }
 
 func (c *taggedConn) SetWriteDeadline(time.Time) error { return nil }
+
+type sockBuf interface {
+	SetReadBuffer(int) error
+	SetWriteBuffer(int) error
+}
+
+func (c *taggedConn) SetReadBuffer(n int) error {
+	if s, ok := c.mux.conn.(sockBuf); ok {
+		return s.SetReadBuffer(n)
+	}
+	return nil
+}
+
+func (c *taggedConn) SetWriteBuffer(n int) error {
+	if s, ok := c.mux.conn.(sockBuf); ok {
+		return s.SetWriteBuffer(n)
+	}
+	return nil
+}

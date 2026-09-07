@@ -86,6 +86,8 @@ type Client struct {
 	BufferBytes         int      `toml:"buffer_bytes"`
 	SendWindow          int      `toml:"send_window"`
 	ProbeTimeout        Duration `toml:"probe_timeout"`
+	KeepaliveInterval   Duration `toml:"keepalive_interval"`
+	IdleTimeout         Duration `toml:"idle_timeout"`
 	ReconnectBackoff    []string `toml:"reconnect_backoff"`
 	ReconnectMaxElapsed Duration `toml:"reconnect_max_elapsed"`
 	LogLevel            string   `toml:"log_level"`
@@ -126,6 +128,8 @@ func DefaultClient() Client {
 		BufferBytes:         67108864,
 		SendWindow:          4194304,
 		ProbeTimeout:        Duration(2 * time.Second),
+		KeepaliveInterval:   Duration(5 * time.Second),
+		IdleTimeout:         Duration(30 * time.Second),
 		ReconnectBackoff:    []string{"100ms", "250ms", "500ms", "1s", "2s", "5s", "10s"},
 		ReconnectMaxElapsed: Duration(5 * time.Minute),
 		LogLevel:            "warn",
@@ -173,9 +177,6 @@ func LoadServer(opts ServerOptions) (Server, error) {
 }
 
 func LoadClient(opts ClientOptions) (Client, error) {
-	if opts.KCP && !opts.TCP {
-		return Client{}, fmt.Errorf("kcp: not implemented yet")
-	}
 	cfg := DefaultClient()
 	path, required := opts.ConfigPath, opts.ConfigPath != ""
 	if !required {
@@ -198,8 +199,11 @@ func LoadClient(opts ClientOptions) (Client, error) {
 			cfg.Destination = opts.PosHost
 		}
 	}
+	// §8.5: --tcp > --kcp > config transport > default quic
 	if opts.TCP {
 		cfg.Transport = "tcp"
+	} else if opts.KCP {
+		cfg.Transport = "kcp"
 	}
 	if opts.LogLevel != "" {
 		cfg.LogLevel = opts.LogLevel
@@ -319,6 +323,15 @@ func (c Client) TransportPreference() []string {
 func (s Server) QUICEnabled() bool {
 	for _, t := range s.Transports {
 		if strings.EqualFold(t, "quic") {
+			return true
+		}
+	}
+	return false
+}
+
+func (s Server) KCPEnabled() bool {
+	for _, t := range s.Transports {
+		if strings.EqualFold(t, "kcp") {
 			return true
 		}
 	}
