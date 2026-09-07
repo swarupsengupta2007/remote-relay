@@ -153,6 +153,25 @@ func TestKCPNotImplemented(t *testing.T) {
 	}
 }
 
+func TestTransportPreference(t *testing.T) {
+	c := DefaultClient()
+	if got := c.TransportPreference(); len(got) != 2 || got[0] != "quic" || got[1] != "kcp" {
+		t.Fatalf("default pref %v", got)
+	}
+	c.Transport = "tcp"
+	if got := c.TransportPreference(); len(got) != 1 || got[0] != "tcp" {
+		t.Fatalf("tcp pref %v", got)
+	}
+	s := DefaultServer()
+	if !s.QUICEnabled() {
+		t.Fatal("default server should enable quic")
+	}
+	s.Transports = []string{"tcp"}
+	if s.QUICEnabled() {
+		t.Fatal("tcp-only")
+	}
+}
+
 func TestValidationErrors(t *testing.T) {
 	s := DefaultServer()
 	s.BufferBytes = s.TotalBufferBytes + 1

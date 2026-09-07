@@ -304,6 +304,27 @@ func validTransport(t string) bool {
 	}
 }
 
+// TransportPreference is the HELLO/RESUME preference list (§8.5).
+func (c Client) TransportPreference() []string {
+	switch strings.ToLower(strings.TrimSpace(c.Transport)) {
+	case "tcp":
+		return []string{"tcp"}
+	case "kcp":
+		return []string{"kcp"}
+	default:
+		return []string{"quic", "kcp"}
+	}
+}
+
+func (s Server) QUICEnabled() bool {
+	for _, t := range s.Transports {
+		if strings.EqualFold(t, "quic") {
+			return true
+		}
+	}
+	return false
+}
+
 func AllowAll(allow []string) bool {
 	for _, a := range allow {
 		if a == "*" {

@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -111,6 +112,11 @@ type pump struct {
 	finished      atomic.Bool
 	backpressured atomic.Bool
 	linkUp        atomic.Bool
+
+	quiesce     atomic.Bool
+	quiesceSeen atomic.Bool
+	sentOff     atomic.Uint64
+	upgrading   atomic.Bool
 
 	srcWG  sync.WaitGroup
 	sinkWG sync.WaitGroup
@@ -235,6 +241,7 @@ func (p *pump) dropConn() {
 		cancel()
 	}
 	if c != nil {
+		_ = c.SetDeadline(time.Now())
 		_ = c.Close()
 	}
 }
@@ -252,6 +259,9 @@ func (p *pump) serveConn(ctx context.Context, conn transport.Conn, sendFrom uint
 	p.connMu.Unlock()
 
 	p.linkUp.Store(true)
+	p.quiesce.Store(false)
+	p.quiesceSeen.Store(false)
+	p.sentOff.Store(sendFrom)
 	p.sendLog.SetSoftLimit(p.cfg.window)
 	p.ack.Advance(sendFrom)
 	p.sendLog.AdvanceTo(sendFrom)
@@ -316,10 +326,24 @@ func (p *pump) serveConn(ctx context.Context, conn transport.Conn, sendFrom uint
 	if p.sessCtx.Err() != nil {
 		return p.sessCtx.Err()
 	}
-	if err == nil || errors.Is(err, context.Canceled) {
+	if err == nil || isTransportGone(err) {
 		return errTransportDown
 	}
 	return err
+}
+
+func isTransportGone(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe) {
+		return true
+	}
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
 
 func (p *pump) classify(err error) error {
@@ -425,11 +449,75 @@ func (p *pump) writeConn(f proto.Frame) error {
 	return c.WriteFrame(f)
 }
 
+func (p *pump) currentKind() transport.Kind {
+	p.connMu.Lock()
+	c := p.conn
+	p.connMu.Unlock()
+	if c == nil {
+		return transport.KindTCP
+	}
+	return c.Kind()
+}
+
+func (p *pump) startQuiesce() {
+	p.quiesceSeen.Store(false)
+	p.quiesce.Store(true)
+	p.nudge()
+}
+
+func (p *pump) abortQuiesce() {
+	p.quiesce.Store(false)
+	p.quiesceSeen.Store(false)
+	p.nudge()
+}
+
+var errSwitchTimeout = errors.New("switch timeout")
+
+func (p *pump) waitQuiesced(ctx context.Context, d time.Duration) (up, down uint64, err error) {
+	if d <= 0 {
+		d = 5 * time.Second
+	}
+	p.startQuiesce()
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	for {
+		if p.quiesceSeen.Load() {
+			sent := p.sentOff.Load()
+			if p.ack.Get() >= sent {
+				return sent, p.expected.Load(), nil
+			}
+		}
+		p.connMu.Lock()
+		connCtx := p.connCtx
+		p.connMu.Unlock()
+		if connCtx == nil {
+			connCtx = p.sessCtx
+		}
+		select {
+		case <-ctx.Done():
+			p.abortQuiesce()
+			return 0, 0, ctx.Err()
+		case <-connCtx.Done():
+			p.abortQuiesce()
+			return 0, 0, connCtx.Err()
+		case <-p.sessCtx.Done():
+			p.abortQuiesce()
+			return 0, 0, p.sessCtx.Err()
+		case <-timer.C:
+			p.abortQuiesce()
+			return 0, 0, errSwitchTimeout
+		case <-p.ack.WaitCh():
+		case <-p.kick:
+		}
+	}
+}
+
 func (p *pump) netWriter() error {
 	sent := p.sendFrom
 	if base := p.sendLog.Base(); base > sent {
 		sent = base
 	}
+	p.sentOff.Store(sent)
 	if d := p.delivered.Load(); d > 0 {
 		if err := p.writeConn(proto.Frame{Type: proto.TypeAck, Payload: proto.EncodeAck(d)}); err != nil {
 			return err
@@ -456,6 +544,26 @@ func (p *pump) netWriter() error {
 			break
 		}
 
+		if p.quiesce.Load() {
+			p.sentOff.Store(sent)
+			p.quiesceSeen.Store(true)
+			select {
+			case <-p.connCtx.Done():
+				return p.connCtx.Err()
+			case f := <-p.ctrlQ:
+				if err := p.writeConn(f); err != nil {
+					return err
+				}
+				if f.Type == proto.TypeBye {
+					p.finished.Store(true)
+					return errByeSent
+				}
+			case <-p.kick:
+			case <-p.ack.WaitCh():
+			}
+			continue
+		}
+
 		acked := p.ack.Get()
 		if p.cfg.window > 0 && sent > acked && sent-acked >= uint64(p.cfg.window) {
 			select {
@@ -480,13 +588,20 @@ func (p *pump) netWriter() error {
 			sent = from
 		}
 		if len(data) > 0 {
+			if p.quiesce.Load() {
+				p.sentOff.Store(sent)
+				p.quiesceSeen.Store(true)
+				continue
+			}
 			fr := proto.Frame{Type: proto.TypeData, Payload: proto.EncodeData(sent, data)}
 			if err := p.writeConn(fr); err != nil {
 				return err
 			}
 			sent += uint64(len(data))
+			p.sentOff.Store(sent)
 			continue
 		}
+		p.sentOff.Store(sent)
 
 		if p.outEOF.Load() && sent >= p.outFinal.Load() {
 			if !closeSent {
@@ -647,6 +762,13 @@ func (p *pump) netReader() error {
 				return err
 			}
 		case proto.TypePong:
+		case proto.TypeSwitch:
+			var sw proto.Switch
+			if uerr := proto.UnmarshalPayload(f, &sw); uerr != nil {
+				_ = p.sendErr(proto.CodeProto, "bad SWITCH")
+				return uerr
+			}
+			p.startQuiesce()
 		case proto.TypeBye:
 			p.finished.Store(true)
 			return errByeReceived

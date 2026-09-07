@@ -25,16 +25,13 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 	if log == nil {
 		log = logging.NewClient(cfg.LogLevel, cfg.LogFormat)
 	}
-	if cfg.Transport != "tcp" {
-		log.Warn("UDP upgrade is not built yet; staying on TCP", "requested", cfg.Transport)
-	}
 
 	conn, helloOK, err := clientHello(ctx, cfg)
 	if err != nil {
 		return err
 	}
 	log = logging.WithSession(log, helloOK.SessionID)
-	log.Info("session established", "transport", "tcp")
+	log.Info("session established", "transport", helloOK.Transport)
 
 	chunk := clampChunk(helloOK.Limits.DataChunkBytes)
 	window := cfg.SendWindow
@@ -68,16 +65,19 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 	p.startIO()
 	defer p.shutdown()
 
-	err = p.serveConn(p.sessCtx, conn, 0)
-	if se := p.sessionErr(); se != nil {
-		return se
-	}
-	if !reconnectable(err) {
-		return p.classify(err)
-	}
-
 	token := helloOK.ResumeToken
 	sessionID := helloOK.SessionID
+	udp := helloOK.UDP
+	target := helloOK.Transport
+	current := conn
+	sendFrom := uint64(0)
+	var udpHold io.Closer
+	defer func() {
+		if udpHold != nil {
+			_ = udpHold.Close()
+		}
+	}()
+
 	schedule := parseBackoff(cfg.ReconnectBackoff)
 	maxElapsed := cfg.ReconnectMaxElapsed.Duration()
 	if maxElapsed <= 0 {
@@ -90,7 +90,39 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 		}
 	}
 
-	for reconnectable(err) {
+	for {
+		upgCh, upgCancel := startUpgrade(ctx, p, cfg, current, sessionID, token, target, udp, log)
+		err = p.serveConn(p.sessCtx, current, sendFrom)
+		upg := takeUpgrade(upgCh, upgCancel, p)
+		if upg.conn != nil {
+			if udpHold != nil {
+				_ = udpHold.Close()
+			}
+			udpHold = upg.hold
+			current = upg.conn
+			sendFrom = upg.rok.UpAcked
+			token = upg.rok.ResumeToken
+			if upg.rok.UDP != nil {
+				udp = upg.rok.UDP
+			}
+			if upg.rok.Transport != "" {
+				target = upg.rok.Transport
+			}
+			p.sendLog.AdvanceTo(sendFrom)
+			log.Info("path upgraded", "transport", current.Kind().String())
+			continue
+		}
+		if upg.hold != nil {
+			_ = upg.hold.Close()
+		}
+
+		if se := p.sessionErr(); se != nil {
+			return se
+		}
+		if !reconnectable(err) {
+			return p.classify(err)
+		}
+
 		deadline := time.Now().Add(maxElapsed)
 		attempt := 0
 		resumed := false
@@ -108,20 +140,26 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 				continue
 			}
 			token = rok.ResumeToken
+			udp = rok.UDP
+			if rok.Transport != "" {
+				target = rok.Transport
+			}
 			if rok.State.UpClosed && !p.outEOF.Load() {
 				p.outFinal.Store(p.sendLog.End())
 				p.outEOF.Store(true)
 				p.sendLog.Close()
 			}
 			p.sendLog.AdvanceTo(rok.UpAcked)
-			err = p.serveConn(p.sessCtx, nconn, rok.UpAcked)
-			if se := p.sessionErr(); se != nil {
-				return se
+			if udpHold != nil {
+				_ = udpHold.Close()
+				udpHold = nil
 			}
+			current = nconn
+			sendFrom = rok.UpAcked
 			resumed = true
 			break
 		}
-		if resumed && reconnectable(err) {
+		if resumed {
 			continue
 		}
 		if reconnectable(err) {
@@ -129,7 +167,6 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 		}
 		return p.classify(err)
 	}
-	return p.classify(err)
 }
 
 func interruptibleReader(r io.Reader) (io.Reader, func()) {
@@ -164,14 +201,11 @@ func clientHello(ctx context.Context, cfg config.Client) (transport.Conn, proto.
 		V:           1,
 		SessionID:   "",
 		ResumeToken: "",
-		Transport:   []string{"tcp"},
+		Transport:   cfg.TransportPreference(),
 		Destination: cfg.Destination,
 		ClientNonce: nonce,
 		Auth:        authMsg,
 		Window:      cfg.SendWindow,
-	}
-	if cfg.Transport != "" && cfg.Transport != "tcp" {
-		hello.Transport = []string{cfg.Transport, "tcp"}
 	}
 	fr, err := proto.MarshalFrame(proto.TypeHello, hello)
 	if err != nil {
@@ -224,60 +258,10 @@ func clientResume(ctx context.Context, cfg config.Client, sessionID, token strin
 	if err != nil {
 		return nil, none, err
 	}
-	nonce, err := proto.RandomNonce()
+	ok, err := writeResumeOn(ctx, conn, cfg, sessionID, token, downAcked)
 	if err != nil {
 		_ = conn.Close()
 		return nil, none, err
-	}
-	msg := proto.Resume{
-		V:           1,
-		SessionID:   sessionID,
-		ResumeToken: token,
-		Transport:   []string{"tcp"},
-		DownAcked:   downAcked,
-		ClientNonce: nonce,
-	}
-	fr, err := proto.MarshalFrame(proto.TypeResume, msg)
-	if err != nil {
-		_ = conn.Close()
-		return nil, none, err
-	}
-	if err := conn.SetDeadline(deadlineOr(ctx, handshakeTimeout)); err != nil {
-		_ = conn.Close()
-		return nil, none, err
-	}
-	if err := conn.WriteFrame(fr); err != nil {
-		_ = conn.Close()
-		return nil, none, err
-	}
-	reply, err := conn.ReadFrame()
-	_ = conn.SetDeadline(time.Time{})
-	if err != nil {
-		_ = conn.Close()
-		return nil, none, err
-	}
-	switch reply.Type {
-	case proto.TypeResumeFail, proto.TypeErr:
-		_ = conn.Close()
-		var fail proto.Fail
-		_ = proto.UnmarshalPayload(reply, &fail)
-		if fail.Code == "" {
-			fail.Code = proto.CodeInternal
-		}
-		return nil, none, proto.NewError(fail.Code, fail.Msg)
-	case proto.TypeResumeOK:
-	default:
-		_ = conn.Close()
-		return nil, none, proto.NewError(proto.CodeProto, "expected RESUME_OK, got "+reply.Type.String())
-	}
-	var ok proto.ResumeOK
-	if err := proto.UnmarshalPayload(reply, &ok); err != nil {
-		_ = conn.Close()
-		return nil, none, err
-	}
-	if ok.V != 1 {
-		_ = conn.Close()
-		return nil, none, proto.ErrVersion
 	}
 	return conn, ok, nil
 }

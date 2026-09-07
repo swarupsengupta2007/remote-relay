@@ -2,6 +2,7 @@ package relay
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"log/slog"
 	"net"
@@ -27,6 +28,23 @@ type Server struct {
 	ln      net.Listener
 	livesMu sync.Mutex
 	lives   map[string]*live
+
+	serveCtx context.Context
+
+	udpMu    sync.Mutex
+	udpStart sync.Mutex
+	udp      *udpEndpoint
+
+	probeMu     sync.Mutex
+	probes      map[[16]byte]string
+	probeBySess map[string][16]byte
+
+	certOnce sync.Once
+	cert     tls.Certificate
+	certErr  error
+
+	histMu   sync.Mutex
+	pathHist []pathInfo
 }
 
 func NewServer(cfg config.Server, log *slog.Logger) *Server {
@@ -34,12 +52,14 @@ func NewServer(cfg config.Server, log *slog.Logger) *Server {
 		log = logging.New(nil, cfg.LogLevel, cfg.LogFormat)
 	}
 	return &Server{
-		cfg:    cfg,
-		log:    log,
-		auth:   auth.None{},
-		store:  session.NewStore(cfg.MaxSessions),
-		budget: session.NewBudget(int64(cfg.TotalBufferBytes)),
-		lives:  make(map[string]*live),
+		cfg:         cfg,
+		log:         log,
+		auth:        auth.None{},
+		store:       session.NewStore(cfg.MaxSessions),
+		budget:      session.NewBudget(int64(cfg.TotalBufferBytes)),
+		lives:       make(map[string]*live),
+		probes:      make(map[[16]byte]string),
+		probeBySess: make(map[string][16]byte),
 	}
 }
 
@@ -56,6 +76,7 @@ func (s *Server) Close() error {
 	s.mu.Lock()
 	ln := s.ln
 	s.mu.Unlock()
+	s.closeUDP()
 	if ln == nil {
 		return nil
 	}
@@ -79,12 +100,9 @@ func (s *Server) Listen() error {
 }
 
 func (s *Server) Serve(ctx context.Context) error {
-	for _, t := range s.cfg.Transports {
-		if t != "tcp" {
-			s.log.Warn("UDP upgrade is not built yet; listening on TCP only")
-			break
-		}
-	}
+	s.mu.Lock()
+	s.serveCtx = ctx
+	s.mu.Unlock()
 	if config.AllowAll(s.cfg.AllowDestinations) {
 		s.log.Warn("allow_destinations includes \"*\": this process is an open TCP proxy")
 	}
@@ -107,6 +125,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	go func() {
 		<-ctx.Done()
 		_ = ln.Close()
+		s.closeUDP()
 	}()
 
 	for {
@@ -233,12 +252,13 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 		writeErr(conn, proto.CodeInternal, "nonce")
 		return
 	}
+	selected, udp := s.pickTransport(hello.Transport, sess.ID, conn.LocalAddr())
 	okMsg := proto.HelloOK{
 		V:           1,
 		SessionID:   sess.ID,
 		ResumeToken: token,
-		Transport:   "tcp",
-		UDP:         nil,
+		Transport:   selected,
+		UDP:         udp,
 		Limits: proto.Limits{
 			BufferBytes:    bufCap,
 			HoldTimeoutMs:  int(s.cfg.HoldTimeout.Duration() / time.Millisecond),
@@ -276,6 +296,7 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 	l := &live{
 		pump:        p,
 		id:          sess.ID,
+		srv:         s,
 		store:       s.store,
 		cfg:         s.cfg,
 		window:      window,
@@ -299,7 +320,7 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 	if err := writeFrameDeadline(conn, fr); err != nil {
 		return
 	}
-	log.Info("session started", "dest", dest, "peer", conn.RemoteAddr().String())
+	log.Info("session started", "dest", dest, "peer", conn.RemoteAddr().String(), "transport", selected)
 	l.run(ctx, conn)
 }
 
@@ -358,6 +379,7 @@ type attachReq struct {
 type live struct {
 	*pump
 	id          string
+	srv         *Server
 	store       *session.Store
 	cfg         config.Server
 	window      int
@@ -367,10 +389,29 @@ type live struct {
 	attachCh    chan attachReq
 	deadCh      chan struct{}
 
-	mu      sync.Mutex
-	heldAt  time.Time
-	dead    bool
-	cleaned bool
+	mu       sync.Mutex
+	heldAt   time.Time
+	dead     bool
+	cleaned  bool
+	pathHist []pathInfo
+}
+
+func (l *live) notePath(c transport.Conn) {
+	info := pathInfo{Kind: transport.KindTCP}
+	if c != nil {
+		info.Kind = c.Kind()
+		if c.RemoteAddr() != nil {
+			info.Remote = c.RemoteAddr().String()
+		}
+	}
+	l.mu.Lock()
+	l.pathHist = append(l.pathHist, info)
+	l.mu.Unlock()
+	if l.srv != nil {
+		l.srv.histMu.Lock()
+		l.srv.pathHist = append(l.srv.pathHist, info)
+		l.srv.histMu.Unlock()
+	}
 }
 
 func (l *live) markDead() {
@@ -438,6 +479,7 @@ func (l *live) Offer(req attachReq) error {
 
 func (l *live) run(ctx context.Context, first transport.Conn) {
 	l.startIO()
+	l.notePath(first)
 	err := l.serveConn(l.sessCtx, first, 0)
 	for reconnectable(err) && ctx.Err() == nil && l.sessionErr() == nil {
 		req, ok := l.holdWait(ctx)
@@ -476,6 +518,7 @@ func (l *live) run(ctx context.Context, first transport.Conn) {
 		}
 		sendFrom := req.resume.DownAcked
 		l.sendLog.AdvanceTo(sendFrom)
+		l.notePath(req.conn)
 		err = l.serveConn(l.sessCtx, req.conn, sendFrom)
 		select {
 		case req.done <- err:
@@ -524,6 +567,17 @@ func (l *live) writeResumeOK(req attachReq, heldMs int) error {
 	if err != nil {
 		return err
 	}
+	pref := []string{"quic", "kcp"}
+	if req.resume != nil && len(req.resume.Transport) > 0 {
+		pref = req.resume.Transport
+	}
+	selected, udp := "tcp", (*proto.UdpInfo)(nil)
+	if l.srv != nil {
+		selected, udp = l.srv.pickTransport(pref, l.id, req.conn.LocalAddr())
+	}
+	if req.conn != nil && req.conn.Kind() == transport.KindQUIC {
+		selected = "quic"
+	}
 	ok := proto.ResumeOK{
 		V:           1,
 		SessionID:   l.id,
@@ -535,7 +589,8 @@ func (l *live) writeResumeOK(req attachReq, heldMs int) error {
 			DownClosed: l.outEOF.Load(),
 			HeldMs:     heldMs,
 		},
-		Transport: "tcp",
+		Transport: selected,
+		UDP:       udp,
 		Limits: proto.Limits{
 			BufferBytes:    l.sendLog.Cap(),
 			HoldTimeoutMs:  int(l.holdTimeout / time.Millisecond),
@@ -564,6 +619,9 @@ func (l *live) cleanup(expired bool) {
 	l.mu.Unlock()
 	l.markDead()
 	l.drainAttach(proto.ErrExpired)
+	if l.srv != nil {
+		l.srv.unregisterProbe(l.id)
+	}
 	if l.dest != nil {
 		_ = l.dest.Close()
 	}
