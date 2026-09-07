@@ -122,8 +122,9 @@ func (c *kcpConn) Kind() Kind           { return KindKCP }
 
 func (c *kcpConn) Close() error {
 	// Do not Flush here: WriteFrame is the only writer, and Close can race with it.
-	// Delay the kcp-go Close so a just-written BYE can be ACKed; KCP has no FIN.
+	// Wake readers immediately; delay sess.Close so a just-written BYE can be ACKed.
 	c.closeOnce.Do(func() {
+		_ = c.sess.SetDeadline(time.Now())
 		go func() {
 			time.Sleep(100 * time.Millisecond)
 			_ = c.sess.Close()
