@@ -12,11 +12,19 @@ import (
 	"github.com/remote-relay/relay/internal/proto"
 )
 
+const (
+	tombstoneTTL  = 10 * time.Minute
+	maxTombstones = 4096
+)
+
 type Session struct {
-	ID          string
-	TokenHash   [32]byte
-	Destination string
-	CreatedAt   time.Time
+	ID           string
+	TokenHash    [32]byte
+	PrevHash     [32]byte
+	hasPrev      bool
+	currentPlain string
+	Destination  string
+	CreatedAt    time.Time
 }
 
 type Store struct {
@@ -94,6 +102,9 @@ func (s *Store) removeLocked(id string) {
 	if sess, ok := s.byID[id]; ok {
 		delete(s.byID, id)
 		delete(s.byHash, sess.TokenHash)
+		if sess.hasPrev {
+			delete(s.byHash, sess.PrevHash)
+		}
 	}
 }
 
@@ -102,13 +113,29 @@ func (s *Store) Expire(id string) {
 	defer s.mu.Unlock()
 	s.removeLocked(id)
 	s.expired[id] = time.Now()
+	s.pruneExpiredLocked(time.Now())
 }
 
 func (s *Store) IsExpired(id string) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pruneExpiredLocked(time.Now())
 	_, ok := s.expired[id]
 	return ok
+}
+
+func (s *Store) pruneExpiredLocked(now time.Time) {
+	for id, t := range s.expired {
+		if now.Sub(t) > tombstoneTTL {
+			delete(s.expired, id)
+		}
+	}
+	for id := range s.expired {
+		if len(s.expired) <= maxTombstones {
+			break
+		}
+		delete(s.expired, id)
+	}
 }
 
 func (s *Store) Len() int {
@@ -139,13 +166,24 @@ func (s *Store) VerifyToken(id, plain string) error {
 	if !ok {
 		return proto.ErrBadToken
 	}
-	if subtle.ConstantTimeCompare(h[:], sess.TokenHash[:]) != 1 {
+	cur := subtle.ConstantTimeCompare(h[:], sess.TokenHash[:])
+	prev := 0
+	if sess.hasPrev {
+		prev = subtle.ConstantTimeCompare(h[:], sess.PrevHash[:])
+	}
+	if cur|prev != 1 {
+		return proto.ErrBadToken
+	}
+	if hid, ok := s.byHash[h]; !ok || hid != id {
 		return proto.ErrBadToken
 	}
 	return nil
 }
 
-func (s *Store) RotateToken(id string) (string, error) {
+// ResumeToken returns the token to put in RESUME_OK. An unconfirmed rotation is
+// reused so a client that never saw RESUME_OK can still present the previous
+// hash and receive the same new token.
+func (s *Store) ResumeToken(id string) (string, error) {
 	plain, hash, err := randomToken()
 	if err != nil {
 		return "", err
@@ -156,8 +194,37 @@ func (s *Store) RotateToken(id string) (string, error) {
 	if !ok {
 		return "", proto.ErrUnknownSession
 	}
-	delete(s.byHash, sess.TokenHash)
+	if sess.currentPlain != "" {
+		return sess.currentPlain, nil
+	}
+	if sess.hasPrev {
+		delete(s.byHash, sess.PrevHash)
+	}
+	sess.PrevHash = sess.TokenHash
+	sess.hasPrev = true
+	s.byHash[sess.PrevHash] = id
 	sess.TokenHash = hash
 	s.byHash[hash] = id
+	sess.currentPlain = plain
 	return plain, nil
+}
+
+func (s *Store) RotateToken(id string) (string, error) {
+	return s.ResumeToken(id)
+}
+
+// ConfirmToken drops the previous-generation hash once the new token is live.
+func (s *Store) ConfirmToken(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, ok := s.byID[id]
+	if !ok {
+		return
+	}
+	sess.currentPlain = ""
+	if sess.hasPrev {
+		delete(s.byHash, sess.PrevHash)
+		sess.PrevHash = [32]byte{}
+		sess.hasPrev = false
+	}
 }

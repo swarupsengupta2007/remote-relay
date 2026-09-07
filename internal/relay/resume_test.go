@@ -220,6 +220,10 @@ func TestResumeAfterHoldExpiry(t *testing.T) {
 
 func TestBackpressureFillsBuffer(t *testing.T) {
 	const bufSize = 32 * 1024
+	const downN = 128 * 1024
+	downWant := makePattern(downN)
+	downHash := sha256.Sum256(downWant)
+
 	destLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -227,20 +231,29 @@ func TestBackpressureFillsBuffer(t *testing.T) {
 	defer destLn.Close()
 
 	var destWritten atomic.Int64
+	upCh := make(chan []byte, 1)
 	go func() {
 		c, err := destLn.Accept()
 		if err != nil {
+			upCh <- nil
 			return
 		}
 		defer c.Close()
-		chunk := makePattern(4096)
-		for {
-			n, err := c.Write(chunk)
-			destWritten.Add(int64(n))
-			if err != nil {
-				return
-			}
-		}
+		tc := c.(*net.TCPConn)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			n, _ := tc.Write(downWant)
+			destWritten.Store(int64(n))
+			_ = tc.CloseWrite()
+		}()
+		go func() {
+			defer wg.Done()
+			b, _ := io.ReadAll(tc)
+			upCh <- b
+		}()
+		wg.Wait()
 	}()
 
 	cfg := config.DefaultServer()
@@ -289,24 +302,31 @@ func TestBackpressureFillsBuffer(t *testing.T) {
 	if got := maxLens(srv.sessionBufferLens()); got != endStable {
 		t.Fatalf("downLog kept growing after cap: %d -> %d", endStable, got)
 	}
-	written := destWritten.Load()
-	time.Sleep(80 * time.Millisecond)
-	written2 := destWritten.Load()
-	if written2-written > 256*1024 {
-		t.Fatalf("dest still being read quickly: %d -> %d", written, written2)
-	}
 
-	go func() { _, _ = io.Copy(io.Discard, outR) }()
 	_ = inW.Close()
-
+	gotDown, err := io.ReadAll(outR)
+	if err != nil {
+		t.Fatalf("stdout: %v", err)
+	}
 	select {
 	case err := <-errc:
-		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, io.EOF) {
-			t.Logf("client ended: %v", err)
+		if err != nil {
+			t.Fatalf("client: %v", err)
 		}
-	case <-time.After(3 * time.Second):
-		cancel()
-		<-errc
+	case <-ctx.Done():
+		t.Fatal("timeout waiting for client")
+	}
+	if len(gotDown) != downN {
+		t.Fatalf("down len=%d want %d", len(gotDown), downN)
+	}
+	checkPattern(t, gotDown)
+	if sha256.Sum256(gotDown) != downHash {
+		t.Fatal("down SHA-256 mismatch")
+	}
+	select {
+	case <-upCh:
+	case <-ctx.Done():
+		t.Fatal("dest did not finish")
 	}
 }
 
@@ -508,6 +528,284 @@ func TestHalfCloseAcrossResume(t *testing.T) {
 	checkPattern(t, gotDown)
 }
 
+func TestHalfCloseKillImmediately(t *testing.T) {
+	upWant := []byte("hello-up")
+	upEOF := make(chan []byte, 1)
+	destLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer destLn.Close()
+	go func() {
+		c, err := destLn.Accept()
+		if err != nil {
+			upEOF <- nil
+			return
+		}
+		defer c.Close()
+		b, _ := io.ReadAll(c)
+		upEOF <- b
+	}()
+
+	cfg := config.DefaultServer()
+	cfg.ListenTCP = "127.0.0.1:0"
+	cfg.DefaultDestination = destLn.Addr().String()
+	cfg.AllowDestinations = []string{destLn.Addr().String(), "*"}
+	cfg.Transports = []string{"tcp"}
+	cfg.HoldTimeout = config.Duration(15 * time.Second)
+	cfg.IdleTimeout = config.Duration(30 * time.Second)
+	srv, relayAddr, _ := startRelayCfg(t, cfg)
+
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	ccfg := config.DefaultClient()
+	ccfg.Server = relayAddr
+	ccfg.Destination = destLn.Addr().String()
+	ccfg.Transport = "tcp"
+	ccfg.ReconnectBackoff = []string{"10ms", "20ms"}
+	ccfg.ReconnectMaxElapsed = config.Duration(8 * time.Second)
+	log := logging.New(io.Discard, "error", "text")
+
+	errc := make(chan error, 1)
+	go func() {
+		err := RunClient(ctx, ccfg, inR, outW, log)
+		_ = outW.Close()
+		errc <- err
+	}()
+
+	if _, err := inW.Write(upWant); err != nil {
+		t.Fatal(err)
+	}
+	if err := inW.Close(); err != nil {
+		t.Fatal(err)
+	}
+	srv.dropLiveTransports()
+
+	_, _ = io.Copy(io.Discard, outR)
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatalf("client: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("timeout")
+	}
+	var gotUp []byte
+	select {
+	case gotUp = <-upEOF:
+	case <-ctx.Done():
+		t.Fatal("dest did not see EOF")
+	}
+	if !bytes.Equal(gotUp, upWant) {
+		t.Fatalf("dest got %q want %q", gotUp, upWant)
+	}
+}
+
+func TestKillTwiceAfterReconnectBudget(t *testing.T) {
+	const n = 256 << 10
+	upWant := makePattern(n)
+	downWant := makePattern(n)
+
+	gotUpCh := make(chan []byte, 1)
+	destLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer destLn.Close()
+	go func() {
+		c, err := destLn.Accept()
+		if err != nil {
+			gotUpCh <- nil
+			return
+		}
+		defer c.Close()
+		tc := c.(*net.TCPConn)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_, _ = tc.Write(downWant)
+			_ = tc.CloseWrite()
+		}()
+		go func() {
+			defer wg.Done()
+			b, _ := io.ReadAll(tc)
+			gotUpCh <- b
+		}()
+		wg.Wait()
+	}()
+
+	cfg := config.DefaultServer()
+	cfg.ListenTCP = "127.0.0.1:0"
+	cfg.DefaultDestination = destLn.Addr().String()
+	cfg.AllowDestinations = []string{destLn.Addr().String(), "*"}
+	cfg.Transports = []string{"tcp"}
+	cfg.HoldTimeout = config.Duration(20 * time.Second)
+	cfg.IdleTimeout = config.Duration(30 * time.Second)
+	srv, relayAddr, _ := startRelayCfg(t, cfg)
+
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	ccfg := config.DefaultClient()
+	ccfg.Server = relayAddr
+	ccfg.Destination = destLn.Addr().String()
+	ccfg.Transport = "tcp"
+	ccfg.ReconnectMaxElapsed = config.Duration(250 * time.Millisecond)
+	ccfg.ReconnectBackoff = []string{"10ms", "20ms"}
+	log := logging.New(io.Discard, "error", "text")
+
+	errc := make(chan error, 1)
+	go func() {
+		err := RunClient(ctx, ccfg, inR, outW, log)
+		_ = outW.Close()
+		errc <- err
+	}()
+
+	var gotDown []byte
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		defer inW.Close()
+		if _, err := inW.Write(upWant); err != nil {
+			t.Errorf("stdin write: %v", err)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, n)
+		var have int
+		kills := 0
+		for have < n {
+			k, err := outR.Read(buf[have:])
+			have += k
+			if kills == 0 && have >= 16*1024 {
+				srv.dropLiveTransports()
+				time.Sleep(400 * time.Millisecond)
+				srv.dropLiveTransports()
+				kills = 2
+			}
+			if err != nil {
+				if have != n {
+					t.Errorf("stdout read: %v have=%d", err, have)
+				}
+				break
+			}
+		}
+		gotDown = buf[:have]
+	}()
+	wg.Wait()
+
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatalf("client: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("timeout waiting for client")
+	}
+	var gotUp []byte
+	select {
+	case gotUp = <-gotUpCh:
+	case <-ctx.Done():
+		t.Fatal("timeout waiting for dest")
+	}
+	if len(gotUp) != n || len(gotDown) != n {
+		t.Fatalf("up=%d down=%d want %d", len(gotUp), len(gotDown), n)
+	}
+	checkPattern(t, gotUp)
+	checkPattern(t, gotDown)
+}
+
+func TestResumeLostOKRetriesOriginalToken(t *testing.T) {
+	dest := startHoldDest(t)
+	cfg := config.DefaultServer()
+	cfg.ListenTCP = "127.0.0.1:0"
+	cfg.DefaultDestination = dest
+	cfg.AllowDestinations = []string{dest, "*"}
+	cfg.Transports = []string{"tcp"}
+	cfg.HoldTimeout = config.Duration(10 * time.Second)
+	_, addr, _ := startRelayCfg(t, cfg)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	conn, hello, err := rawHello(ctx, addr, dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+
+	lost, err := rawResumeWrite(ctx, addr, hello.SessionID, hello.ResumeToken, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	_ = lost.Close()
+
+	okConn, rok, err := rawResumeOK(ctx, addr, hello.SessionID, hello.ResumeToken, 0)
+	if err != nil {
+		t.Fatalf("original token after lost RESUME_OK: %v", err)
+	}
+	_ = okConn.Close()
+	if rok.SessionID != hello.SessionID {
+		t.Fatalf("session %s", rok.SessionID)
+	}
+	if rok.ResumeToken == "" || rok.ResumeToken == hello.ResumeToken {
+		t.Fatal("expected rotated token in RESUME_OK")
+	}
+}
+
+func TestClientReturnsOnDestDeath(t *testing.T) {
+	destLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer destLn.Close()
+	go func() {
+		c, err := destLn.Accept()
+		if err != nil {
+			return
+		}
+		tc := c.(*net.TCPConn)
+		_ = tc.SetLinger(0)
+		_ = tc.Close()
+	}()
+
+	cfg := config.DefaultServer()
+	cfg.ListenTCP = "127.0.0.1:0"
+	cfg.DefaultDestination = destLn.Addr().String()
+	cfg.AllowDestinations = []string{destLn.Addr().String(), "*"}
+	cfg.Transports = []string{"tcp"}
+	cfg.HoldTimeout = config.Duration(2 * time.Second)
+	_, addr, _ := startRelayCfg(t, cfg)
+
+	inR, inW := io.Pipe()
+	defer inW.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ccfg := config.DefaultClient()
+	ccfg.Server = addr
+	ccfg.Destination = destLn.Addr().String()
+	ccfg.Transport = "tcp"
+	ccfg.ReconnectMaxElapsed = config.Duration(500 * time.Millisecond)
+	ccfg.ReconnectBackoff = []string{"10ms"}
+	errc := make(chan error, 1)
+	go func() {
+		errc <- RunClient(ctx, ccfg, inR, io.Discard, logging.New(io.Discard, "error", "text"))
+	}()
+	select {
+	case <-errc:
+	case <-ctx.Done():
+		t.Fatal("RunClient hung after dest death")
+	}
+}
+
 func startHoldDest(t *testing.T) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -571,6 +869,64 @@ func rawHello(ctx context.Context, addr, dest string) (transport.Conn, proto.Hel
 		return nil, none, proto.NewError(proto.CodeProto, reply.Type.String())
 	}
 	var ok proto.HelloOK
+	if err := proto.UnmarshalPayload(reply, &ok); err != nil {
+		_ = conn.Close()
+		return nil, none, err
+	}
+	return conn, ok, nil
+}
+
+func rawResumeWrite(ctx context.Context, addr, sessionID, token string, downAcked uint64) (transport.Conn, error) {
+	conn, err := transport.DialTCP(ctx, addr)
+	if err != nil {
+		return nil, err
+	}
+	nonce, err := proto.RandomNonce()
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	msg := proto.Resume{
+		V: 1, SessionID: sessionID, ResumeToken: token,
+		Transport: []string{"tcp"}, DownAcked: downAcked, ClientNonce: nonce,
+	}
+	fr, err := proto.MarshalFrame(proto.TypeResume, msg)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if err := conn.WriteFrame(fr); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	_ = conn.SetDeadline(time.Time{})
+	return conn, nil
+}
+
+func rawResumeOK(ctx context.Context, addr, sessionID, token string, downAcked uint64) (transport.Conn, proto.ResumeOK, error) {
+	var none proto.ResumeOK
+	conn, err := rawResumeWrite(ctx, addr, sessionID, token, downAcked)
+	if err != nil {
+		return nil, none, err
+	}
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	reply, err := conn.ReadFrame()
+	_ = conn.SetDeadline(time.Time{})
+	if err != nil {
+		_ = conn.Close()
+		return nil, none, err
+	}
+	if reply.Type != proto.TypeResumeOK {
+		_ = conn.Close()
+		var fail proto.Fail
+		_ = proto.UnmarshalPayload(reply, &fail)
+		if fail.Code == "" {
+			fail.Code = proto.CodeProto
+		}
+		return nil, none, proto.NewError(fail.Code, fail.Msg)
+	}
+	var ok proto.ResumeOK
 	if err := proto.UnmarshalPayload(reply, &ok); err != nil {
 		_ = conn.Close()
 		return nil, none, err

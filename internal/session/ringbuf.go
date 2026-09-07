@@ -14,18 +14,18 @@ var (
 // Ring is a growable circular byte buffer addressed by absolute stream offsets.
 // One goroutine appends; another calls AdvanceTo. The mutex/cond serialise both.
 type Ring struct {
-	mu        sync.Mutex
-	cond      *sync.Cond
-	buf       []byte
-	start     int
-	length    int
-	capMax    int
-	soft      int // 0 = no soft cap (use capMax)
-	base      uint64
-	closed    bool
-	budget    *Budget
-	allocated int
-	notify    chan struct{}
+	mu       sync.Mutex
+	cond     *sync.Cond
+	buf      []byte
+	start    int
+	length   int
+	capMax   int
+	soft     int // 0 = no soft cap (use capMax)
+	base     uint64
+	closed   bool
+	budget   *Budget
+	budgeted int
+	notify   chan struct{}
 }
 
 func NewRing(cap int, budget *Budget) *Ring {
@@ -100,9 +100,9 @@ func (r *Ring) Release() {
 	r.Close()
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.budget != nil && r.allocated > 0 {
-		r.budget.Release(int64(r.allocated))
-		r.allocated = 0
+	if r.budget != nil && r.budgeted > 0 {
+		r.budget.Release(int64(r.budgeted))
+		r.budgeted = 0
 	}
 	r.buf = nil
 	r.length = 0
@@ -165,41 +165,50 @@ func (r *Ring) appendSome(ctx context.Context, p []byte, wait bool) (int, error)
 		}
 		lim := r.limitLocked()
 		space := lim - r.length
-		if space > 0 {
-			if !wait && len(p) > space {
+		if space <= 0 {
+			if !wait {
 				return 0, ErrOverflow
 			}
-			n := len(p)
-			if n > space {
-				n = space
-			}
-			if !r.ensureLocked(r.length + n) {
+			r.cond.Wait()
+			continue
+		}
+		if !wait && len(p) > space {
+			return 0, ErrOverflow
+		}
+		n := len(p)
+		if n > space {
+			n = space
+		}
+		if !r.ensureLocked(r.length + n) {
+			room := len(r.buf) - r.length
+			if room <= 0 {
 				if !wait {
 					return 0, ErrOverflow
 				}
-				if r.length >= len(r.buf) && len(r.buf) > 0 {
-					r.cond.Wait()
-					continue
-				}
-				room := len(r.buf) - r.length
-				if room <= 0 {
-					r.cond.Wait()
-					continue
-				}
-				if n > room {
-					n = room
-				}
+				r.cond.Wait()
+				continue
 			}
-			copyIn(r.buf, r.start, r.length, p[:n])
-			r.length += n
-			r.cond.Broadcast()
-			r.pokeLocked()
-			return n, nil
+			if n > room {
+				n = room
+			}
 		}
-		if !wait {
-			return 0, ErrOverflow
+		if r.budget != nil {
+			got := r.budget.TryAcquire(int64(n))
+			if got <= 0 {
+				if !wait {
+					return 0, ErrOverflow
+				}
+				r.cond.Wait()
+				continue
+			}
+			n = int(got)
 		}
-		r.cond.Wait()
+		copyIn(r.buf, r.start, r.length, p[:n])
+		r.length += n
+		r.budgeted += n
+		r.cond.Broadcast()
+		r.pokeLocked()
+		return n, nil
 	}
 }
 
@@ -214,27 +223,12 @@ func (r *Ring) ensureLocked(need int) bool {
 	if newSize <= len(r.buf) {
 		return false
 	}
-	delta := newSize - len(r.buf)
-	if r.budget != nil {
-		got := r.budget.TryAcquire(int64(delta))
-		if got <= 0 {
-			return false
-		}
-		if int(got) < delta {
-			newSize = len(r.buf) + int(got)
-			if newSize <= len(r.buf) {
-				r.budget.Release(got)
-				return false
-			}
-		}
-	}
 	nb := make([]byte, newSize)
 	if r.length > 0 && len(r.buf) > 0 {
 		copyOut(nb[:r.length], r.buf, r.start, r.length)
 	}
 	r.buf = nb
 	r.start = 0
-	r.allocated = newSize
 	return len(r.buf) >= need
 }
 
@@ -256,6 +250,13 @@ func (r *Ring) AdvanceTo(ack uint64) {
 		r.start = (r.start + drop) % len(r.buf)
 	}
 	r.length -= drop
+	if r.budget != nil && drop > 0 {
+		r.budget.Release(int64(drop))
+		r.budgeted -= drop
+		if r.budgeted < 0 {
+			r.budgeted = 0
+		}
+	}
 	r.base = ack
 	r.cond.Broadcast()
 	r.pokeLocked()

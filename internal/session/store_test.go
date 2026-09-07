@@ -29,8 +29,22 @@ func TestTokenRotateAndVerify(t *testing.T) {
 	if next == token {
 		t.Fatal("token was not rotated")
 	}
+	if err := st.VerifyToken(sess.ID, token); err != nil {
+		t.Fatalf("previous generation should still verify: %v", err)
+	}
+	if err := st.VerifyToken(sess.ID, next); err != nil {
+		t.Fatal(err)
+	}
+	again, err := st.ResumeToken(sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again != next {
+		t.Fatal("unconfirmed rotation must reuse the current token")
+	}
+	st.ConfirmToken(sess.ID)
 	if err := st.VerifyToken(sess.ID, token); !errors.Is(err, proto.ErrBadToken) {
-		t.Fatalf("old token: %v", err)
+		t.Fatalf("old token after confirm: %v", err)
 	}
 	if err := st.VerifyToken(sess.ID, next); err != nil {
 		t.Fatal(err)

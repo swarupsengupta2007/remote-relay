@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"math/big"
+	"sync"
 	"time"
 
 	"github.com/remote-relay/relay/internal/auth"
@@ -46,12 +47,14 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 	}
 
 	bw := bufio.NewWriterSize(stdout, 128*1024)
+	src, stopSrc := interruptibleReader(stdin)
 	sendLog := session.NewRing(bufCap, nil)
 	p := newPump(ctx, sessionIO{
 		conn:      conn,
-		src:       stdin,
+		src:       src,
 		sink:      bw,
 		flushSink: bw.Flush,
+		closeSrc:  func() error { stopSrc(); return nil },
 		outDir:    proto.DirUp,
 		inDir:     proto.DirDown,
 	}, pumpConfig{
@@ -83,38 +86,65 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 	if maxElapsed <= 0 {
 		maxElapsed = 5 * time.Minute
 	}
-	deadline := time.Now().Add(maxElapsed)
-	attempt := 0
-	for reconnectable(err) && time.Now().Before(deadline) {
-		nconn, rok, rerr := clientResume(ctx, cfg, sessionID, token, p.delivered.Load())
-		if rerr != nil {
-			if !reconnectable(rerr) {
-				return rerr
+	if helloOK.Limits.HoldTimeoutMs > 0 {
+		hold := time.Duration(helloOK.Limits.HoldTimeoutMs) * time.Millisecond
+		if hold > 0 && hold < maxElapsed {
+			maxElapsed = hold
+		}
+	}
+
+	for reconnectable(err) {
+		deadline := time.Now().Add(maxElapsed)
+		attempt := 0
+		resumed := false
+		for reconnectable(err) && time.Now().Before(deadline) {
+			nconn, rok, rerr := clientResume(ctx, cfg, sessionID, token, p.delivered.Load())
+			if rerr != nil {
+				if !reconnectable(rerr) {
+					return rerr
+				}
+				err = rerr
+				if serr := sleepBackoff(ctx, schedule, attempt, deadline); serr != nil {
+					break
+				}
+				attempt++
+				continue
 			}
-			err = rerr
-			if serr := sleepBackoff(ctx, schedule, attempt, deadline); serr != nil {
-				return fmt.Errorf("reconnect budget exhausted: %w", err)
+			token = rok.ResumeToken
+			if rok.State.UpClosed && !p.outEOF.Load() {
+				p.outFinal.Store(p.sendLog.End())
+				p.outEOF.Store(true)
+				p.sendLog.Close()
 			}
-			attempt++
+			p.sendLog.AdvanceTo(rok.UpAcked)
+			err = p.serveConn(p.sessCtx, nconn, rok.UpAcked)
+			if se := p.sessionErr(); se != nil {
+				return se
+			}
+			resumed = true
+			break
+		}
+		if resumed && reconnectable(err) {
 			continue
 		}
-		token = rok.ResumeToken
-		if rok.State.UpClosed && !p.outEOF.Load() {
-			p.outFinal.Store(p.sendLog.End())
-			p.outEOF.Store(true)
-			p.sendLog.Close()
+		if reconnectable(err) {
+			return fmt.Errorf("reconnect budget exhausted: %w", err)
 		}
-		p.sendLog.AdvanceTo(rok.UpAcked)
-		err = p.serveConn(p.sessCtx, nconn, rok.UpAcked)
-		if se := p.sessionErr(); se != nil {
-			return se
-		}
-		attempt = 0
-	}
-	if reconnectable(err) {
-		return fmt.Errorf("reconnect budget exhausted: %w", err)
+		return p.classify(err)
 	}
 	return p.classify(err)
+}
+
+func interruptibleReader(r io.Reader) (io.Reader, func()) {
+	pr, pw := io.Pipe()
+	go func() {
+		_, err := io.Copy(pw, r)
+		_ = pw.CloseWithError(err)
+	}()
+	return pr, sync.OnceFunc(func() {
+		_ = pr.Close()
+		_ = pw.Close()
+	})
 }
 
 func clientHello(ctx context.Context, cfg config.Client) (transport.Conn, proto.HelloOK, error) {

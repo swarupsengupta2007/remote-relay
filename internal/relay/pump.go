@@ -86,10 +86,13 @@ type pump struct {
 	cfg        pumpConfig
 	sendLog    *session.Ring
 
-	ctrlQ chan proto.Frame
-	sinkQ chan dataFrag
-	kick  chan struct{}
-	ack   *acker
+	ctrlQ    chan proto.Frame
+	sinkQ    chan dataFrag
+	kick     chan struct{}
+	sinkKick chan struct{}
+	ack      *acker
+
+	onPeerFrame func()
 
 	connMu     sync.Mutex
 	conn       transport.Conn
@@ -142,6 +145,7 @@ func newPump(parent context.Context, io sessionIO, cfg pumpConfig, sendLog *sess
 		ctrlQ:      make(chan proto.Frame, 64),
 		sinkQ:      make(chan dataFrag, 16),
 		kick:       make(chan struct{}, 1),
+		sinkKick:   make(chan struct{}, 1),
 		ack:        newAcker(),
 	}
 	p.lastIn.Store(time.Now().UnixNano())
@@ -169,14 +173,19 @@ func (p *pump) startIO() {
 
 func (p *pump) shutdown() {
 	p.sessCancel()
+	p.wakeSink()
 	if p.io.closeSrc != nil {
 		_ = p.io.closeSrc()
 	}
 	if p.sendLog != nil {
 		p.sendLog.Release()
 	}
-	p.srcWG.Wait()
-	p.sinkWG.Wait()
+	if p.io.closeSrc != nil {
+		p.srcWG.Wait()
+	}
+	if p.io.closeWrite != nil {
+		p.sinkWG.Wait()
+	}
 }
 
 func (p *pump) fail(err error) {
@@ -201,6 +210,19 @@ func (p *pump) nudge() {
 	select {
 	case p.kick <- struct{}{}:
 	default:
+	}
+}
+
+func (p *pump) wakeSink() {
+	select {
+	case p.sinkKick <- struct{}{}:
+	default:
+	}
+}
+
+func (p *pump) notePeerFrame() {
+	if f := p.onPeerFrame; f != nil {
+		f()
 	}
 }
 
@@ -235,6 +257,9 @@ func (p *pump) serveConn(ctx context.Context, conn transport.Conn, sendFrom uint
 	p.sendLog.AdvanceTo(sendFrom)
 	p.lastIn.Store(time.Now().UnixNano())
 	p.nudge()
+	if p.inGotClose.Load() {
+		p.wakeSink()
+	}
 
 	defer func() {
 		p.linkUp.Store(false)
@@ -382,7 +407,7 @@ func (p *pump) srcReader() error {
 				p.nudge()
 				return nil
 			}
-			if errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) {
+			if errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) || errors.Is(err, io.ErrClosedPipe) {
 				return nil
 			}
 			return err
@@ -554,6 +579,7 @@ func (p *pump) netReader() error {
 			return err
 		}
 		p.lastIn.Store(time.Now().UnixNano())
+		p.notePeerFrame()
 		switch f.Type {
 		case proto.TypeData:
 			seq, data, derr := proto.DecodeData(f.Payload)
@@ -602,6 +628,7 @@ func (p *pump) netReader() error {
 					_ = p.sendErr(proto.CodeProto, "CLOSE_DIR offset mismatch")
 					return proto.ErrProto
 				}
+				p.wakeSink()
 				continue
 			}
 			if cd.FinalOffset != expected {
@@ -610,6 +637,7 @@ func (p *pump) netReader() error {
 			}
 			p.inFinal.Store(cd.FinalOffset)
 			p.inGotClose.Store(true)
+			p.wakeSink()
 			if err := p.enqueueSink(dataFrag{eof: true}); err != nil {
 				return err
 			}
@@ -636,6 +664,17 @@ func (p *pump) netReader() error {
 	}
 }
 
+func (p *pump) tryCloseWrite(delivered uint64) {
+	if p.inGotClose.Load() && delivered >= p.inFinal.Load() {
+		p.cwOnce.Do(func() {
+			if p.io.closeWrite != nil {
+				_ = p.io.closeWrite()
+			}
+		})
+		p.nudge()
+	}
+}
+
 func (p *pump) sinkWriter() error {
 	var delivered uint64
 	for {
@@ -659,14 +698,9 @@ func (p *pump) sinkWriter() error {
 				}
 				p.nudge()
 			}
-			if p.inGotClose.Load() && delivered >= p.inFinal.Load() {
-				p.cwOnce.Do(func() {
-					if p.io.closeWrite != nil {
-						_ = p.io.closeWrite()
-					}
-				})
-				p.nudge()
-			}
+			p.tryCloseWrite(delivered)
+		case <-p.sinkKick:
+			p.tryCloseWrite(delivered)
 		}
 	}
 }

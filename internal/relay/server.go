@@ -253,15 +253,8 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 		s.store.Remove(sess.ID)
 		return
 	}
-	if err := writeFrameDeadline(conn, fr); err != nil {
-		_ = dtcp.Close()
-		s.store.Remove(sess.ID)
-		return
-	}
 
 	log := logging.WithSession(s.log, sess.ID)
-	log.Info("session started", "dest", dest, "peer", conn.RemoteAddr().String())
-
 	sendLog := session.NewRing(bufCap, s.budget)
 	p := newPump(ctx, sessionIO{
 		conn:       conn,
@@ -290,7 +283,9 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 		dest:        dtcp,
 		log:         log,
 		attachCh:    make(chan attachReq, 4),
+		deadCh:      make(chan struct{}),
 	}
+	l.onPeerFrame = func() { l.store.ConfirmToken(l.id) }
 	s.livesMu.Lock()
 	s.lives[sess.ID] = l
 	s.livesMu.Unlock()
@@ -301,6 +296,10 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 		l.cleanup(false)
 	}()
 
+	if err := writeFrameDeadline(conn, fr); err != nil {
+		return
+	}
+	log.Info("session started", "dest", dest, "peer", conn.RemoteAddr().String())
 	l.run(ctx, conn)
 }
 
@@ -366,6 +365,7 @@ type live struct {
 	dest        *net.TCPConn
 	log         *slog.Logger
 	attachCh    chan attachReq
+	deadCh      chan struct{}
 
 	mu      sync.Mutex
 	heldAt  time.Time
@@ -373,17 +373,64 @@ type live struct {
 	cleaned bool
 }
 
-func (l *live) Offer(req attachReq) error {
+func (l *live) markDead() {
 	l.mu.Lock()
-	if l.dead {
-		l.mu.Unlock()
-		return proto.ErrExpired
+	defer l.mu.Unlock()
+	if !l.dead {
+		l.dead = true
+		close(l.deadCh)
 	}
-	l.mu.Unlock()
+}
+
+func (l *live) rejectAttach(req attachReq, err error) {
+	code, msg := proto.CodeExpired, "session expired"
+	var pe *proto.Error
+	if errors.As(err, &pe) {
+		code, msg = pe.Code, pe.Msg
+	}
+	writeResumeFail(req.conn, code, msg)
+	_ = req.conn.Close()
+	select {
+	case req.done <- err:
+	default:
+	}
+}
+
+func (l *live) drainAttach(err error) {
+	for {
+		select {
+		case req := <-l.attachCh:
+			l.rejectAttach(req, err)
+		default:
+			return
+		}
+	}
+}
+
+func (l *live) failHold() {
+	l.markDead()
+	l.store.Expire(l.id)
+	l.drainAttach(proto.ErrExpired)
+}
+
+func (l *live) Offer(req attachReq) error {
+	select {
+	case <-l.deadCh:
+		return proto.ErrExpired
+	default:
+	}
 	select {
 	case l.attachCh <- req:
-		l.dropConn()
-		return nil
+		select {
+		case <-l.deadCh:
+			l.rejectAttach(req, proto.ErrExpired)
+			return proto.ErrExpired
+		default:
+			l.dropConn()
+			return nil
+		}
+	case <-l.deadCh:
+		return proto.ErrExpired
 	case <-l.sessCtx.Done():
 		return proto.ErrExpired
 	}
@@ -439,11 +486,8 @@ func (l *live) run(ctx context.Context, first transport.Conn) {
 
 func (l *live) holdWait(ctx context.Context) (attachReq, bool) {
 	if l.holdTimeout <= 0 {
-		l.store.Expire(l.id)
-		l.mu.Lock()
-		l.dead = true
-		l.mu.Unlock()
 		l.log.Info("session expired")
+		l.failHold()
 		return attachReq{}, false
 	}
 	l.mu.Lock()
@@ -458,21 +502,25 @@ func (l *live) holdWait(ctx context.Context) (attachReq, bool) {
 	case req := <-l.attachCh:
 		return req, true
 	case <-timer.C:
-		l.store.Expire(l.id)
-		l.mu.Lock()
-		l.dead = true
-		l.mu.Unlock()
+		select {
+		case req := <-l.attachCh:
+			return req, true
+		default:
+		}
 		l.log.Info("session expired")
+		l.failHold()
 		return attachReq{}, false
 	case <-ctx.Done():
+		l.failHold()
 		return attachReq{}, false
 	case <-l.sessCtx.Done():
+		l.failHold()
 		return attachReq{}, false
 	}
 }
 
 func (l *live) writeResumeOK(req attachReq, heldMs int) error {
-	token, err := l.store.RotateToken(l.id)
+	token, err := l.store.ResumeToken(l.id)
 	if err != nil {
 		return err
 	}
@@ -513,8 +561,9 @@ func (l *live) cleanup(expired bool) {
 		return
 	}
 	l.cleaned = true
-	l.dead = true
 	l.mu.Unlock()
+	l.markDead()
+	l.drainAttach(proto.ErrExpired)
 	if l.dest != nil {
 		_ = l.dest.Close()
 	}

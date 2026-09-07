@@ -128,6 +128,16 @@ func TestRingBudgetCapsGrowth(t *testing.T) {
 	if err := r.TryAppend([]byte("i")); !errors.Is(err, ErrOverflow) {
 		t.Fatalf("got %v", err)
 	}
+	r.AdvanceTo(8)
+	if b.Used() != 0 {
+		t.Fatalf("used after advance %d", b.Used())
+	}
+	if err := r.TryAppend([]byte("ijkl")); err != nil {
+		t.Fatal(err)
+	}
+	if b.Used() != 4 {
+		t.Fatalf("used=%d", b.Used())
+	}
 	r.Release()
 	if b.Used() != 0 {
 		t.Fatalf("used after release %d", b.Used())
