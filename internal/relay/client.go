@@ -3,15 +3,18 @@ package relay
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
 	"time"
 
 	"github.com/remote-relay/relay/internal/auth"
 	"github.com/remote-relay/relay/internal/config"
 	"github.com/remote-relay/relay/internal/logging"
 	"github.com/remote-relay/relay/internal/proto"
+	"github.com/remote-relay/relay/internal/session"
 	"github.com/remote-relay/relay/internal/transport"
 )
 
@@ -25,19 +28,110 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 		log.Warn("UDP upgrade is not built yet; staying on TCP", "requested", cfg.Transport)
 	}
 
-	conn, err := transport.DialTCP(ctx, cfg.Server)
-	if err != nil {
-		return fmt.Errorf("dial server: %w", err)
-	}
-	defer conn.Close()
-
-	authMsg, err := auth.None{}.Respond(auth.Challenge{Destination: cfg.Destination})
+	conn, helloOK, err := clientHello(ctx, cfg)
 	if err != nil {
 		return err
+	}
+	log = logging.WithSession(log, helloOK.SessionID)
+	log.Info("session established", "transport", "tcp")
+
+	chunk := clampChunk(helloOK.Limits.DataChunkBytes)
+	window := cfg.SendWindow
+	if helloOK.Limits.Window > 0 && (window <= 0 || helloOK.Limits.Window < window) {
+		window = helloOK.Limits.Window
+	}
+	bufCap := cfg.BufferBytes
+	if helloOK.Limits.BufferBytes > 0 && helloOK.Limits.BufferBytes < bufCap {
+		bufCap = helloOK.Limits.BufferBytes
+	}
+
+	bw := bufio.NewWriterSize(stdout, 128*1024)
+	sendLog := session.NewRing(bufCap, nil)
+	p := newPump(ctx, sessionIO{
+		conn:      conn,
+		src:       stdin,
+		sink:      bw,
+		flushSink: bw.Flush,
+		outDir:    proto.DirUp,
+		inDir:     proto.DirDown,
+	}, pumpConfig{
+		chunk:     chunk,
+		window:    window,
+		buffer:    bufCap,
+		keepalive: 5 * time.Second,
+		idle:      30 * time.Second,
+		log:       log,
+	}, sendLog)
+	p.startIO()
+	defer func() {
+		p.shutdown()
+		_ = bw.Flush()
+	}()
+
+	err = p.serveConn(p.sessCtx, conn, 0)
+	if se := p.sessionErr(); se != nil {
+		return se
+	}
+	if !reconnectable(err) {
+		return p.classify(err)
+	}
+
+	token := helloOK.ResumeToken
+	sessionID := helloOK.SessionID
+	schedule := parseBackoff(cfg.ReconnectBackoff)
+	maxElapsed := cfg.ReconnectMaxElapsed.Duration()
+	if maxElapsed <= 0 {
+		maxElapsed = 5 * time.Minute
+	}
+	deadline := time.Now().Add(maxElapsed)
+	attempt := 0
+	for reconnectable(err) && time.Now().Before(deadline) {
+		nconn, rok, rerr := clientResume(ctx, cfg, sessionID, token, p.delivered.Load())
+		if rerr != nil {
+			if !reconnectable(rerr) {
+				return rerr
+			}
+			err = rerr
+			if serr := sleepBackoff(ctx, schedule, attempt, deadline); serr != nil {
+				return fmt.Errorf("reconnect budget exhausted: %w", err)
+			}
+			attempt++
+			continue
+		}
+		token = rok.ResumeToken
+		if rok.State.UpClosed && !p.outEOF.Load() {
+			p.outFinal.Store(p.sendLog.End())
+			p.outEOF.Store(true)
+			p.sendLog.Close()
+		}
+		p.sendLog.AdvanceTo(rok.UpAcked)
+		err = p.serveConn(p.sessCtx, nconn, rok.UpAcked)
+		if se := p.sessionErr(); se != nil {
+			return se
+		}
+		attempt = 0
+	}
+	if reconnectable(err) {
+		return fmt.Errorf("reconnect budget exhausted: %w", err)
+	}
+	return p.classify(err)
+}
+
+func clientHello(ctx context.Context, cfg config.Client) (transport.Conn, proto.HelloOK, error) {
+	var none proto.HelloOK
+	conn, err := transport.DialTCP(ctx, cfg.Server)
+	if err != nil {
+		return nil, none, fmt.Errorf("dial server: %w", err)
+	}
+	authMsg, err := auth.None{}.Respond(auth.Challenge{Destination: cfg.Destination})
+	if err != nil {
+		_ = conn.Close()
+		return nil, none, err
 	}
 	nonce, err := proto.RandomNonce()
 	if err != nil {
-		return err
+		_ = conn.Close()
+		return nil, none, err
 	}
 	hello := proto.Hello{
 		V:           1,
@@ -54,65 +148,161 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 	}
 	fr, err := proto.MarshalFrame(proto.TypeHello, hello)
 	if err != nil {
-		return err
+		_ = conn.Close()
+		return nil, none, err
 	}
 	if err := conn.SetDeadline(deadlineOr(ctx, handshakeTimeout)); err != nil {
-		return err
+		_ = conn.Close()
+		return nil, none, err
 	}
 	if err := conn.WriteFrame(fr); err != nil {
-		return fmt.Errorf("send HELLO: %w", err)
+		_ = conn.Close()
+		return nil, none, fmt.Errorf("send HELLO: %w", err)
 	}
-	// Server may spend DialTimeout connecting the destination before HELLO_OK or ERR.
 	if err := conn.SetDeadline(deadlineOr(ctx, handshakeTimeout+config.DefaultServer().DialTimeout.Duration())); err != nil {
-		return err
+		_ = conn.Close()
+		return nil, none, err
 	}
 	reply, err := conn.ReadFrame()
 	if err != nil {
-		return fmt.Errorf("read HELLO_OK: %w", err)
+		_ = conn.Close()
+		return nil, none, fmt.Errorf("read HELLO_OK: %w", err)
 	}
+	_ = conn.SetDeadline(time.Time{})
 	if reply.Type == proto.TypeErr {
+		_ = conn.Close()
 		var fail proto.Fail
 		_ = proto.UnmarshalPayload(reply, &fail)
-		return proto.NewError(fail.Code, fail.Msg)
+		return nil, none, proto.NewError(fail.Code, fail.Msg)
 	}
 	if reply.Type != proto.TypeHelloOK {
-		return proto.NewError(proto.CodeProto, "expected HELLO_OK, got "+reply.Type.String())
+		_ = conn.Close()
+		return nil, none, proto.NewError(proto.CodeProto, "expected HELLO_OK, got "+reply.Type.String())
 	}
 	var ok proto.HelloOK
 	if err := proto.UnmarshalPayload(reply, &ok); err != nil {
-		return err
+		_ = conn.Close()
+		return nil, none, err
 	}
 	if ok.V != 1 {
-		return proto.ErrVersion
+		_ = conn.Close()
+		return nil, none, proto.ErrVersion
 	}
+	return conn, ok, nil
+}
+
+func clientResume(ctx context.Context, cfg config.Client, sessionID, token string, downAcked uint64) (transport.Conn, proto.ResumeOK, error) {
+	var none proto.ResumeOK
+	conn, err := transport.DialTCP(ctx, cfg.Server)
+	if err != nil {
+		return nil, none, err
+	}
+	nonce, err := proto.RandomNonce()
+	if err != nil {
+		_ = conn.Close()
+		return nil, none, err
+	}
+	msg := proto.Resume{
+		V:           1,
+		SessionID:   sessionID,
+		ResumeToken: token,
+		Transport:   []string{"tcp"},
+		DownAcked:   downAcked,
+		ClientNonce: nonce,
+	}
+	fr, err := proto.MarshalFrame(proto.TypeResume, msg)
+	if err != nil {
+		_ = conn.Close()
+		return nil, none, err
+	}
+	if err := conn.SetDeadline(deadlineOr(ctx, handshakeTimeout)); err != nil {
+		_ = conn.Close()
+		return nil, none, err
+	}
+	if err := conn.WriteFrame(fr); err != nil {
+		_ = conn.Close()
+		return nil, none, err
+	}
+	reply, err := conn.ReadFrame()
 	_ = conn.SetDeadline(time.Time{})
-
-	log = logging.WithSession(log, ok.SessionID)
-	log.Info("session established", "transport", "tcp")
-
-	chunk := clampChunk(ok.Limits.DataChunkBytes)
-	window := cfg.SendWindow
-	if ok.Limits.Window > 0 && (window <= 0 || ok.Limits.Window < window) {
-		window = ok.Limits.Window
+	if err != nil {
+		_ = conn.Close()
+		return nil, none, err
 	}
+	switch reply.Type {
+	case proto.TypeResumeFail, proto.TypeErr:
+		_ = conn.Close()
+		var fail proto.Fail
+		_ = proto.UnmarshalPayload(reply, &fail)
+		if fail.Code == "" {
+			fail.Code = proto.CodeInternal
+		}
+		return nil, none, proto.NewError(fail.Code, fail.Msg)
+	case proto.TypeResumeOK:
+	default:
+		_ = conn.Close()
+		return nil, none, proto.NewError(proto.CodeProto, "expected RESUME_OK, got "+reply.Type.String())
+	}
+	var ok proto.ResumeOK
+	if err := proto.UnmarshalPayload(reply, &ok); err != nil {
+		_ = conn.Close()
+		return nil, none, err
+	}
+	if ok.V != 1 {
+		_ = conn.Close()
+		return nil, none, proto.ErrVersion
+	}
+	return conn, ok, nil
+}
 
-	bw := bufio.NewWriterSize(stdout, 128*1024)
-	err = runPump(ctx, sessionIO{
-		conn:      conn,
-		src:       stdin,
-		sink:      bw,
-		flushSink: bw.Flush,
-		outDir:    proto.DirUp,
-		inDir:     proto.DirDown,
-	}, pumpConfig{
-		chunk:     chunk,
-		window:    window,
-		keepalive: 5 * time.Second,
-		idle:      30 * time.Second,
-		log:       log,
-	})
-	_ = bw.Flush()
-	return err
+func parseBackoff(ss []string) []time.Duration {
+	out := make([]time.Duration, 0, len(ss))
+	for _, s := range ss {
+		d, err := time.ParseDuration(s)
+		if err != nil || d < 0 {
+			continue
+		}
+		out = append(out, d)
+	}
+	if len(out) == 0 {
+		return []time.Duration{100 * time.Millisecond}
+	}
+	return out
+}
+
+func sleepBackoff(ctx context.Context, schedule []time.Duration, attempt int, deadline time.Time) error {
+	if time.Now().After(deadline) {
+		return context.DeadlineExceeded
+	}
+	var d time.Duration
+	if len(schedule) == 0 {
+		d = 100 * time.Millisecond
+	} else if attempt >= len(schedule) {
+		d = schedule[len(schedule)-1]
+	} else if attempt >= 0 {
+		d = schedule[attempt]
+	}
+	if d > 0 {
+		n, err := rand.Int(rand.Reader, big.NewInt(int64(d)+1))
+		if err == nil {
+			d = time.Duration(n.Int64())
+		}
+	}
+	remain := time.Until(deadline)
+	if remain <= 0 {
+		return context.DeadlineExceeded
+	}
+	if d > remain {
+		d = remain
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 func deadlineOr(ctx context.Context, d time.Duration) time.Time {

@@ -11,13 +11,15 @@ import (
 	"time"
 
 	"github.com/remote-relay/relay/internal/proto"
+	"github.com/remote-relay/relay/internal/session"
 	"github.com/remote-relay/relay/internal/transport"
 )
 
 var (
-	errByeSent     = errors.New("bye sent")
-	errByeReceived = errors.New("bye received")
-	errIdle        = errors.New("idle timeout")
+	errByeSent       = errors.New("bye sent")
+	errByeReceived   = errors.New("bye received")
+	errIdle          = errors.New("idle timeout")
+	errTransportDown = errors.New("transport down")
 )
 
 type sessionIO struct {
@@ -34,6 +36,7 @@ type sessionIO struct {
 type pumpConfig struct {
 	chunk     int
 	window    int
+	buffer    int
 	keepalive time.Duration
 	idle      time.Duration
 	log       *slog.Logger
@@ -70,49 +73,52 @@ func (a *acker) Advance(n uint64) {
 	}
 }
 
-func (a *acker) WaitBelow(ctx context.Context, sent, window uint64) error {
-	for {
-		a.mu.Lock()
-		acked := a.acked
-		if acked >= sent || sent-acked < window {
-			a.mu.Unlock()
-			return nil
-		}
-		ch := a.wait
-		a.mu.Unlock()
-		select {
-		case <-ch:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
+func (a *acker) WaitCh() <-chan struct{} {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.wait
 }
 
 type pump struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-	io     sessionIO
-	cfg    pumpConfig
+	sessCtx    context.Context
+	sessCancel context.CancelFunc
+	io         sessionIO
+	cfg        pumpConfig
+	sendLog    *session.Ring
 
-	outQ  chan proto.Frame
+	ctrlQ chan proto.Frame
 	sinkQ chan dataFrag
+	kick  chan struct{}
 	ack   *acker
 
-	outFinal atomic.Uint64
-	outEOF   atomic.Bool
+	connMu     sync.Mutex
+	conn       transport.Conn
+	connCtx    context.Context
+	connCancel context.CancelFunc
+	sendFrom   uint64
 
+	outFinal   atomic.Uint64
+	outEOF     atomic.Bool
 	inFinal    atomic.Uint64
 	inGotClose atomic.Bool
 	delivered  atomic.Uint64
+	expected   atomic.Uint64
 
 	lastIn        atomic.Int64
 	finished      atomic.Bool
 	backpressured atomic.Bool
-	byeOnce       sync.Once
-	cwOnce        sync.Once
+	linkUp        atomic.Bool
+
+	srcWG  sync.WaitGroup
+	sinkWG sync.WaitGroup
+	ioOnce sync.Once
+	cwOnce sync.Once
+
+	fatalMu sync.Mutex
+	fatal   error
 }
 
-func runPump(ctx context.Context, io sessionIO, cfg pumpConfig) error {
+func newPump(parent context.Context, io sessionIO, cfg pumpConfig, sendLog *session.Ring) *pump {
 	if cfg.log == nil {
 		cfg.log = slog.Default()
 	}
@@ -120,26 +126,134 @@ func runPump(ctx context.Context, io sessionIO, cfg pumpConfig) error {
 	if cfg.window <= 0 {
 		cfg.window = 4194304
 	}
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
+	if cfg.buffer <= 0 {
+		cfg.buffer = cfg.window
+	}
+	if sendLog == nil {
+		sendLog = session.NewRing(cfg.buffer, nil)
+	}
+	ctx, cancel := context.WithCancel(parent)
 	p := &pump{
-		ctx:    ctx,
-		cancel: cancel,
-		io:     io,
-		cfg:    cfg,
-		outQ:   make(chan proto.Frame, 32),
-		sinkQ:  make(chan dataFrag, 16),
-		ack:    newAcker(),
+		sessCtx:    ctx,
+		sessCancel: cancel,
+		io:         io,
+		cfg:        cfg,
+		sendLog:    sendLog,
+		ctrlQ:      make(chan proto.Frame, 64),
+		sinkQ:      make(chan dataFrag, 16),
+		kick:       make(chan struct{}, 1),
+		ack:        newAcker(),
 	}
 	p.lastIn.Store(time.Now().UnixNano())
+	return p
+}
 
-	errc := make(chan error, 8)
-	var netWG, srcWG sync.WaitGroup
-	start := func(fn func() error) {
-		netWG.Add(1)
+func (p *pump) startIO() {
+	p.ioOnce.Do(func() {
+		p.srcWG.Add(1)
 		go func() {
-			defer netWG.Done()
+			defer p.srcWG.Done()
+			if err := p.srcReader(); err != nil && p.sessCtx.Err() == nil {
+				p.fail(err)
+			}
+		}()
+		p.sinkWG.Add(1)
+		go func() {
+			defer p.sinkWG.Done()
+			if err := p.sinkWriter(); err != nil && p.sessCtx.Err() == nil {
+				p.fail(err)
+			}
+		}()
+	})
+}
+
+func (p *pump) shutdown() {
+	p.sessCancel()
+	if p.io.closeSrc != nil {
+		_ = p.io.closeSrc()
+	}
+	if p.sendLog != nil {
+		p.sendLog.Release()
+	}
+	p.srcWG.Wait()
+	p.sinkWG.Wait()
+}
+
+func (p *pump) fail(err error) {
+	if err == nil {
+		return
+	}
+	p.fatalMu.Lock()
+	if p.fatal == nil {
+		p.fatal = err
+	}
+	p.fatalMu.Unlock()
+	p.sessCancel()
+}
+
+func (p *pump) sessionErr() error {
+	p.fatalMu.Lock()
+	defer p.fatalMu.Unlock()
+	return p.fatal
+}
+
+func (p *pump) nudge() {
+	select {
+	case p.kick <- struct{}{}:
+	default:
+	}
+}
+
+func (p *pump) dropConn() {
+	p.connMu.Lock()
+	c := p.conn
+	cancel := p.connCancel
+	p.connMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if c != nil {
+		_ = c.Close()
+	}
+}
+
+func (p *pump) serveConn(ctx context.Context, conn transport.Conn, sendFrom uint64) error {
+	connCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	p.connMu.Lock()
+	p.conn = conn
+	p.connCtx = connCtx
+	p.connCancel = cancel
+	p.sendFrom = sendFrom
+	p.io.conn = conn
+	p.connMu.Unlock()
+
+	p.linkUp.Store(true)
+	p.sendLog.SetSoftLimit(p.cfg.window)
+	p.ack.Advance(sendFrom)
+	p.sendLog.AdvanceTo(sendFrom)
+	p.lastIn.Store(time.Now().UnixNano())
+	p.nudge()
+
+	defer func() {
+		p.linkUp.Store(false)
+		p.sendLog.SetSoftLimit(0)
+		_ = conn.Close()
+		p.connMu.Lock()
+		if p.conn == conn {
+			p.conn = nil
+			p.connCancel = nil
+		}
+		p.connMu.Unlock()
+	}()
+
+	errc := make(chan error, 4)
+	var wg sync.WaitGroup
+	start := func(fn func() error) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
 			if err := fn(); err != nil {
 				select {
 				case errc <- err:
@@ -149,36 +263,38 @@ func runPump(ctx context.Context, io sessionIO, cfg pumpConfig) error {
 			}
 		}()
 	}
-	srcWG.Add(1)
-	go func() {
-		defer srcWG.Done()
-		if err := p.srcReader(); err != nil {
-			select {
-			case errc <- err:
-			default:
-			}
-			cancel()
-		}
-	}()
 	start(p.netWriter)
 	start(p.netReader)
-	start(p.sinkWriter)
 	start(p.timer)
 
 	var err error
 	select {
 	case err = <-errc:
-	case <-ctx.Done():
-		err = ctx.Err()
+	case <-connCtx.Done():
+		err = connCtx.Err()
+	case <-p.sessCtx.Done():
+		if se := p.sessionErr(); se != nil {
+			err = se
+		} else {
+			err = p.sessCtx.Err()
+		}
 	}
 	cancel()
-	_ = p.io.conn.Close()
-	if p.io.closeSrc != nil {
-		_ = p.io.closeSrc()
-		srcWG.Wait()
+	_ = conn.Close()
+	wg.Wait()
+	if p.finished.Load() {
+		return errByeSent
 	}
-	netWG.Wait()
-	return p.classify(err)
+	if se := p.sessionErr(); se != nil {
+		return se
+	}
+	if p.sessCtx.Err() != nil {
+		return p.sessCtx.Err()
+	}
+	if err == nil || errors.Is(err, context.Canceled) {
+		return errTransportDown
+	}
+	return err
 }
 
 func (p *pump) classify(err error) error {
@@ -189,50 +305,84 @@ func (p *pump) classify(err error) error {
 		return nil
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed) {
+		if se := p.sessionErr(); se != nil {
+			return se
+		}
 		return nil
 	}
 	return err
 }
 
-func (p *pump) send(f proto.Frame) error {
-	select {
-	case p.outQ <- f:
+func reconnectable(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, errByeSent) || errors.Is(err, errByeReceived) {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if errors.Is(err, session.ErrClosed) {
+		return false
+	}
+	var pe *proto.Error
+	if errors.As(err, &pe) {
+		switch pe.Code {
+		case proto.CodeProto, proto.CodeFrame, proto.CodeVersion,
+			proto.CodeDestRefused, proto.CodeDestForbidden, proto.CodeNoCapacity,
+			proto.CodeUnknownSession, proto.CodeBadToken, proto.CodeExpired,
+			proto.CodeAuth, proto.CodeShutdown:
+			return false
+		}
+	}
+	return true
+}
+
+func (p *pump) sendCtrl(f proto.Frame) error {
+	p.connMu.Lock()
+	connCtx := p.connCtx
+	p.connMu.Unlock()
+	if connCtx == nil || !p.linkUp.Load() {
+		p.nudge()
 		return nil
-	case <-p.ctx.Done():
-		return p.ctx.Err()
+	}
+	select {
+	case p.ctrlQ <- f:
+		p.nudge()
+		return nil
+	case <-connCtx.Done():
+		p.nudge()
+		return nil
+	case <-p.sessCtx.Done():
+		return p.sessCtx.Err()
 	}
 }
 
 func (p *pump) srcReader() error {
 	buf := make([]byte, p.cfg.chunk)
-	var offset uint64
 	for {
+		if err := p.sessCtx.Err(); err != nil {
+			return err
+		}
 		n, err := p.io.src.Read(buf)
 		if n > 0 {
-			if werr := p.ack.WaitBelow(p.ctx, offset, uint64(p.cfg.window)); werr != nil {
-				return werr
+			if aerr := p.sendLog.Append(p.sessCtx, buf[:n]); aerr != nil {
+				if errors.Is(aerr, session.ErrClosed) || errors.Is(aerr, context.Canceled) {
+					return nil
+				}
+				return aerr
 			}
-			frame := proto.Frame{Type: proto.TypeData, Payload: proto.EncodeData(offset, buf[:n])}
-			if serr := p.send(frame); serr != nil {
-				return serr
-			}
-			offset += uint64(n)
 		}
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				p.outFinal.Store(offset)
+				p.outFinal.Store(p.sendLog.End())
 				p.outEOF.Store(true)
-				fr, merr := proto.MarshalFrame(proto.TypeCloseDir, proto.CloseDir{
-					Dir:         p.io.outDir,
-					FinalOffset: offset,
-				})
-				if merr != nil {
-					return merr
-				}
-				if serr := p.send(fr); serr != nil {
-					return serr
-				}
-				p.maybeBye()
+				p.sendLog.Close()
+				p.nudge()
+				return nil
+			}
+			if errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) {
 				return nil
 			}
 			return err
@@ -240,38 +390,166 @@ func (p *pump) srcReader() error {
 	}
 }
 
+func (p *pump) writeConn(f proto.Frame) error {
+	p.connMu.Lock()
+	c := p.conn
+	p.connMu.Unlock()
+	if c == nil {
+		return net.ErrClosed
+	}
+	return c.WriteFrame(f)
+}
+
 func (p *pump) netWriter() error {
+	sent := p.sendFrom
+	if base := p.sendLog.Base(); base > sent {
+		sent = base
+	}
+	if d := p.delivered.Load(); d > 0 {
+		if err := p.writeConn(proto.Frame{Type: proto.TypeAck, Payload: proto.EncodeAck(d)}); err != nil {
+			return err
+		}
+	}
+	closeSent := false
 	for {
+		if err := p.connCtx.Err(); err != nil {
+			return err
+		}
+		for {
+			select {
+			case f := <-p.ctrlQ:
+				if err := p.writeConn(f); err != nil {
+					return err
+				}
+				if f.Type == proto.TypeBye {
+					p.finished.Store(true)
+					return errByeSent
+				}
+				continue
+			default:
+			}
+			break
+		}
+
+		acked := p.ack.Get()
+		if p.cfg.window > 0 && sent > acked && sent-acked >= uint64(p.cfg.window) {
+			select {
+			case <-p.connCtx.Done():
+				return p.connCtx.Err()
+			case f := <-p.ctrlQ:
+				if err := p.writeConn(f); err != nil {
+					return err
+				}
+				if f.Type == proto.TypeBye {
+					p.finished.Store(true)
+					return errByeSent
+				}
+			case <-p.ack.WaitCh():
+			case <-p.kick:
+			}
+			continue
+		}
+
+		from, data := p.sendLog.Slice(sent, p.cfg.chunk)
+		if from > sent {
+			sent = from
+		}
+		if len(data) > 0 {
+			fr := proto.Frame{Type: proto.TypeData, Payload: proto.EncodeData(sent, data)}
+			if err := p.writeConn(fr); err != nil {
+				return err
+			}
+			sent += uint64(len(data))
+			continue
+		}
+
+		if p.outEOF.Load() && sent >= p.outFinal.Load() {
+			if !closeSent {
+				fr, err := proto.MarshalFrame(proto.TypeCloseDir, proto.CloseDir{
+					Dir:         p.io.outDir,
+					FinalOffset: p.outFinal.Load(),
+				})
+				if err != nil {
+					return err
+				}
+				if err := p.writeConn(fr); err != nil {
+					return err
+				}
+				closeSent = true
+			}
+			if p.bothDrained() {
+				fr, err := proto.MarshalFrame(proto.TypeBye, proto.Bye{Msg: "closed"})
+				if err != nil {
+					return err
+				}
+				if err := p.writeConn(fr); err != nil {
+					return err
+				}
+				p.finished.Store(true)
+				return errByeSent
+			}
+		}
+
 		select {
-		case <-p.ctx.Done():
-			return p.ctx.Err()
-		case f := <-p.outQ:
-			if err := p.io.conn.WriteFrame(f); err != nil {
+		case <-p.connCtx.Done():
+			return p.connCtx.Err()
+		case f := <-p.ctrlQ:
+			if err := p.writeConn(f); err != nil {
 				return err
 			}
 			if f.Type == proto.TypeBye {
 				p.finished.Store(true)
 				return errByeSent
 			}
+		case <-p.sendLog.Notify():
+		case <-p.kick:
+		case <-p.ack.WaitCh():
 		}
 	}
+}
+
+func (p *pump) bothDrained() bool {
+	if !p.outEOF.Load() || !p.inGotClose.Load() {
+		return false
+	}
+	if p.delivered.Load() < p.inFinal.Load() {
+		return false
+	}
+	if p.ack.Get() < p.outFinal.Load() {
+		return false
+	}
+	return true
 }
 
 func (p *pump) enqueueSink(frag dataFrag) error {
 	p.backpressured.Store(true)
 	defer p.backpressured.Store(false)
+	p.connMu.Lock()
+	connCtx := p.connCtx
+	p.connMu.Unlock()
+	if connCtx == nil {
+		connCtx = p.sessCtx
+	}
 	select {
 	case p.sinkQ <- frag:
 		return nil
-	case <-p.ctx.Done():
-		return p.ctx.Err()
+	case <-connCtx.Done():
+		return connCtx.Err()
+	case <-p.sessCtx.Done():
+		return p.sessCtx.Err()
 	}
 }
 
 func (p *pump) netReader() error {
-	expected := uint64(0)
+	expected := p.expected.Load()
 	for {
-		f, err := p.io.conn.ReadFrame()
+		p.connMu.Lock()
+		c := p.conn
+		p.connMu.Unlock()
+		if c == nil {
+			return net.ErrClosed
+		}
+		f, err := c.ReadFrame()
 		if err != nil {
 			return err
 		}
@@ -283,17 +561,13 @@ func (p *pump) netReader() error {
 				_ = p.sendErr(proto.CodeProto, "bad DATA")
 				return derr
 			}
-			end := seq + uint64(len(data))
-			if end <= expected {
-				continue
-			}
-			if seq < expected {
-				data = data[expected-seq:]
-				seq = expected
-			}
-			if seq > expected {
+			seq, data, drop, derr := session.Dedupe(seq, data, expected)
+			if derr != nil {
 				_ = p.sendErr(proto.CodeProto, "gap in data stream")
-				return proto.ErrProto
+				return derr
+			}
+			if drop {
+				continue
 			}
 			if p.inGotClose.Load() && seq+uint64(len(data)) > p.inFinal.Load() {
 				_ = p.sendErr(proto.CodeProto, "data past CLOSE_DIR")
@@ -303,14 +577,16 @@ func (p *pump) netReader() error {
 				return err
 			}
 			expected += uint64(len(data))
+			p.expected.Store(expected)
 		case proto.TypeAck:
 			acked, aerr := proto.DecodeAck(f.Payload)
 			if aerr != nil {
 				_ = p.sendErr(proto.CodeProto, "bad ACK")
 				return aerr
 			}
+			p.sendLog.AdvanceTo(acked)
 			p.ack.Advance(acked)
-			p.maybeBye()
+			p.nudge()
 		case proto.TypeCloseDir:
 			var cd proto.CloseDir
 			if uerr := proto.UnmarshalPayload(f, &cd); uerr != nil {
@@ -321,6 +597,13 @@ func (p *pump) netReader() error {
 				_ = p.sendErr(proto.CodeProto, "CLOSE_DIR direction")
 				return proto.ErrProto
 			}
+			if p.inGotClose.Load() {
+				if cd.FinalOffset != p.inFinal.Load() {
+					_ = p.sendErr(proto.CodeProto, "CLOSE_DIR offset mismatch")
+					return proto.ErrProto
+				}
+				continue
+			}
 			if cd.FinalOffset != expected {
 				_ = p.sendErr(proto.CodeProto, "CLOSE_DIR offset mismatch")
 				return proto.ErrProto
@@ -330,9 +613,9 @@ func (p *pump) netReader() error {
 			if err := p.enqueueSink(dataFrag{eof: true}); err != nil {
 				return err
 			}
-			p.maybeBye()
+			p.nudge()
 		case proto.TypePing:
-			if err := p.send(proto.Frame{Type: proto.TypePong, Payload: f.Payload}); err != nil {
+			if err := p.sendCtrl(proto.Frame{Type: proto.TypePong, Payload: f.Payload}); err != nil {
 				return err
 			}
 		case proto.TypePong:
@@ -357,8 +640,8 @@ func (p *pump) sinkWriter() error {
 	var delivered uint64
 	for {
 		select {
-		case <-p.ctx.Done():
-			return p.ctx.Err()
+		case <-p.sessCtx.Done():
+			return p.sessCtx.Err()
 		case frag := <-p.sinkQ:
 			if len(frag.data) > 0 {
 				if err := writeFull(p.io.sink, frag.data); err != nil {
@@ -371,9 +654,10 @@ func (p *pump) sinkWriter() error {
 				}
 				delivered += uint64(len(frag.data))
 				p.delivered.Store(delivered)
-				if err := p.send(proto.Frame{Type: proto.TypeAck, Payload: proto.EncodeAck(delivered)}); err != nil {
+				if err := p.sendCtrl(proto.Frame{Type: proto.TypeAck, Payload: proto.EncodeAck(delivered)}); err != nil {
 					return err
 				}
+				p.nudge()
 			}
 			if p.inGotClose.Load() && delivered >= p.inFinal.Load() {
 				p.cwOnce.Do(func() {
@@ -381,7 +665,7 @@ func (p *pump) sinkWriter() error {
 						_ = p.io.closeWrite()
 					}
 				})
-				p.maybeBye()
+				p.nudge()
 			}
 		}
 	}
@@ -389,51 +673,29 @@ func (p *pump) sinkWriter() error {
 
 func (p *pump) timer() error {
 	if p.cfg.keepalive <= 0 {
-		<-p.ctx.Done()
-		return p.ctx.Err()
+		<-p.connCtx.Done()
+		return p.connCtx.Err()
 	}
 	t := time.NewTicker(p.cfg.keepalive)
 	defer t.Stop()
 	var nonce uint64
 	for {
 		select {
-		case <-p.ctx.Done():
-			return p.ctx.Err()
+		case <-p.connCtx.Done():
+			return p.connCtx.Err()
 		case now := <-t.C:
 			last := time.Unix(0, p.lastIn.Load())
 			if p.cfg.idle > 0 && !p.backpressured.Load() && now.Sub(last) > p.cfg.idle {
-				p.cancel()
+				p.connCancel()
 				return errIdle
 			}
 			nonce++
 			payload := proto.EncodePing(nonce, uint64(now.UnixMilli()))
-			if err := p.send(proto.Frame{Type: proto.TypePing, Payload: payload}); err != nil {
+			if err := p.sendCtrl(proto.Frame{Type: proto.TypePing, Payload: payload}); err != nil {
 				return err
 			}
 		}
 	}
-}
-
-func (p *pump) maybeBye() {
-	if !p.outEOF.Load() || !p.inGotClose.Load() {
-		return
-	}
-	if p.delivered.Load() < p.inFinal.Load() {
-		return
-	}
-	if p.ack.Get() < p.outFinal.Load() {
-		return
-	}
-	p.byeOnce.Do(func() {
-		fr, err := proto.MarshalFrame(proto.TypeBye, proto.Bye{Msg: "closed"})
-		if err != nil {
-			return
-		}
-		select {
-		case p.outQ <- fr:
-		case <-p.ctx.Done():
-		}
-	})
 }
 
 func (p *pump) sendErr(code, msg string) error {
@@ -441,7 +703,7 @@ func (p *pump) sendErr(code, msg string) error {
 	if err != nil {
 		return err
 	}
-	return p.send(fr)
+	return p.sendCtrl(fr)
 }
 
 func writeFull(w io.Writer, p []byte) error {
@@ -467,6 +729,14 @@ func writeFrameDeadline(conn transport.Conn, f proto.Frame) error {
 
 func writeErr(conn transport.Conn, code, msg string) {
 	fr, err := proto.MarshalFrame(proto.TypeErr, proto.Fail{Code: code, Msg: msg})
+	if err != nil {
+		return
+	}
+	_ = writeFrameDeadline(conn, fr)
+}
+
+func writeResumeFail(conn transport.Conn, code, msg string) {
+	fr, err := proto.MarshalFrame(proto.TypeResumeFail, proto.Fail{Code: code, Msg: msg})
 	if err != nil {
 		return
 	}

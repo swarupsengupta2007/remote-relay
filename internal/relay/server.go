@@ -17,13 +17,16 @@ import (
 )
 
 type Server struct {
-	cfg   config.Server
-	log   *slog.Logger
-	auth  auth.Authenticator
-	store *session.Store
+	cfg    config.Server
+	log    *slog.Logger
+	auth   auth.Authenticator
+	store  *session.Store
+	budget *session.Budget
 
-	mu sync.Mutex
-	ln net.Listener
+	mu      sync.Mutex
+	ln      net.Listener
+	livesMu sync.Mutex
+	lives   map[string]*live
 }
 
 func NewServer(cfg config.Server, log *slog.Logger) *Server {
@@ -31,10 +34,12 @@ func NewServer(cfg config.Server, log *slog.Logger) *Server {
 		log = logging.New(nil, cfg.LogLevel, cfg.LogFormat)
 	}
 	return &Server{
-		cfg:   cfg,
-		log:   log,
-		auth:  auth.None{},
-		store: session.NewStore(cfg.MaxSessions),
+		cfg:    cfg,
+		log:    log,
+		auth:   auth.None{},
+		store:  session.NewStore(cfg.MaxSessions),
+		budget: session.NewBudget(int64(cfg.TotalBufferBytes)),
+		lives:  make(map[string]*live),
 	}
 }
 
@@ -128,20 +133,22 @@ func (s *Server) handle(ctx context.Context, raw net.Conn) {
 
 	_ = conn.SetDeadline(time.Now().Add(handshakeTimeout))
 	f, err := conn.ReadFrame()
-	// Dest dial has its own timeout; do not share the HELLO read deadline with it.
 	_ = conn.SetDeadline(time.Time{})
 	if err != nil {
 		s.log.Debug("handshake read", "err", err)
 		return
 	}
-	if f.Type == proto.TypeResume {
-		writeErr(conn, proto.CodeUnknownSession, "resume not supported")
-		return
-	}
-	if f.Type != proto.TypeHello {
+	switch f.Type {
+	case proto.TypeResume:
+		s.handleResume(ctx, conn, f)
+	case proto.TypeHello:
+		s.handleHello(ctx, conn, f)
+	default:
 		writeErr(conn, proto.CodeProto, "expected HELLO")
-		return
 	}
+}
+
+func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.Frame) {
 	var hello proto.Hello
 	if err := proto.UnmarshalPayload(f, &hello); err != nil {
 		writeErr(conn, proto.CodeProto, "bad HELLO")
@@ -173,6 +180,11 @@ func (s *Server) handle(ctx context.Context, raw net.Conn) {
 		return
 	}
 
+	if s.budget.Exhausted() {
+		writeErr(conn, proto.CodeNoCapacity, "buffer budget exhausted")
+		return
+	}
+
 	sess, token, err := session.New()
 	if err != nil {
 		writeErr(conn, proto.CodeInternal, "session allocate")
@@ -183,17 +195,18 @@ func (s *Server) handle(ctx context.Context, raw net.Conn) {
 		writeErr(conn, proto.CodeNoCapacity, "too many sessions")
 		return
 	}
-	defer s.store.Remove(sess.ID)
 
 	d := net.Dialer{Timeout: s.cfg.DialTimeout.Duration(), KeepAlive: 15 * time.Second}
 	dconn, err := d.DialContext(ctx, "tcp", dest)
 	if err != nil {
+		s.store.Remove(sess.ID)
 		writeErr(conn, proto.CodeDestRefused, "dial destination failed")
 		return
 	}
-	defer dconn.Close()
 	dtcp, ok := dconn.(*net.TCPConn)
 	if !ok {
+		_ = dconn.Close()
+		s.store.Remove(sess.ID)
 		writeErr(conn, proto.CodeInternal, "destination is not tcp")
 		return
 	}
@@ -203,8 +216,20 @@ func (s *Server) handle(ctx context.Context, raw net.Conn) {
 	if hello.Window > 0 && hello.Window < window {
 		window = hello.Window
 	}
+	bufCap := s.cfg.BufferBytes
+	if rem := s.budget.Remaining(); rem > 0 && rem < int64(bufCap) {
+		bufCap = int(rem)
+	}
+	if bufCap <= 0 {
+		_ = dtcp.Close()
+		s.store.Remove(sess.ID)
+		writeErr(conn, proto.CodeNoCapacity, "buffer budget exhausted")
+		return
+	}
 	serverNonce, err := proto.RandomNonce()
 	if err != nil {
+		_ = dtcp.Close()
+		s.store.Remove(sess.ID)
 		writeErr(conn, proto.CodeInternal, "nonce")
 		return
 	}
@@ -215,7 +240,7 @@ func (s *Server) handle(ctx context.Context, raw net.Conn) {
 		Transport:   "tcp",
 		UDP:         nil,
 		Limits: proto.Limits{
-			BufferBytes:    s.cfg.BufferBytes,
+			BufferBytes:    bufCap,
 			HoldTimeoutMs:  int(s.cfg.HoldTimeout.Duration() / time.Millisecond),
 			Window:         window,
 			DataChunkBytes: s.cfg.DataChunkBytes,
@@ -224,16 +249,21 @@ func (s *Server) handle(ctx context.Context, raw net.Conn) {
 	}
 	fr, err := proto.MarshalFrame(proto.TypeHelloOK, okMsg)
 	if err != nil {
+		_ = dtcp.Close()
+		s.store.Remove(sess.ID)
 		return
 	}
 	if err := writeFrameDeadline(conn, fr); err != nil {
+		_ = dtcp.Close()
+		s.store.Remove(sess.ID)
 		return
 	}
 
 	log := logging.WithSession(s.log, sess.ID)
 	log.Info("session started", "dest", dest, "peer", conn.RemoteAddr().String())
 
-	err = runPump(ctx, sessionIO{
+	sendLog := session.NewRing(bufCap, s.budget)
+	p := newPump(ctx, sessionIO{
 		conn:       conn,
 		src:        dtcp,
 		sink:       dtcp,
@@ -244,13 +274,286 @@ func (s *Server) handle(ctx context.Context, raw net.Conn) {
 	}, pumpConfig{
 		chunk:     s.cfg.DataChunkBytes,
 		window:    window,
+		buffer:    bufCap,
 		keepalive: s.cfg.KeepaliveInterval.Duration(),
 		idle:      s.cfg.IdleTimeout.Duration(),
 		log:       log,
-	})
-	if err != nil {
-		log.Info("session ended", "err", err)
+	}, sendLog)
+
+	l := &live{
+		pump:        p,
+		id:          sess.ID,
+		store:       s.store,
+		cfg:         s.cfg,
+		window:      window,
+		holdTimeout: s.cfg.HoldTimeout.Duration(),
+		dest:        dtcp,
+		log:         log,
+		attachCh:    make(chan attachReq, 4),
+	}
+	s.livesMu.Lock()
+	s.lives[sess.ID] = l
+	s.livesMu.Unlock()
+	defer func() {
+		s.livesMu.Lock()
+		delete(s.lives, sess.ID)
+		s.livesMu.Unlock()
+		l.cleanup(false)
+	}()
+
+	l.run(ctx, conn)
+}
+
+func (s *Server) handleResume(ctx context.Context, conn transport.Conn, f proto.Frame) {
+	var msg proto.Resume
+	if err := proto.UnmarshalPayload(f, &msg); err != nil {
+		writeResumeFail(conn, proto.CodeProto, "bad RESUME")
 		return
 	}
-	log.Info("session ended")
+	if msg.V != 1 {
+		writeResumeFail(conn, proto.CodeVersion, "unsupported version")
+		return
+	}
+	if err := s.store.VerifyToken(msg.SessionID, msg.ResumeToken); err != nil {
+		code, m := proto.CodeInternal, err.Error()
+		var pe *proto.Error
+		if errors.As(err, &pe) {
+			code, m = pe.Code, pe.Msg
+		}
+		writeResumeFail(conn, code, m)
+		return
+	}
+	s.livesMu.Lock()
+	l := s.lives[msg.SessionID]
+	s.livesMu.Unlock()
+	if l == nil {
+		if s.store.IsExpired(msg.SessionID) {
+			writeResumeFail(conn, proto.CodeExpired, "session expired")
+		} else {
+			writeResumeFail(conn, proto.CodeUnknownSession, "unknown session")
+		}
+		return
+	}
+	req := attachReq{conn: conn, resume: &msg, done: make(chan error, 1)}
+	if err := l.Offer(req); err != nil {
+		var pe *proto.Error
+		if errors.As(err, &pe) {
+			writeResumeFail(conn, pe.Code, pe.Msg)
+			return
+		}
+		writeResumeFail(conn, proto.CodeExpired, "session closed")
+		return
+	}
+	select {
+	case <-req.done:
+	case <-ctx.Done():
+	}
+}
+
+type attachReq struct {
+	conn   transport.Conn
+	resume *proto.Resume
+	done   chan error
+}
+
+type live struct {
+	*pump
+	id          string
+	store       *session.Store
+	cfg         config.Server
+	window      int
+	holdTimeout time.Duration
+	dest        *net.TCPConn
+	log         *slog.Logger
+	attachCh    chan attachReq
+
+	mu      sync.Mutex
+	heldAt  time.Time
+	dead    bool
+	cleaned bool
+}
+
+func (l *live) Offer(req attachReq) error {
+	l.mu.Lock()
+	if l.dead {
+		l.mu.Unlock()
+		return proto.ErrExpired
+	}
+	l.mu.Unlock()
+	select {
+	case l.attachCh <- req:
+		l.dropConn()
+		return nil
+	case <-l.sessCtx.Done():
+		return proto.ErrExpired
+	}
+}
+
+func (l *live) run(ctx context.Context, first transport.Conn) {
+	l.startIO()
+	err := l.serveConn(l.sessCtx, first, 0)
+	for reconnectable(err) && ctx.Err() == nil && l.sessionErr() == nil {
+		req, ok := l.holdWait(ctx)
+		if !ok {
+			return
+		}
+		if req.resume == nil {
+			_ = req.conn.Close()
+			select {
+			case req.done <- proto.ErrProto:
+			default:
+			}
+			err = proto.ErrProto
+			continue
+		}
+		heldMs := 0
+		l.mu.Lock()
+		if !l.heldAt.IsZero() {
+			heldMs = int(time.Since(l.heldAt).Milliseconds())
+			if heldMs < 0 {
+				heldMs = 0
+			}
+		}
+		l.mu.Unlock()
+		if werr := l.writeResumeOK(req, heldMs); werr != nil {
+			_ = req.conn.Close()
+			select {
+			case req.done <- werr:
+			default:
+			}
+			err = werr
+			if reconnectable(werr) {
+				continue
+			}
+			return
+		}
+		sendFrom := req.resume.DownAcked
+		l.sendLog.AdvanceTo(sendFrom)
+		err = l.serveConn(l.sessCtx, req.conn, sendFrom)
+		select {
+		case req.done <- err:
+		default:
+		}
+	}
+}
+
+func (l *live) holdWait(ctx context.Context) (attachReq, bool) {
+	if l.holdTimeout <= 0 {
+		l.store.Expire(l.id)
+		l.mu.Lock()
+		l.dead = true
+		l.mu.Unlock()
+		l.log.Info("session expired")
+		return attachReq{}, false
+	}
+	l.mu.Lock()
+	l.heldAt = time.Now()
+	l.mu.Unlock()
+	l.sendLog.SetSoftLimit(0)
+	l.log.Info("session held")
+
+	timer := time.NewTimer(l.holdTimeout)
+	defer timer.Stop()
+	select {
+	case req := <-l.attachCh:
+		return req, true
+	case <-timer.C:
+		l.store.Expire(l.id)
+		l.mu.Lock()
+		l.dead = true
+		l.mu.Unlock()
+		l.log.Info("session expired")
+		return attachReq{}, false
+	case <-ctx.Done():
+		return attachReq{}, false
+	case <-l.sessCtx.Done():
+		return attachReq{}, false
+	}
+}
+
+func (l *live) writeResumeOK(req attachReq, heldMs int) error {
+	token, err := l.store.RotateToken(l.id)
+	if err != nil {
+		return err
+	}
+	ok := proto.ResumeOK{
+		V:           1,
+		SessionID:   l.id,
+		ResumeToken: token,
+		UpAcked:     l.delivered.Load(),
+		DownNext:    req.resume.DownAcked,
+		State: proto.SessionState{
+			UpClosed:   l.inGotClose.Load(),
+			DownClosed: l.outEOF.Load(),
+			HeldMs:     heldMs,
+		},
+		Transport: "tcp",
+		Limits: proto.Limits{
+			BufferBytes:    l.sendLog.Cap(),
+			HoldTimeoutMs:  int(l.holdTimeout / time.Millisecond),
+			Window:         l.window,
+			DataChunkBytes: l.cfg.DataChunkBytes,
+		},
+	}
+	fr, err := proto.MarshalFrame(proto.TypeResumeOK, ok)
+	if err != nil {
+		return err
+	}
+	if err := writeFrameDeadline(req.conn, fr); err != nil {
+		return err
+	}
+	l.log.Info("session resumed", "heldMs", heldMs)
+	return nil
+}
+
+func (l *live) cleanup(expired bool) {
+	l.mu.Lock()
+	if l.cleaned {
+		l.mu.Unlock()
+		return
+	}
+	l.cleaned = true
+	l.dead = true
+	l.mu.Unlock()
+	if l.dest != nil {
+		_ = l.dest.Close()
+	}
+	l.shutdown()
+	if expired || l.store.IsExpired(l.id) {
+		l.store.Expire(l.id)
+	} else {
+		l.store.Remove(l.id)
+	}
+}
+
+func (s *Server) dropLiveTransports() {
+	s.livesMu.Lock()
+	lives := make([]*live, 0, len(s.lives))
+	for _, l := range s.lives {
+		lives = append(lives, l)
+	}
+	s.livesMu.Unlock()
+	for _, l := range lives {
+		l.dropConn()
+	}
+}
+
+func (s *Server) sessionBufferLens() []int {
+	s.livesMu.Lock()
+	defer s.livesMu.Unlock()
+	out := make([]int, 0, len(s.lives))
+	for _, l := range s.lives {
+		out = append(out, l.sendLog.Len())
+	}
+	return out
+}
+
+func (s *Server) budgetUsed() int64 {
+	return s.budget.Used()
+}
+
+func (s *Server) sessionCount() int {
+	s.livesMu.Lock()
+	defer s.livesMu.Unlock()
+	return len(s.lives)
 }
