@@ -88,10 +88,11 @@ type UdpInfo struct {
 }
 
 type Limits struct {
-	BufferBytes    int `json:"bufferBytes"`
-	HoldTimeoutMs  int `json:"holdTimeoutMs"`
-	Window         int `json:"window"`
-	DataChunkBytes int `json:"dataChunkBytes"`
+	BufferBytes     int `json:"bufferBytes"`
+	HoldTimeoutMs   int `json:"holdTimeoutMs"`
+	Window          int `json:"window"`
+	DataChunkBytes  int `json:"dataChunkBytes"`
+	SwitchTimeoutMs int `json:"switchTimeoutMs"`
 }
 
 func MarshalFrame(typ Type, v any) (Frame, error) {

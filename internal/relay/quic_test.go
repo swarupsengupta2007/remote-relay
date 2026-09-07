@@ -392,6 +392,324 @@ func TestNATRebindResume(t *testing.T) {
 	}
 }
 
+func TestQUICDialFailKeepsTCP(t *testing.T) {
+	testFailQUICDial.Store(true)
+	t.Cleanup(func() { testFailQUICDial.Store(false) })
+	const n = 64 << 10
+	upWant := makePattern(n)
+	dest, gotUpCh := startBidiDest(t, n, n)
+	srv, relayAddr, _ := startRelayQUIC(t, dest)
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	errc := make(chan error, 1)
+	go func() {
+		err := RunClient(ctx, defaultQUICClient(relayAddr, dest), inR, outW, logging.New(io.Discard, "error", "text"))
+		_ = outW.Close()
+		errc <- err
+	}()
+	time.Sleep(400 * time.Millisecond)
+	for _, k := range srv.liveKinds() {
+		if k == transport.KindQUIC {
+			t.Fatal("failed QUIC dial upgraded")
+		}
+	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		defer inW.Close()
+		if _, err := inW.Write(upWant); err != nil {
+			t.Errorf("stdin: %v", err)
+		}
+	}()
+	var gotDown []byte
+	go func() {
+		defer wg.Done()
+		gotDown, _ = io.ReadAll(outR)
+	}()
+	wg.Wait()
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("timeout")
+	}
+	gotUp := <-gotUpCh
+	if len(gotUp) != n || len(gotDown) != n {
+		t.Fatalf("up=%d down=%d", len(gotUp), len(gotDown))
+	}
+	checkPattern(t, gotUp)
+	checkPattern(t, gotDown)
+	for _, p := range srv.pathHistory() {
+		if p.Kind == transport.KindQUIC {
+			t.Fatalf("unexpected QUIC: %v", srv.pathHistory())
+		}
+	}
+}
+
+func TestUpgradeDestReadsFirst(t *testing.T) {
+	const n = 32 << 10
+	upWant := makePattern(n)
+	downWant := makePattern(n)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	gotUpCh := make(chan []byte, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			gotUpCh <- nil
+			return
+		}
+		defer c.Close()
+		tc := c.(*net.TCPConn)
+		b, _ := io.ReadAll(tc)
+		gotUpCh <- b
+		_, _ = tc.Write(downWant)
+		_ = tc.CloseWrite()
+	}()
+	dest := ln.Addr().String()
+	srv, relayAddr, _ := startRelayQUIC(t, dest)
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	errc := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		err := RunClient(ctx, defaultQUICClient(relayAddr, dest), inR, outW, logging.New(io.Discard, "error", "text"))
+		_ = outW.Close()
+		errc <- err
+	}()
+	waitKind(t, srv, transport.KindQUIC, 2*time.Second)
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("upgrade took %s, want well under switch_timeout", d)
+	}
+	go func() {
+		defer inW.Close()
+		_, _ = inW.Write(upWant)
+	}()
+	gotDown, _ := io.ReadAll(outR)
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("timeout")
+	}
+	gotUp := <-gotUpCh
+	if len(gotUp) != n || len(gotDown) != n {
+		t.Fatalf("up=%d down=%d hist=%v", len(gotUp), len(gotDown), srv.pathHistory())
+	}
+	checkPattern(t, gotUp)
+	checkPattern(t, gotDown)
+}
+
+func TestUpgradeInFlightDown(t *testing.T) {
+	const n = 256 << 10
+	upWant := makePattern(n)
+	downWant := makePattern(n)
+	dest, gotUpCh := startBidiDest(t, n, n)
+	srv, relayAddr, _ := startRelayQUIC(t, dest)
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	errc := make(chan error, 1)
+	go func() {
+		err := RunClient(ctx, defaultQUICClient(relayAddr, dest), inR, outW, logging.New(io.Discard, "error", "text"))
+		_ = outW.Close()
+		errc <- err
+	}()
+	downCh := make(chan []byte, 1)
+	go func() {
+		b, _ := io.ReadAll(outR)
+		downCh <- b
+	}()
+	waitKind(t, srv, transport.KindQUIC, 8*time.Second)
+	go func() {
+		defer inW.Close()
+		_, _ = inW.Write(upWant)
+	}()
+	gotDown := <-downCh
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("timeout")
+	}
+	gotUp := <-gotUpCh
+	if len(gotUp) != n || len(gotDown) != n {
+		t.Fatalf("up=%d down=%d", len(gotUp), len(gotDown))
+	}
+	checkPattern(t, gotUp)
+	checkPattern(t, gotDown)
+	if sha256.Sum256(gotDown) != sha256.Sum256(downWant) {
+		t.Fatal("down hash")
+	}
+	sawQUIC := false
+	for _, p := range srv.pathHistory() {
+		if p.Kind == transport.KindQUIC {
+			sawQUIC = true
+		}
+	}
+	if !sawQUIC {
+		t.Fatal("expected QUIC")
+	}
+}
+
+func TestSwitchTimeoutStaysTCP(t *testing.T) {
+	const n = 1 << 20
+	upWant := makePattern(n)
+	downWant := makePattern(n)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	unblock := make(chan struct{})
+	gotUpCh := make(chan []byte, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			gotUpCh <- nil
+			return
+		}
+		defer c.Close()
+		tc := c.(*net.TCPConn)
+		<-unblock
+		_, _ = tc.Write(downWant)
+		_ = tc.CloseWrite()
+		b, _ := io.ReadAll(tc)
+		gotUpCh <- b
+	}()
+	dest := ln.Addr().String()
+	cfg := config.DefaultServer()
+	cfg.ListenTCP = "127.0.0.1:0"
+	cfg.UDPListen = "127.0.0.1:0"
+	cfg.DefaultDestination = dest
+	cfg.AllowDestinations = []string{dest, "*"}
+	cfg.Transports = []string{"quic"}
+	cfg.SwitchTimeout = config.Duration(200 * time.Millisecond)
+	cfg.ProbeTimeout = config.Duration(200 * time.Millisecond)
+	cfg.IdleTimeout = config.Duration(30 * time.Second)
+	cfg.HoldTimeout = config.Duration(15 * time.Second)
+	srv, relayAddr, _ := startRelayCfg(t, cfg)
+
+	testSuppressAck.Store(true)
+	t.Cleanup(func() { testSuppressAck.Store(false) })
+	gate := make(chan struct{})
+	testGateUpgrade.Store(&gate)
+	t.Cleanup(func() { testGateUpgrade.Store(nil) })
+
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	errc := make(chan error, 1)
+	go func() {
+		err := RunClient(ctx, defaultQUICClient(relayAddr, dest), inR, outW, logging.New(io.Discard, "error", "text"))
+		_ = outW.Close()
+		errc <- err
+	}()
+	downCh := make(chan []byte, 1)
+	go func() {
+		b, _ := io.ReadAll(outR)
+		downCh <- b
+	}()
+	const stall = 512 << 10
+	wrote := make(chan struct{})
+	go func() {
+		_, _ = inW.Write(upWant[:stall])
+		close(wrote)
+	}()
+	<-wrote
+	time.Sleep(100 * time.Millisecond)
+	close(gate)
+	time.Sleep(600 * time.Millisecond)
+	for _, k := range srv.liveKinds() {
+		if k == transport.KindQUIC {
+			t.Fatal("stalled ACK should abort switch and stay on TCP")
+		}
+	}
+	testSuppressAck.Store(false)
+	close(unblock)
+	go func() {
+		defer inW.Close()
+		_, _ = inW.Write(upWant[stall:])
+	}()
+	gotDown := <-downCh
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("timeout")
+	}
+	gotUp := <-gotUpCh
+	if len(gotUp) != n || len(gotDown) != n {
+		t.Fatalf("up=%d down=%d hist=%v", len(gotUp), len(gotDown), srv.pathHistory())
+	}
+	checkPattern(t, gotUp)
+	checkPattern(t, gotDown)
+	for _, p := range srv.pathHistory() {
+		if p.Kind == transport.KindQUIC {
+			t.Fatalf("R6 expected TCP-only history: %v", srv.pathHistory())
+		}
+	}
+}
+
+func TestHostnameServerUpgrades(t *testing.T) {
+	const n = 32 << 10
+	dest, gotUpCh := startBidiDest(t, n, n)
+	srv, relayAddr, _ := startRelayQUIC(t, dest)
+	_, port, err := net.SplitHostPort(relayAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	ccfg := defaultQUICClient(net.JoinHostPort("localhost", port), dest)
+	errc := make(chan error, 1)
+	go func() {
+		err := RunClient(ctx, ccfg, inR, outW, logging.New(io.Discard, "error", "text"))
+		_ = outW.Close()
+		errc <- err
+	}()
+	waitKind(t, srv, transport.KindQUIC, 8*time.Second)
+	go func() {
+		defer inW.Close()
+		_, _ = inW.Write(makePattern(n))
+	}()
+	gotDown, _ := io.ReadAll(outR)
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("timeout")
+	}
+	gotUp := <-gotUpCh
+	if len(gotUp) != n || len(gotDown) != n {
+		t.Fatalf("up=%d down=%d", len(gotUp), len(gotDown))
+	}
+	checkPattern(t, gotUp)
+	checkPattern(t, gotDown)
+}
+
 func TestTCPFlagSkipsUpgrade(t *testing.T) {
 	dest, gotUpCh := startBidiDest(t, 1024, 1024)
 	srv, relayAddr, _ := startRelayQUIC(t, dest)

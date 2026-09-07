@@ -21,6 +21,8 @@ var (
 	errByeReceived   = errors.New("bye received")
 	errIdle          = errors.New("idle timeout")
 	errTransportDown = errors.New("transport down")
+
+	testSuppressAck atomic.Bool
 )
 
 type sessionIO struct {
@@ -35,12 +37,13 @@ type sessionIO struct {
 }
 
 type pumpConfig struct {
-	chunk     int
-	window    int
-	buffer    int
-	keepalive time.Duration
-	idle      time.Duration
-	log       *slog.Logger
+	chunk         int
+	window        int
+	buffer        int
+	keepalive     time.Duration
+	idle          time.Duration
+	switchTimeout time.Duration
+	log           *slog.Logger
 }
 
 type dataFrag struct {
@@ -113,10 +116,14 @@ type pump struct {
 	backpressured atomic.Bool
 	linkUp        atomic.Bool
 
-	quiesce     atomic.Bool
-	quiesceSeen atomic.Bool
-	sentOff     atomic.Uint64
-	upgrading   atomic.Bool
+	quiesce       atomic.Bool
+	quiesceSeen   atomic.Bool
+	sentOff       atomic.Uint64
+	upgrading     atomic.Bool
+	switchUp      atomic.Uint64
+	switchDown    atomic.Uint64
+	quiesceParked chan struct{}
+	switchWrote   chan struct{}
 
 	srcWG  sync.WaitGroup
 	sinkWG sync.WaitGroup
@@ -143,16 +150,21 @@ func newPump(parent context.Context, io sessionIO, cfg pumpConfig, sendLog *sess
 	}
 	ctx, cancel := context.WithCancel(parent)
 	p := &pump{
-		sessCtx:    ctx,
-		sessCancel: cancel,
-		io:         io,
-		cfg:        cfg,
-		sendLog:    sendLog,
-		ctrlQ:      make(chan proto.Frame, 64),
-		sinkQ:      make(chan dataFrag, 16),
-		kick:       make(chan struct{}, 1),
-		sinkKick:   make(chan struct{}, 1),
-		ack:        newAcker(),
+		sessCtx:       ctx,
+		sessCancel:    cancel,
+		io:            io,
+		cfg:           cfg,
+		sendLog:       sendLog,
+		ctrlQ:         make(chan proto.Frame, 64),
+		sinkQ:         make(chan dataFrag, 16),
+		kick:          make(chan struct{}, 1),
+		sinkKick:      make(chan struct{}, 1),
+		ack:           newAcker(),
+		quiesceParked: make(chan struct{}, 1),
+		switchWrote:   make(chan struct{}, 1),
+	}
+	if p.cfg.switchTimeout <= 0 {
+		p.cfg.switchTimeout = 5 * time.Second
 	}
 	p.lastIn.Store(time.Now().UnixNano())
 	return p
@@ -262,6 +274,14 @@ func (p *pump) serveConn(ctx context.Context, conn transport.Conn, sendFrom uint
 	p.quiesce.Store(false)
 	p.quiesceSeen.Store(false)
 	p.sentOff.Store(sendFrom)
+	select {
+	case <-p.quiesceParked:
+	default:
+	}
+	select {
+	case <-p.switchWrote:
+	default:
+	}
 	p.sendLog.SetSoftLimit(p.cfg.window)
 	p.ack.Advance(sendFrom)
 	p.sendLog.AdvanceTo(sendFrom)
@@ -446,7 +466,16 @@ func (p *pump) writeConn(f proto.Frame) error {
 	if c == nil {
 		return net.ErrClosed
 	}
-	return c.WriteFrame(f)
+	if err := c.WriteFrame(f); err != nil {
+		return err
+	}
+	if f.Type == proto.TypeSwitch {
+		select {
+		case p.switchWrote <- struct{}{}:
+		default:
+		}
+	}
+	return nil
 }
 
 func (p *pump) currentKind() transport.Kind {
@@ -471,9 +500,25 @@ func (p *pump) abortQuiesce() {
 	p.nudge()
 }
 
+func (p *pump) parkQuiesce(sent uint64) {
+	p.sentOff.Store(sent)
+	p.quiesceSeen.Store(true)
+	select {
+	case p.quiesceParked <- struct{}{}:
+	default:
+	}
+}
+
+func (p *pump) drained() bool {
+	return p.quiesceSeen.Load() && p.ack.Get() >= p.sentOff.Load()
+}
+
 var errSwitchTimeout = errors.New("switch timeout")
 
 func (p *pump) waitQuiesced(ctx context.Context, d time.Duration) (up, down uint64, err error) {
+	if d <= 0 {
+		d = p.cfg.switchTimeout
+	}
 	if d <= 0 {
 		d = 5 * time.Second
 	}
@@ -481,11 +526,8 @@ func (p *pump) waitQuiesced(ctx context.Context, d time.Duration) (up, down uint
 	timer := time.NewTimer(d)
 	defer timer.Stop()
 	for {
-		if p.quiesceSeen.Load() {
-			sent := p.sentOff.Load()
-			if p.ack.Get() >= sent {
-				return sent, p.expected.Load(), nil
-			}
+		if p.drained() {
+			return p.sentOff.Load(), p.expected.Load(), nil
 		}
 		p.connMu.Lock()
 		connCtx := p.connCtx
@@ -504,11 +546,90 @@ func (p *pump) waitQuiesced(ctx context.Context, d time.Duration) (up, down uint
 			p.abortQuiesce()
 			return 0, 0, p.sessCtx.Err()
 		case <-timer.C:
+			if p.drained() {
+				return p.sentOff.Load(), p.expected.Load(), nil
+			}
 			p.abortQuiesce()
 			return 0, 0, errSwitchTimeout
 		case <-p.ack.WaitCh():
-		case <-p.kick:
+		case <-p.quiesceParked:
 		}
+	}
+}
+
+// SWITCH.offset is the takeover point (D9). The new path emits from RESUME
+// offsets (I2); bytes already on the old path are dropped by dedupe (I3).
+func (p *pump) handleSwitch(sw proto.Switch) error {
+	switch sw.Dir {
+	case proto.DirBoth, p.io.inDir, p.io.outDir:
+	default:
+		_ = p.sendErr(proto.CodeProto, "SWITCH direction")
+		return proto.ErrProto
+	}
+	switch sw.From {
+	case "tcp", "quic", "kcp":
+	default:
+		_ = p.sendErr(proto.CodeProto, "SWITCH from")
+		return proto.ErrProto
+	}
+	p.switchUp.Store(sw.Offset.Up)
+	p.switchDown.Store(sw.Offset.Down)
+	p.startQuiesce()
+	d := p.cfg.switchTimeout
+	if d <= 0 {
+		d = 5 * time.Second
+	}
+	p.connMu.Lock()
+	connCtx := p.connCtx
+	p.connMu.Unlock()
+	if connCtx == nil {
+		connCtx = p.sessCtx
+	}
+	go func() {
+		timer := time.NewTimer(d)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			p.connMu.Lock()
+			still := p.connCtx == connCtx
+			p.connMu.Unlock()
+			if still && p.quiesce.Load() {
+				p.abortQuiesce()
+			}
+		case <-connCtx.Done():
+		case <-p.sessCtx.Done():
+		}
+	}()
+	return nil
+}
+
+func (p *pump) sendSwitch(ctx context.Context, sw proto.Switch) error {
+	fr, err := proto.MarshalFrame(proto.TypeSwitch, sw)
+	if err != nil {
+		return err
+	}
+	select {
+	case <-p.switchWrote:
+	default:
+	}
+	if err := p.sendCtrl(fr); err != nil {
+		return err
+	}
+	p.connMu.Lock()
+	connCtx := p.connCtx
+	p.connMu.Unlock()
+	if connCtx == nil {
+		connCtx = p.sessCtx
+	}
+	select {
+	case <-p.switchWrote:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-connCtx.Done():
+		return connCtx.Err()
+	case <-p.sessCtx.Done():
+		return p.sessCtx.Err()
 	}
 }
 
@@ -545,8 +666,7 @@ func (p *pump) netWriter() error {
 		}
 
 		if p.quiesce.Load() {
-			p.sentOff.Store(sent)
-			p.quiesceSeen.Store(true)
+			p.parkQuiesce(sent)
 			select {
 			case <-p.connCtx.Done():
 				return p.connCtx.Err()
@@ -589,8 +709,7 @@ func (p *pump) netWriter() error {
 		}
 		if len(data) > 0 {
 			if p.quiesce.Load() {
-				p.sentOff.Store(sent)
-				p.quiesceSeen.Store(true)
+				p.parkQuiesce(sent)
 				continue
 			}
 			fr := proto.Frame{Type: proto.TypeData, Payload: proto.EncodeData(sent, data)}
@@ -768,7 +887,9 @@ func (p *pump) netReader() error {
 				_ = p.sendErr(proto.CodeProto, "bad SWITCH")
 				return uerr
 			}
-			p.startQuiesce()
+			if err := p.handleSwitch(sw); err != nil {
+				return err
+			}
 		case proto.TypeBye:
 			p.finished.Store(true)
 			return errByeReceived
@@ -815,8 +936,10 @@ func (p *pump) sinkWriter() error {
 				}
 				delivered += uint64(len(frag.data))
 				p.delivered.Store(delivered)
-				if err := p.sendCtrl(proto.Frame{Type: proto.TypeAck, Payload: proto.EncodeAck(delivered)}); err != nil {
-					return err
+				if !testSuppressAck.Load() {
+					if err := p.sendCtrl(proto.Frame{Type: proto.TypeAck, Payload: proto.EncodeAck(delivered)}); err != nil {
+						return err
+					}
 				}
 				p.nudge()
 			}

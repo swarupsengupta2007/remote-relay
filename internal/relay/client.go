@@ -46,6 +46,10 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 	bw := bufio.NewWriterSize(stdout, 128*1024)
 	src, stopSrc := interruptibleReader(stdin)
 	sendLog := session.NewRing(bufCap, nil)
+	st := 5 * time.Second
+	if helloOK.Limits.SwitchTimeoutMs > 0 {
+		st = time.Duration(helloOK.Limits.SwitchTimeoutMs) * time.Millisecond
+	}
 	p := newPump(ctx, sessionIO{
 		conn:      conn,
 		src:       src,
@@ -55,12 +59,13 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 		outDir:    proto.DirUp,
 		inDir:     proto.DirDown,
 	}, pumpConfig{
-		chunk:     chunk,
-		window:    window,
-		buffer:    bufCap,
-		keepalive: 5 * time.Second,
-		idle:      30 * time.Second,
-		log:       log,
+		chunk:         chunk,
+		window:        window,
+		buffer:        bufCap,
+		keepalive:     5 * time.Second,
+		idle:          30 * time.Second,
+		switchTimeout: st,
+		log:           log,
 	}, sendLog)
 	p.startIO()
 	defer p.shutdown()
@@ -108,6 +113,9 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 			if upg.rok.Transport != "" {
 				target = upg.rok.Transport
 			}
+			if upg.rok.Limits.SwitchTimeoutMs > 0 {
+				p.cfg.switchTimeout = time.Duration(upg.rok.Limits.SwitchTimeoutMs) * time.Millisecond
+			}
 			p.sendLog.AdvanceTo(sendFrom)
 			log.Info("path upgraded", "transport", current.Kind().String())
 			continue
@@ -143,6 +151,9 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 			udp = rok.UDP
 			if rok.Transport != "" {
 				target = rok.Transport
+			}
+			if rok.Limits.SwitchTimeoutMs > 0 {
+				p.cfg.switchTimeout = time.Duration(rok.Limits.SwitchTimeoutMs) * time.Millisecond
 			}
 			if rok.State.UpClosed && !p.outEOF.Load() {
 				p.outFinal.Store(p.sendLog.End())

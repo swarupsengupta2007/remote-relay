@@ -2,9 +2,11 @@ package relay
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"github.com/remote-relay/relay/internal/config"
@@ -12,7 +14,8 @@ import (
 	"github.com/remote-relay/relay/internal/transport"
 )
 
-const switchTimeout = 5 * time.Second
+var testFailQUICDial atomic.Bool
+var testGateUpgrade atomic.Pointer[chan struct{}]
 
 type upgradeResult struct {
 	conn transport.Conn
@@ -32,6 +35,14 @@ func startUpgrade(ctx context.Context, p *pump, cfg config.Client, tcpConn trans
 	upgCtx, cancel := context.WithCancel(ctx)
 	ch := make(chan upgradeResult, 1)
 	go func() {
+		if g := testGateUpgrade.Load(); g != nil {
+			select {
+			case <-*g:
+			case <-upgCtx.Done():
+				ch <- upgradeResult{err: upgCtx.Err()}
+				return
+			}
+		}
 		ch <- tryUpgrade(upgCtx, p, cfg, tcpConn, sessionID, token, udp, log)
 	}()
 	return ch, cancel
@@ -64,7 +75,7 @@ func tryUpgrade(ctx context.Context, p *pump, cfg config.Client, tcpConn transpo
 		res.err = err
 		return res
 	}
-	mux, err := transport.ListenUDPMux(clientUDPBind(cfg.Server))
+	mux, err := transport.ListenUDPMux(transport.UDPBindAll(addr))
 	if err != nil {
 		res.err = err
 		return res
@@ -92,10 +103,7 @@ func tryUpgrade(ctx context.Context, p *pump, cfg config.Client, tcpConn transpo
 		return res
 	}
 
-	st := switchTimeout
-	if st <= 0 {
-		st = 5 * time.Second
-	}
+	st := p.cfg.switchTimeout
 	up, down, err := p.waitQuiesced(ctx, st)
 	if err != nil {
 		if log != nil {
@@ -104,28 +112,29 @@ func tryUpgrade(ctx context.Context, p *pump, cfg config.Client, tcpConn transpo
 		res.err = err
 		return res
 	}
-	fr, err := proto.MarshalFrame(proto.TypeSwitch, proto.Switch{
-		Dir:    proto.DirBoth,
-		From:   "tcp",
-		Offset: proto.SwitchOffset{Up: up, Down: down},
-	})
-	if err != nil {
-		p.abortQuiesce()
-		res.err = err
-		return res
-	}
-	if err := p.sendCtrl(fr); err != nil {
-		p.abortQuiesce()
-		res.err = err
-		return res
-	}
 
 	p.upgrading.Store(true)
 	defer p.upgrading.Store(false)
 
+	if testFailQUICDial.Load() {
+		p.abortQuiesce()
+		res.err = errors.New("test: quic dial fail")
+		return res
+	}
+
 	qconf := transport.NewQUICConfig(p.cfg.idle, p.cfg.keepalive, p.cfg.window)
 	qconn, err := transport.DialQUIC(ctx, mux.QUIC(), addr, qconf)
 	if err != nil {
+		p.abortQuiesce()
+		res.err = err
+		return res
+	}
+	if err := p.sendSwitch(ctx, proto.Switch{
+		Dir:    proto.DirBoth,
+		From:   "tcp",
+		Offset: proto.SwitchOffset{Up: up, Down: down},
+	}); err != nil {
+		_ = qconn.Close()
 		p.abortQuiesce()
 		res.err = err
 		return res
@@ -143,18 +152,6 @@ func tryUpgrade(ctx context.Context, p *pump, cfg config.Client, tcpConn transpo
 	res.rok = rok
 	res.hold = mux
 	return res
-}
-
-func clientUDPBind(server string) string {
-	host, _, err := net.SplitHostPort(server)
-	if err != nil {
-		return "0.0.0.0:0"
-	}
-	ip := net.ParseIP(host)
-	if ip != nil && ip.To4() != nil {
-		return "0.0.0.0:0"
-	}
-	return "[::]:0"
 }
 
 func writeResumeOn(ctx context.Context, conn transport.Conn, cfg config.Client, sessionID, token string, downAcked uint64) (proto.ResumeOK, error) {

@@ -101,6 +101,76 @@ func TestMuxProbeRoundTrip(t *testing.T) {
 	}
 }
 
+func TestProbeLateOKReusesNonce(t *testing.T) {
+	srv, err := ListenUDPMux("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	cli, err := ListenUDPMux("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+
+	var want [16]byte
+	want[1] = 3
+	srv.SetProbeHandler(func(token [16]byte, nonce uint64, addr net.Addr) {
+		if token != want {
+			return
+		}
+		time.Sleep(80 * time.Millisecond)
+		_ = srv.WriteProbeOK(addr, nonce)
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := Probe(ctx, cli, srv.LocalAddr(), want, 3, 30*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestProbeIgnoresWrongSource(t *testing.T) {
+	srv, err := ListenUDPMux("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	cli, err := ListenUDPMux("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+	other, err := ListenUDPMux("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+
+	var want [16]byte
+	want[2] = 4
+	srv.SetProbeHandler(func(token [16]byte, nonce uint64, addr net.Addr) {
+		if token != want {
+			return
+		}
+		_ = other.WriteProbeOK(cli.LocalAddr(), nonce)
+		_ = srv.WriteProbeOK(addr, nonce)
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := Probe(ctx, cli, srv.LocalAddr(), want, 2, 200*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUDPBindAll(t *testing.T) {
+	if got := UDPBindAll(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9}); got != "0.0.0.0:0" {
+		t.Fatalf("v4 %q", got)
+	}
+	if got := UDPBindAll(&net.UDPAddr{IP: net.ParseIP("::1"), Port: 9}); got != "[::]:0" {
+		t.Fatalf("v6 %q", got)
+	}
+}
+
 func TestParseProbeToken(t *testing.T) {
 	var tok [16]byte
 	tok[15] = 0xff

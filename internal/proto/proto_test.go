@@ -142,7 +142,7 @@ func TestControlRoundTrip(t *testing.T) {
 		{name: "switch", typ: TypeSwitch, v: Switch{Dir: DirBoth, From: "tcp", Offset: SwitchOffset{Up: 1, Down: 2}}},
 		{name: "bye", typ: TypeBye, v: Bye{Code: CodeShutdown, Msg: "bye"}},
 		{name: "close_dir", typ: TypeCloseDir, v: CloseDir{Dir: DirUp, FinalOffset: 99}},
-		{name: "limits", typ: TypeHelloOK, v: Limits{BufferBytes: 2, HoldTimeoutMs: 3, Window: 4, DataChunkBytes: 5}},
+		{name: "limits", typ: TypeHelloOK, v: Limits{BufferBytes: 2, HoldTimeoutMs: 3, Window: 4, DataChunkBytes: 5, SwitchTimeoutMs: 6}},
 		{name: "session_state", typ: TypeResumeOK, v: SessionState{UpClosed: true, DownClosed: true, HeldMs: 7}},
 		{name: "udp_info", typ: TypeHelloOK, v: UdpInfo{Addr: "a:1", ProbeToken: "x", ProbeTimeoutMs: 1, ProbeAttempts: 2}},
 	}

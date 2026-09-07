@@ -142,12 +142,16 @@ func (c *quicConn) Kind() Kind           { return KindQUIC }
 
 func (c *quicConn) Close() error {
 	// Stream FIN first so a just-written BYE can still be read. CloseWithError
-	// waits for the close handshake, so it runs in the background.
+	// waits for the close handshake, so it runs in the background. The client
+	// Transport is closed after that drain; the mux owner still closes the socket.
 	c.closeOnce.Do(func() {
 		_ = c.st.Close()
 		go func() {
 			time.Sleep(30 * time.Millisecond)
 			_ = c.qc.CloseWithError(0, "")
+			if c.tr != nil {
+				_ = c.tr.Close()
+			}
 		}()
 	})
 	return nil

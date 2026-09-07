@@ -37,7 +37,7 @@ type UDPMux struct {
 
 	probeMu      sync.Mutex
 	probeHandler func(token [16]byte, nonce uint64, addr net.Addr)
-	probeWait    map[uint64]chan struct{}
+	probeWait    map[uint64]*probeWaiter
 
 	closeOnce sync.Once
 	closed    chan struct{}
@@ -58,7 +58,7 @@ func ListenUDPMux(addr string) (*UDPMux, error) {
 func NewUDPMux(conn net.PacketConn) *UDPMux {
 	m := &UDPMux{
 		conn:      conn,
-		probeWait: make(map[uint64]chan struct{}),
+		probeWait: make(map[uint64]*probeWaiter),
 		closed:    make(chan struct{}),
 	}
 	m.quic = newTaggedConn(m, TagQUIC)
@@ -139,7 +139,7 @@ func (m *UDPMux) readLoop() {
 			if perr != nil {
 				continue
 			}
-			m.signalProbeOK(nonce)
+			m.signalProbeOK(nonce, addr)
 		default:
 			// unknown tag: drop (never sniff QUIC/KCP payloads)
 		}
@@ -193,47 +193,59 @@ func (m *UDPMux) WriteProbeOK(addr net.Addr, nonce uint64) error {
 	return m.writeRaw(p, addr)
 }
 
-func (m *UDPMux) WaitProbeOK(ctx context.Context, nonce uint64) error {
-	ch := make(chan struct{})
+type probeWaiter struct {
+	ch   chan struct{}
+	addr net.Addr
+}
+
+func (m *UDPMux) armProbeWait(nonce uint64, addr net.Addr) <-chan struct{} {
 	m.probeMu.Lock()
-	if existing, ok := m.probeWait[nonce]; ok {
-		ch = existing
-	} else {
-		m.probeWait[nonce] = ch
+	defer m.probeMu.Unlock()
+	if w, ok := m.probeWait[nonce]; ok {
+		return w.ch
 	}
+	ch := make(chan struct{})
+	m.probeWait[nonce] = &probeWaiter{ch: ch, addr: addr}
+	return ch
+}
+
+func (m *UDPMux) disarmProbeWait(nonce uint64) {
+	m.probeMu.Lock()
+	delete(m.probeWait, nonce)
+	m.probeMu.Unlock()
+}
+
+func (m *UDPMux) signalProbeOK(nonce uint64, from net.Addr) {
+	m.probeMu.Lock()
+	w, ok := m.probeWait[nonce]
+	if !ok {
+		m.probeMu.Unlock()
+		return
+	}
+	if w.addr != nil && from != nil && !sameUDPAddr(w.addr, from) {
+		m.probeMu.Unlock()
+		return
+	}
+	delete(m.probeWait, nonce)
 	m.probeMu.Unlock()
 	select {
-	case <-ctx.Done():
-		m.probeMu.Lock()
-		if m.probeWait[nonce] == ch {
-			delete(m.probeWait, nonce)
-		}
-		m.probeMu.Unlock()
-		return ctx.Err()
-	case <-ch:
-		return nil
-	case <-m.closed:
-		return errMuxClosed
+	case <-w.ch:
+	default:
+		close(w.ch)
 	}
 }
 
-func (m *UDPMux) signalProbeOK(nonce uint64) {
-	m.probeMu.Lock()
-	ch, ok := m.probeWait[nonce]
-	if ok {
-		delete(m.probeWait, nonce)
+func sameUDPAddr(a, b net.Addr) bool {
+	ua, ok1 := a.(*net.UDPAddr)
+	ub, ok2 := b.(*net.UDPAddr)
+	if ok1 && ok2 {
+		return ua.Port == ub.Port && ua.IP.Equal(ub.IP)
 	}
-	m.probeMu.Unlock()
-	if ok {
-		select {
-		case <-ch:
-		default:
-			close(ch)
-		}
-	}
+	return a != nil && b != nil && a.String() == b.String()
 }
 
 // Probe sends up to attempts PROBE datagrams and waits for a matching PROBE_OK.
+// The waiter is armed before the first write so a fast localhost OK cannot be dropped.
 func Probe(ctx context.Context, mux *UDPMux, addr net.Addr, token [16]byte, attempts int, timeout time.Duration) error {
 	if attempts <= 0 {
 		attempts = 2
@@ -241,28 +253,50 @@ func Probe(ctx context.Context, mux *UDPMux, addr net.Addr, token [16]byte, atte
 	if timeout <= 0 {
 		timeout = 2 * time.Second
 	}
+	const nonce = uint64(1)
+	ch := mux.armProbeWait(nonce, addr)
+	defer mux.disarmProbeWait(nonce)
 	var last error
 	for i := 0; i < attempts; i++ {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		nonce := uint64(i) + 1
 		if err := mux.WriteProbe(addr, token, nonce); err != nil {
 			last = err
 			continue
 		}
 		sub, cancel := context.WithTimeout(ctx, timeout)
-		err := mux.WaitProbeOK(sub, nonce)
-		cancel()
-		if err == nil {
+		select {
+		case <-ch:
+			cancel()
 			return nil
+		case <-sub.Done():
+			last = sub.Err()
+			cancel()
+		case <-mux.closed:
+			cancel()
+			return errMuxClosed
+		case <-ctx.Done():
+			cancel()
+			return ctx.Err()
 		}
-		last = err
 	}
 	if last == nil {
 		last = errors.New("udp probe failed")
 	}
 	return last
+}
+
+// UDPBindAll returns a wildcard bind in the same address family as dst.
+func UDPBindAll(dst net.Addr) string {
+	ua, ok := dst.(*net.UDPAddr)
+	if !ok || ua == nil || ua.IP == nil {
+		return ":0"
+	}
+	if ua.IP.To4() != nil {
+		return "0.0.0.0:0"
+	}
+	return "[::]:0"
 }
 
 type taggedConn struct {

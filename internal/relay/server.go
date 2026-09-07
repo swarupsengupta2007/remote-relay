@@ -260,10 +260,11 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 		Transport:   selected,
 		UDP:         udp,
 		Limits: proto.Limits{
-			BufferBytes:    bufCap,
-			HoldTimeoutMs:  int(s.cfg.HoldTimeout.Duration() / time.Millisecond),
-			Window:         window,
-			DataChunkBytes: s.cfg.DataChunkBytes,
+			BufferBytes:     bufCap,
+			HoldTimeoutMs:   int(s.cfg.HoldTimeout.Duration() / time.Millisecond),
+			Window:          window,
+			DataChunkBytes:  s.cfg.DataChunkBytes,
+			SwitchTimeoutMs: int(s.cfg.SwitchTimeout.Duration() / time.Millisecond),
 		},
 		ServerNonce: serverNonce,
 	}
@@ -285,12 +286,13 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 		outDir:     proto.DirDown,
 		inDir:      proto.DirUp,
 	}, pumpConfig{
-		chunk:     s.cfg.DataChunkBytes,
-		window:    window,
-		buffer:    bufCap,
-		keepalive: s.cfg.KeepaliveInterval.Duration(),
-		idle:      s.cfg.IdleTimeout.Duration(),
-		log:       log,
+		chunk:         s.cfg.DataChunkBytes,
+		window:        window,
+		buffer:        bufCap,
+		keepalive:     s.cfg.KeepaliveInterval.Duration(),
+		idle:          s.cfg.IdleTimeout.Duration(),
+		switchTimeout: s.cfg.SwitchTimeout.Duration(),
+		log:           log,
 	}, sendLog)
 
 	l := &live{
@@ -592,10 +594,11 @@ func (l *live) writeResumeOK(req attachReq, heldMs int) error {
 		Transport: selected,
 		UDP:       udp,
 		Limits: proto.Limits{
-			BufferBytes:    l.sendLog.Cap(),
-			HoldTimeoutMs:  int(l.holdTimeout / time.Millisecond),
-			Window:         l.window,
-			DataChunkBytes: l.cfg.DataChunkBytes,
+			BufferBytes:     l.sendLog.Cap(),
+			HoldTimeoutMs:   int(l.holdTimeout / time.Millisecond),
+			Window:          l.window,
+			DataChunkBytes:  l.cfg.DataChunkBytes,
+			SwitchTimeoutMs: int(l.cfg.SwitchTimeout.Duration() / time.Millisecond),
 		},
 	}
 	fr, err := proto.MarshalFrame(proto.TypeResumeOK, ok)
