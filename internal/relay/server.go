@@ -6,7 +6,9 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/remote-relay/relay/internal/auth"
@@ -16,6 +18,8 @@ import (
 	"github.com/remote-relay/relay/internal/session"
 	"github.com/remote-relay/relay/internal/transport"
 )
+
+const shutdownDrain = 5 * time.Second
 
 type Server struct {
 	cfg    config.Server
@@ -29,7 +33,24 @@ type Server struct {
 	livesMu sync.Mutex
 	lives   map[string]*live
 
-	serveCtx context.Context
+	serveCtx  context.Context
+	runCtx    context.Context
+	runCancel context.CancelFunc
+
+	shut       atomic.Bool
+	finishOnce sync.Once
+
+	ipMu    sync.Mutex
+	ipConns map[string]int
+	ipSess  map[string]int
+
+	accepts atomic.Int64
+	refused atomic.Int64
+
+	debugMu    sync.Mutex
+	debug      []*http.Server
+	pprofAddr  string
+	expvarAddr string
 
 	udpMu    sync.Mutex
 	udpStart sync.Mutex
@@ -51,6 +72,7 @@ func NewServer(cfg config.Server, log *slog.Logger) *Server {
 	if log == nil {
 		log = logging.New(nil, cfg.LogLevel, cfg.LogFormat)
 	}
+	runCtx, runCancel := context.WithCancel(context.Background())
 	return &Server{
 		cfg:         cfg,
 		log:         log,
@@ -60,6 +82,10 @@ func NewServer(cfg config.Server, log *slog.Logger) *Server {
 		lives:       make(map[string]*live),
 		probes:      make(map[[16]byte]string),
 		probeBySess: make(map[string][16]byte),
+		ipConns:     make(map[string]int),
+		ipSess:      make(map[string]int),
+		runCtx:      runCtx,
+		runCancel:   runCancel,
 	}
 }
 
@@ -73,14 +99,10 @@ func (s *Server) Addr() string {
 }
 
 func (s *Server) Close() error {
-	s.mu.Lock()
-	ln := s.ln
-	s.mu.Unlock()
-	s.closeUDP()
-	if ln == nil {
-		return nil
-	}
-	return ln.Close()
+	s.shut.Store(true)
+	s.closeListener()
+	s.finishShutdown()
+	return nil
 }
 
 func (s *Server) Listen() error {
@@ -118,31 +140,52 @@ func (s *Server) Serve(ctx context.Context) error {
 		ln = s.ln
 		s.mu.Unlock()
 	}
-	defer ln.Close()
+
+	if err := s.startDebug(); err != nil {
+		_ = ln.Close()
+		return err
+	}
 
 	s.log.Info("listening", "addr", ln.Addr().String())
 
 	go func() {
 		<-ctx.Done()
-		_ = ln.Close()
-		s.closeUDP()
+		s.closeListener()
 	}()
 
 	for {
 		c, err := ln.Accept()
 		if err != nil {
-			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) || s.shutting() {
+				shutCtx, cancel := context.WithTimeout(context.Background(), shutdownDrain)
+				_ = s.Shutdown(shutCtx)
+				cancel()
 				return nil
 			}
 			s.log.Error("accept", "err", err)
 			continue
 		}
-		go s.handle(ctx, c)
+		s.accepts.Add(1)
+		if s.shutting() {
+			_ = c.Close()
+			continue
+		}
+		go s.handle(c)
 	}
 }
 
-func (s *Server) handle(ctx context.Context, raw net.Conn) {
+func (s *Server) handle(raw net.Conn) {
 	defer raw.Close()
+	ip := clientIP(raw.RemoteAddr())
+	n := s.incIPConn(ip)
+	defer s.decIPConn(ip)
+	if max := s.cfg.MaxConnsPerIP; max > 0 && n > 2*max {
+		// Headroom of 2× covers in-flight RESUME while the original handle
+		// goroutine is still alive; beyond that this is a handshake flood.
+		s.refused.Add(1)
+		return
+	}
+
 	conn, err := transport.WrapTCP(raw)
 	if err != nil {
 		s.log.Error("wrap tcp", "err", err)
@@ -157,17 +200,26 @@ func (s *Server) handle(ctx context.Context, raw net.Conn) {
 		s.log.Debug("handshake read", "err", err)
 		return
 	}
+	ctx := s.sessionContext()
+	if s.shutting() {
+		if f.Type == proto.TypeResume {
+			writeResumeFail(conn, proto.CodeShutdown, "shutting down")
+		} else {
+			writeErr(conn, proto.CodeShutdown, "shutting down")
+		}
+		return
+	}
 	switch f.Type {
 	case proto.TypeResume:
 		s.handleResume(ctx, conn, f)
 	case proto.TypeHello:
-		s.handleHello(ctx, conn, f)
+		s.handleHello(ctx, conn, f, ip)
 	default:
 		writeErr(conn, proto.CodeProto, "expected HELLO")
 	}
 }
 
-func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.Frame) {
+func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.Frame, ip string) {
 	var hello proto.Hello
 	if err := proto.UnmarshalPayload(f, &hello); err != nil {
 		writeErr(conn, proto.CodeProto, "bad HELLO")
@@ -199,10 +251,22 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 		return
 	}
 
-	if s.budget.Exhausted() {
-		writeErr(conn, proto.CodeNoCapacity, "buffer budget exhausted")
+	if err := s.tryReserveIPSess(ip); err != nil {
+		s.refused.Add(1)
+		var pe *proto.Error
+		if errors.As(err, &pe) {
+			writeErr(conn, pe.Code, pe.Msg)
+			return
+		}
+		writeErr(conn, proto.CodeNoCapacity, "no capacity")
 		return
 	}
+	reserved := true
+	defer func() {
+		if reserved {
+			s.decIPSess(ip)
+		}
+	}()
 
 	sess, token, err := session.New()
 	if err != nil {
@@ -211,7 +275,13 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 	}
 	sess.Destination = dest
 	if err := s.store.Add(sess); err != nil {
+		s.refused.Add(1)
 		writeErr(conn, proto.CodeNoCapacity, "too many sessions")
+		return
+	}
+	if s.shutting() {
+		s.store.Remove(sess.ID)
+		writeErr(conn, proto.CodeShutdown, "shutting down")
 		return
 	}
 
@@ -242,6 +312,7 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 	if bufCap <= 0 {
 		_ = dtcp.Close()
 		s.store.Remove(sess.ID)
+		s.refused.Add(1)
 		writeErr(conn, proto.CodeNoCapacity, "buffer budget exhausted")
 		return
 	}
@@ -305,6 +376,7 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 		holdTimeout: s.cfg.HoldTimeout.Duration(),
 		dest:        dtcp,
 		log:         log,
+		clientIP:    ip,
 		attachCh:    make(chan attachReq, 4),
 		deadCh:      make(chan struct{}),
 	}
@@ -312,6 +384,7 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 	s.livesMu.Lock()
 	s.lives[sess.ID] = l
 	s.livesMu.Unlock()
+	reserved = false
 	defer func() {
 		s.livesMu.Lock()
 		delete(s.lives, sess.ID)
@@ -327,6 +400,10 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 }
 
 func (s *Server) handleResume(ctx context.Context, conn transport.Conn, f proto.Frame) {
+	if s.shutting() {
+		writeResumeFail(conn, proto.CodeShutdown, "shutting down")
+		return
+	}
 	var msg proto.Resume
 	if err := proto.UnmarshalPayload(f, &msg); err != nil {
 		writeResumeFail(conn, proto.CodeProto, "bad RESUME")
@@ -388,6 +465,7 @@ type live struct {
 	holdTimeout time.Duration
 	dest        *net.TCPConn
 	log         *slog.Logger
+	clientIP    string
 	attachCh    chan attachReq
 	deadCh      chan struct{}
 
@@ -531,7 +609,7 @@ func (l *live) run(ctx context.Context, first transport.Conn) {
 
 func (l *live) holdWait(ctx context.Context) (attachReq, bool) {
 	if l.holdTimeout <= 0 {
-		l.log.Info("session expired")
+		l.log.Info("session expired", "heldMs", 0)
 		l.failHold()
 		return attachReq{}, false
 	}
@@ -539,7 +617,7 @@ func (l *live) holdWait(ctx context.Context) (attachReq, bool) {
 	l.heldAt = time.Now()
 	l.mu.Unlock()
 	l.sendLog.SetSoftLimit(0)
-	l.log.Info("session held")
+	l.log.Info("session held", "heldMs", 0)
 
 	timer := time.NewTimer(l.holdTimeout)
 	defer timer.Stop()
@@ -552,7 +630,7 @@ func (l *live) holdWait(ctx context.Context) (attachReq, bool) {
 			return req, true
 		default:
 		}
-		l.log.Info("session expired")
+		l.log.Info("session expired", "heldMs", l.heldMs())
 		l.failHold()
 		return attachReq{}, false
 	case <-ctx.Done():
@@ -562,6 +640,19 @@ func (l *live) holdWait(ctx context.Context) (attachReq, bool) {
 		l.failHold()
 		return attachReq{}, false
 	}
+}
+
+func (l *live) heldMs() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.heldAt.IsZero() {
+		return 0
+	}
+	ms := int(time.Since(l.heldAt).Milliseconds())
+	if ms < 0 {
+		return 0
+	}
+	return ms
 }
 
 func (l *live) writeResumeOK(req attachReq, heldMs int) error {
@@ -624,11 +715,15 @@ func (l *live) cleanup(expired bool) {
 		return
 	}
 	l.cleaned = true
+	ip := l.clientIP
 	l.mu.Unlock()
 	l.markDead()
 	l.drainAttach(proto.ErrExpired)
 	if l.srv != nil {
 		l.srv.unregisterProbe(l.id)
+		if ip != "" {
+			l.srv.decIPSess(ip)
+		}
 	}
 	if l.dest != nil {
 		_ = l.dest.Close()
@@ -671,4 +766,16 @@ func (s *Server) sessionCount() int {
 	s.livesMu.Lock()
 	defer s.livesMu.Unlock()
 	return len(s.lives)
+}
+
+func (s *Server) heldCount() int {
+	s.livesMu.Lock()
+	defer s.livesMu.Unlock()
+	n := 0
+	for _, l := range s.lives {
+		if l.isHeld() {
+			n++
+		}
+	}
+	return n
 }

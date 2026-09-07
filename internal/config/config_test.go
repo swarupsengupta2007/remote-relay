@@ -18,8 +18,11 @@ func TestDefaults(t *testing.T) {
 	if len(s.AllowDestinations) != 1 || s.AllowDestinations[0] != "127.0.0.1:22" {
 		t.Fatalf("allow_destinations=%v", s.AllowDestinations)
 	}
-	if s.MaxSessions != 1024 || s.DataChunkBytes != 65536 || s.SendWindow != 4194304 {
+	if s.MaxSessions != 1024 || s.MaxConnsPerIP != 8 || s.DataChunkBytes != 65536 || s.SendWindow != 4194304 {
 		t.Fatalf("sizes %+v", s)
+	}
+	if s.PprofListen != "" || s.ExpvarListen != "" {
+		t.Fatalf("debug listeners should default empty: %+v", s)
 	}
 	if s.BufferBytes != 67108864 || s.TotalBufferBytes != 536870912 {
 		t.Fatalf("buffers %d %d", s.BufferBytes, s.TotalBufferBytes)
@@ -201,6 +204,12 @@ func TestValidationErrors(t *testing.T) {
 	s.BufferBytes = s.TotalBufferBytes + 1
 	if err := s.Validate(); err == nil {
 		t.Fatal("expected buffer_bytes > total_buffer_bytes error")
+	}
+
+	s = DefaultServer()
+	s.MaxConnsPerIP = 0
+	if err := s.Validate(); err == nil {
+		t.Fatal("expected max_conns_per_ip error")
 	}
 
 	s = DefaultServer()

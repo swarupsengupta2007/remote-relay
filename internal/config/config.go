@@ -266,6 +266,9 @@ func (s Server) Validate() error {
 	if s.MaxSessions <= 0 {
 		return fmt.Errorf("max_sessions must be positive")
 	}
+	if s.MaxConnsPerIP <= 0 {
+		return fmt.Errorf("max_conns_per_ip must be positive")
+	}
 	if len(s.AllowDestinations) == 0 {
 		return fmt.Errorf("allow_destinations must not be empty")
 	}

@@ -51,6 +51,27 @@ func TestTokenRotateAndVerify(t *testing.T) {
 	}
 }
 
+func TestStoreMaxCapacity(t *testing.T) {
+	st := NewStore(1)
+	s1, _, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2, _, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Add(s1); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Add(s2); !errors.Is(err, proto.ErrNoCapacity) {
+		t.Fatalf("got %v want ERR_NO_CAPACITY", err)
+	}
+	if st.Len() != 1 {
+		t.Fatalf("len=%d", st.Len())
+	}
+}
+
 func TestExpireTombstone(t *testing.T) {
 	st := NewStore(8)
 	sess, token, err := New()

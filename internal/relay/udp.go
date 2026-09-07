@@ -154,10 +154,7 @@ func (s *Server) quicCert() (tls.Certificate, error) {
 }
 
 func (s *Server) serveQUIC(ln *transport.QUICListener) {
-	ctx := s.serveCtx
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx := s.sessionContext()
 	for {
 		qconn, err := ln.Accept(ctx)
 		if err != nil {
@@ -183,6 +180,10 @@ func (s *Server) handleQUIC(ctx context.Context, qconn *quic.Conn) {
 	if err != nil {
 		return
 	}
+	if s.shutting() {
+		writeResumeFail(conn, proto.CodeShutdown, "shutting down")
+		return
+	}
 	switch f.Type {
 	case proto.TypeResume:
 		s.handleResume(ctx, conn, f)
@@ -192,14 +193,15 @@ func (s *Server) handleQUIC(ctx context.Context, qconn *quic.Conn) {
 }
 
 func (s *Server) serveKCP(ln *transport.KCPListener) {
-	ctx := s.serveCtx
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx := s.sessionContext()
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			return
+		}
+		if s.shutting() {
+			_ = conn.Close()
+			continue
 		}
 		go s.handleKCP(ctx, conn)
 	}
@@ -211,6 +213,10 @@ func (s *Server) handleKCP(ctx context.Context, conn transport.Conn) {
 	f, err := conn.ReadFrame()
 	_ = conn.SetDeadline(time.Time{})
 	if err != nil {
+		return
+	}
+	if s.shutting() {
+		writeResumeFail(conn, proto.CodeShutdown, "shutting down")
 		return
 	}
 	switch f.Type {
