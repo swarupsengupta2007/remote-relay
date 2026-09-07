@@ -105,19 +105,18 @@ type pump struct {
 	inGotClose atomic.Bool
 	delivered  atomic.Uint64
 
-	lastIn   atomic.Int64
-	finished atomic.Bool
-	byeOnce  sync.Once
-	cwOnce   sync.Once
+	lastIn        atomic.Int64
+	finished      atomic.Bool
+	backpressured atomic.Bool
+	byeOnce       sync.Once
+	cwOnce        sync.Once
 }
 
 func runPump(ctx context.Context, io sessionIO, cfg pumpConfig) error {
 	if cfg.log == nil {
 		cfg.log = slog.Default()
 	}
-	if cfg.chunk <= 0 {
-		cfg.chunk = 65536
-	}
+	cfg.chunk = clampChunk(cfg.chunk)
 	if cfg.window <= 0 {
 		cfg.window = 4194304
 	}
@@ -136,7 +135,7 @@ func runPump(ctx context.Context, io sessionIO, cfg pumpConfig) error {
 	p.lastIn.Store(time.Now().UnixNano())
 
 	errc := make(chan error, 8)
-	var netWG sync.WaitGroup
+	var netWG, srcWG sync.WaitGroup
 	start := func(fn func() error) {
 		netWG.Add(1)
 		go func() {
@@ -150,7 +149,9 @@ func runPump(ctx context.Context, io sessionIO, cfg pumpConfig) error {
 			}
 		}()
 	}
+	srcWG.Add(1)
 	go func() {
+		defer srcWG.Done()
 		if err := p.srcReader(); err != nil {
 			select {
 			case errc <- err:
@@ -174,16 +175,9 @@ func runPump(ctx context.Context, io sessionIO, cfg pumpConfig) error {
 	_ = p.io.conn.Close()
 	if p.io.closeSrc != nil {
 		_ = p.io.closeSrc()
+		srcWG.Wait()
 	}
-	done := make(chan struct{})
-	go func() {
-		netWG.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-	}
+	netWG.Wait()
 	return p.classify(err)
 }
 
@@ -263,12 +257,20 @@ func (p *pump) netWriter() error {
 	}
 }
 
+func (p *pump) enqueueSink(frag dataFrag) error {
+	p.backpressured.Store(true)
+	defer p.backpressured.Store(false)
+	select {
+	case p.sinkQ <- frag:
+		return nil
+	case <-p.ctx.Done():
+		return p.ctx.Err()
+	}
+}
+
 func (p *pump) netReader() error {
 	expected := uint64(0)
 	for {
-		if p.cfg.idle > 0 {
-			_ = p.io.conn.SetDeadline(time.Now().Add(p.cfg.idle))
-		}
 		f, err := p.io.conn.ReadFrame()
 		if err != nil {
 			return err
@@ -297,12 +299,10 @@ func (p *pump) netReader() error {
 				_ = p.sendErr(proto.CodeProto, "data past CLOSE_DIR")
 				return proto.ErrProto
 			}
-			select {
-			case p.sinkQ <- dataFrag{data: data}:
-				expected += uint64(len(data))
-			case <-p.ctx.Done():
-				return p.ctx.Err()
+			if err := p.enqueueSink(dataFrag{data: data}); err != nil {
+				return err
 			}
+			expected += uint64(len(data))
 		case proto.TypeAck:
 			acked, aerr := proto.DecodeAck(f.Payload)
 			if aerr != nil {
@@ -317,12 +317,18 @@ func (p *pump) netReader() error {
 				_ = p.sendErr(proto.CodeProto, "bad CLOSE_DIR")
 				return uerr
 			}
+			if cd.Dir != p.io.inDir {
+				_ = p.sendErr(proto.CodeProto, "CLOSE_DIR direction")
+				return proto.ErrProto
+			}
+			if cd.FinalOffset != expected {
+				_ = p.sendErr(proto.CodeProto, "CLOSE_DIR offset mismatch")
+				return proto.ErrProto
+			}
 			p.inFinal.Store(cd.FinalOffset)
 			p.inGotClose.Store(true)
-			select {
-			case p.sinkQ <- dataFrag{eof: true}:
-			case <-p.ctx.Done():
-				return p.ctx.Err()
+			if err := p.enqueueSink(dataFrag{eof: true}); err != nil {
+				return err
 			}
 			p.maybeBye()
 		case proto.TypePing:
@@ -395,7 +401,7 @@ func (p *pump) timer() error {
 			return p.ctx.Err()
 		case now := <-t.C:
 			last := time.Unix(0, p.lastIn.Load())
-			if p.cfg.idle > 0 && now.Sub(last) > p.cfg.idle {
+			if p.cfg.idle > 0 && !p.backpressured.Load() && now.Sub(last) > p.cfg.idle {
 				p.cancel()
 				return errIdle
 			}
@@ -452,10 +458,28 @@ func writeFull(w io.Writer, p []byte) error {
 	return nil
 }
 
+func writeFrameDeadline(conn transport.Conn, f proto.Frame) error {
+	_ = conn.SetDeadline(time.Now().Add(handshakeTimeout))
+	err := conn.WriteFrame(f)
+	_ = conn.SetDeadline(time.Time{})
+	return err
+}
+
 func writeErr(conn transport.Conn, code, msg string) {
 	fr, err := proto.MarshalFrame(proto.TypeErr, proto.Fail{Code: code, Msg: msg})
 	if err != nil {
 		return
 	}
-	_ = conn.WriteFrame(fr)
+	_ = writeFrameDeadline(conn, fr)
+}
+
+func clampChunk(n int) int {
+	const max = proto.MaxFrameLen - 8
+	if n <= 0 {
+		return 65536
+	}
+	if n > max {
+		return max
+	}
+	return n
 }

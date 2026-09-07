@@ -56,9 +56,15 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 	if err != nil {
 		return err
 	}
-	_ = conn.SetDeadline(time.Now().Add(handshakeTimeout))
+	if err := conn.SetDeadline(deadlineOr(ctx, handshakeTimeout)); err != nil {
+		return err
+	}
 	if err := conn.WriteFrame(fr); err != nil {
 		return fmt.Errorf("send HELLO: %w", err)
+	}
+	// Server may spend DialTimeout connecting the destination before HELLO_OK or ERR.
+	if err := conn.SetDeadline(deadlineOr(ctx, handshakeTimeout+config.DefaultServer().DialTimeout.Duration())); err != nil {
+		return err
 	}
 	reply, err := conn.ReadFrame()
 	if err != nil {
@@ -84,10 +90,7 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 	log = logging.WithSession(log, ok.SessionID)
 	log.Info("session established", "transport", "tcp")
 
-	chunk := ok.Limits.DataChunkBytes
-	if chunk <= 0 {
-		chunk = 65536
-	}
+	chunk := clampChunk(ok.Limits.DataChunkBytes)
 	window := cfg.SendWindow
 	if ok.Limits.Window > 0 && (window <= 0 || ok.Limits.Window < window) {
 		window = ok.Limits.Window
@@ -110,4 +113,12 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 	})
 	_ = bw.Flush()
 	return err
+}
+
+func deadlineOr(ctx context.Context, d time.Duration) time.Time {
+	t := time.Now().Add(d)
+	if abs, ok := ctx.Deadline(); ok && abs.Before(t) {
+		return abs
+	}
+	return t
 }

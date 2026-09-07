@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/remote-relay/relay/internal/config"
 	"github.com/remote-relay/relay/internal/logging"
+	"github.com/remote-relay/relay/internal/proto"
 )
 
 const recordSize = 16
@@ -62,6 +64,11 @@ func startRelay(t *testing.T, dest string) (*Server, string, context.CancelFunc)
 	cfg.Transports = []string{"tcp"}
 	cfg.LogLevel = "error"
 	cfg.IdleTimeout = config.Duration(30 * time.Second)
+	return startRelayCfg(t, cfg)
+}
+
+func startRelayCfg(t *testing.T, cfg config.Server) (*Server, string, context.CancelFunc) {
+	t.Helper()
 	log := logging.New(io.Discard, "error", "text")
 	srv := NewServer(cfg, log)
 	if err := srv.Listen(); err != nil {
@@ -83,6 +90,18 @@ func startRelay(t *testing.T, dest string) (*Server, string, context.CancelFunc)
 		t.Fatal("empty listen addr")
 	}
 	return srv, addr, cancel
+}
+
+func runClientTo(t *testing.T, server, dest string) error {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	ccfg := config.DefaultClient()
+	ccfg.Server = server
+	ccfg.Destination = dest
+	ccfg.Transport = "tcp"
+	log := logging.New(io.Discard, "error", "text")
+	return RunClient(ctx, ccfg, bytes.NewReader(nil), io.Discard, log)
 }
 
 func TestE2EByteExactBothDirections(t *testing.T) {
@@ -309,23 +328,72 @@ func TestDestForbidden(t *testing.T) {
 	cfg := config.DefaultServer()
 	cfg.ListenTCP = "127.0.0.1:0"
 	cfg.AllowDestinations = []string{"127.0.0.1:22"}
+	cfg.DefaultDestination = "127.0.0.1:22"
 	cfg.Transports = []string{"tcp"}
-	log := logging.New(io.Discard, "error", "text")
-	srv := NewServer(cfg, log)
-	if err := srv.Listen(); err != nil {
+	_, addr, _ := startRelayCfg(t, cfg)
+
+	err := runClientTo(t, addr, "127.0.0.1:1")
+	if !errors.Is(err, proto.ErrDestForbidden) {
+		t.Fatalf("got %v, want ERR_DEST_FORBIDDEN", err)
+	}
+}
+
+func TestDestRefused(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { _ = srv.Serve(ctx) }()
-	t.Cleanup(func() { _ = srv.Close() })
+	dest := l.Addr().String()
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
 
-	ccfg := config.DefaultClient()
-	ccfg.Server = srv.Addr()
-	ccfg.Destination = "127.0.0.1:1"
-	ccfg.Transport = "tcp"
-	err := RunClient(ctx, ccfg, bytes.NewReader(nil), io.Discard, log)
-	if err == nil {
-		t.Fatal("expected forbidden dest error")
+	cfg := config.DefaultServer()
+	cfg.ListenTCP = "127.0.0.1:0"
+	cfg.AllowDestinations = []string{dest}
+	cfg.DefaultDestination = dest
+	cfg.Transports = []string{"tcp"}
+	cfg.DialTimeout = config.Duration(2 * time.Second)
+	_, addr, _ := startRelayCfg(t, cfg)
+
+	err = runClientTo(t, addr, dest)
+	if !errors.Is(err, proto.ErrDestRefused) {
+		t.Fatalf("got %v, want ERR_DEST_REFUSED", err)
+	}
+}
+
+func TestDestRefusedDialTimeout(t *testing.T) {
+	// TEST-NET-1 is not on the loopback; connect waits until DialTimeout.
+	const blackhole = "192.0.2.1:1"
+	cfg := config.DefaultServer()
+	cfg.ListenTCP = "127.0.0.1:0"
+	cfg.AllowDestinations = []string{blackhole}
+	cfg.DefaultDestination = blackhole
+	cfg.Transports = []string{"tcp"}
+	cfg.DialTimeout = config.Duration(300 * time.Millisecond)
+	_, addr, _ := startRelayCfg(t, cfg)
+
+	start := time.Now()
+	err := runClientTo(t, addr, blackhole)
+	if !errors.Is(err, proto.ErrDestRefused) {
+		t.Fatalf("got %v, want ERR_DEST_REFUSED (not a handshake I/O timeout)", err)
+	}
+	if time.Since(start) < 200*time.Millisecond {
+		t.Fatalf("dial failed too quickly to be a timeout: %s", time.Since(start))
+	}
+}
+
+func TestClampChunk(t *testing.T) {
+	if got := clampChunk(0); got != 65536 {
+		t.Fatalf("zero: %d", got)
+	}
+	if got := clampChunk(-1); got != 65536 {
+		t.Fatalf("neg: %d", got)
+	}
+	if got := clampChunk(1024); got != 1024 {
+		t.Fatalf("ok: %d", got)
+	}
+	if got := clampChunk(proto.MaxFrameLen); got != proto.MaxFrameLen-8 {
+		t.Fatalf("oversize: %d", got)
 	}
 }

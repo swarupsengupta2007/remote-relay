@@ -128,6 +128,8 @@ func (s *Server) handle(ctx context.Context, raw net.Conn) {
 
 	_ = conn.SetDeadline(time.Now().Add(handshakeTimeout))
 	f, err := conn.ReadFrame()
+	// Dest dial has its own timeout; do not share the HELLO read deadline with it.
+	_ = conn.SetDeadline(time.Time{})
 	if err != nil {
 		s.log.Debug("handshake read", "err", err)
 		return
@@ -224,10 +226,9 @@ func (s *Server) handle(ctx context.Context, raw net.Conn) {
 	if err != nil {
 		return
 	}
-	if err := conn.WriteFrame(fr); err != nil {
+	if err := writeFrameDeadline(conn, fr); err != nil {
 		return
 	}
-	_ = conn.SetDeadline(time.Time{})
 
 	log := logging.WithSession(s.log, sess.ID)
 	log.Info("session started", "dest", dest, "peer", conn.RemoteAddr().String())
