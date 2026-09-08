@@ -28,12 +28,27 @@ type HelloOK struct {
 }
 
 type Resume struct {
-	V           int      `json:"v"`
-	SessionID   string   `json:"sessionId"`
-	ResumeToken string   `json:"resumeToken"`
-	Transport   []string `json:"transport"`
-	DownAcked   uint64   `json:"downAcked"`
-	ClientNonce string   `json:"clientNonce"`
+	V           int             `json:"v"`
+	SessionID   string          `json:"sessionId"`
+	ResumeToken string          `json:"resumeToken"`
+	Transport   []string        `json:"transport"`
+	DownAcked   uint64          `json:"downAcked"`
+	ClientNonce string          `json:"clientNonce"`
+	Auth        json.RawMessage `json:"auth,omitempty"`
+}
+
+// Auth is C→S TypeAuth: the signature over the AUTH_OK challenge.
+type Auth struct {
+	Sig string `json:"sig"`
+}
+
+// AuthOK is S→C TypeAuthOK: the pre-session / pre-attach challenge.
+// It is not a success verdict; HELLO_OK / RESUME_OK follows a valid AUTH.
+type AuthOK struct {
+	SessionID   string `json:"sessionId"`
+	ServerNonce string `json:"serverNonce"`
+	Challenge   string `json:"challenge"`
+	Destination string `json:"destination"`
 }
 
 type ResumeOK struct {

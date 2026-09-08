@@ -24,6 +24,9 @@ func TestDefaults(t *testing.T) {
 	if s.PprofListen != "" || s.ExpvarListen != "" {
 		t.Fatalf("debug listeners should default empty: %+v", s)
 	}
+	if s.AuthMethod != "none" {
+		t.Fatalf("auth_method=%q", s.AuthMethod)
+	}
 	if s.BufferBytes != 67108864 || s.TotalBufferBytes != 536870912 {
 		t.Fatalf("buffers %d %d", s.BufferBytes, s.TotalBufferBytes)
 	}
@@ -35,7 +38,7 @@ func TestDefaults(t *testing.T) {
 	}
 
 	c := DefaultClient()
-	if c.Transport != "quic" || c.LogLevel != "warn" {
+	if c.Transport != "quic" || c.LogLevel != "warn" || c.AuthMethod != "none" {
 		t.Fatalf("client %+v", c)
 	}
 	if err := c.Validate(); err != nil {
@@ -53,6 +56,9 @@ max_sessions = 4
 hold_timeout = "90s"
 allow_destinations = ["127.0.0.1:22", "127.0.0.1:7"]
 transports = ["tcp"]
+auth_method = "ssh-publickey"
+authorized_keys = "/tmp/ak"
+auth_fail_delay = "50ms"
 `
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
@@ -75,6 +81,12 @@ transports = ["tcp"]
 	}
 	if len(cfg.AllowDestinations) != 2 {
 		t.Fatalf("allow %v", cfg.AllowDestinations)
+	}
+	if cfg.AuthMethod != "ssh-publickey" || cfg.AuthorizedKeys != "/tmp/ak" {
+		t.Fatalf("auth %+v", cfg)
+	}
+	if cfg.AuthFailDelay.Duration() != 50*time.Millisecond {
+		t.Fatalf("auth_fail_delay %s", cfg.AuthFailDelay)
 	}
 }
 
@@ -220,6 +232,12 @@ func TestValidationErrors(t *testing.T) {
 	s.Transports = []string{}
 	if err := s.Validate(); err == nil {
 		t.Fatal("expected empty transports error")
+	}
+
+	s = DefaultServer()
+	s.AuthMethod = "password"
+	if err := s.Validate(); err == nil {
+		t.Fatal("expected unknown auth_method error")
 	}
 
 	c := DefaultClient()

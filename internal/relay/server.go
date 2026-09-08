@@ -3,6 +3,8 @@ package relay
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net"
@@ -76,7 +78,7 @@ func NewServer(cfg config.Server, log *slog.Logger) *Server {
 	return &Server{
 		cfg:         cfg,
 		log:         log,
-		auth:        auth.None{},
+		auth:        auth.New(auth.Config{Method: cfg.AuthMethod, AuthorizedKeys: cfg.AuthorizedKeys, FailDelay: cfg.AuthFailDelay.Duration()}),
 		store:       session.NewStore(cfg.MaxSessions),
 		budget:      session.NewBudget(int64(cfg.TotalBufferBytes)),
 		lives:       make(map[string]*live),
@@ -246,13 +248,15 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 		return
 	}
 
-	if _, err := s.auth.Verify(auth.Challenge{
-		Destination: dest,
-		ClientNonce: hello.ClientNonce,
-	}, hello.Auth); err != nil {
-		writeErr(conn, proto.CodeAuth, "auth failed")
+	id, sess, token, serverNonce, ok := s.helloAuth(conn, hello, f.Payload)
+	if !ok {
 		return
 	}
+	sess.Destination = dest
+	sess.AuthMethod = id.Method
+	sess.AuthUser = id.Name
+	sess.Fingerprint = id.Fingerprint
+	sess.PublicKey = id.RawPubKey
 
 	if err := s.tryReserveIPSess(ip); err != nil {
 		s.refused.Add(1)
@@ -271,12 +275,6 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 		}
 	}()
 
-	sess, token, err := session.New()
-	if err != nil {
-		writeErr(conn, proto.CodeInternal, "session allocate")
-		return
-	}
-	sess.Destination = dest
 	if err := s.store.Add(sess); err != nil {
 		s.refused.Add(1)
 		writeErr(conn, proto.CodeNoCapacity, "too many sessions")
@@ -319,12 +317,15 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 		writeErr(conn, proto.CodeNoCapacity, "buffer budget exhausted")
 		return
 	}
-	serverNonce, err := proto.RandomNonce()
-	if err != nil {
-		_ = dtcp.Close()
-		s.store.Remove(sess.ID)
-		writeErr(conn, proto.CodeInternal, "nonce")
-		return
+	if serverNonce == "" {
+		var err error
+		serverNonce, err = proto.RandomNonce()
+		if err != nil {
+			_ = dtcp.Close()
+			s.store.Remove(sess.ID)
+			writeErr(conn, proto.CodeInternal, "nonce")
+			return
+		}
 	}
 	selected, udp := s.pickTransport(hello.Transport, sess.ID, conn.LocalAddr())
 	okMsg := proto.HelloOK{
@@ -435,6 +436,9 @@ func (s *Server) handleResume(ctx context.Context, conn transport.Conn, f proto.
 		} else {
 			writeResumeFail(conn, proto.CodeUnknownSession, "unknown session")
 		}
+		return
+	}
+	if !s.resumeAuth(conn, msg, f.Payload) {
 		return
 	}
 	req := attachReq{conn: conn, resume: &msg, done: make(chan error, 1)}
@@ -787,4 +791,143 @@ func (s *Server) heldCount() int {
 		}
 	}
 	return n
+}
+
+func (s *Server) authFail(conn transport.Conn, started time.Time) {
+	if d := s.auth.FailDelay(); d > 0 {
+		if rem := d - time.Since(started); rem > 0 {
+			time.Sleep(rem)
+		}
+	}
+	writeErr(conn, proto.CodeAuth, "auth failed")
+}
+
+func (s *Server) helloAuth(conn transport.Conn, hello proto.Hello, canonical []byte) (auth.Identity, *session.Session, string, string, bool) {
+	if !s.auth.RequiresChallenge() {
+		id, err := s.auth.Verify(auth.Challenge{
+			Destination: hello.Destination,
+			ClientNonce: hello.ClientNonce,
+		}, hello.Auth)
+		if err != nil {
+			writeErr(conn, proto.CodeAuth, "auth failed")
+			return auth.Identity{}, nil, "", "", false
+		}
+		sess, token, err := session.New()
+		if err != nil {
+			writeErr(conn, proto.CodeInternal, "session allocate")
+			return auth.Identity{}, nil, "", "", false
+		}
+		return id, sess, token, "", true
+	}
+
+	started := time.Now()
+	var offer auth.Offer
+	if err := json.Unmarshal(bytesOrEmpty(hello.Auth), &offer); err != nil || offer.Method != auth.MethodPublicKey {
+		s.authFail(conn, started)
+		return auth.Identity{}, nil, "", "", false
+	}
+	sess, token, err := session.New()
+	if err != nil {
+		writeErr(conn, proto.CodeInternal, "session allocate")
+		return auth.Identity{}, nil, "", "", false
+	}
+	serverNonce, err := proto.RandomNonce()
+	if err != nil {
+		writeErr(conn, proto.CodeInternal, "nonce")
+		return auth.Identity{}, nil, "", "", false
+	}
+	ch := auth.Challenge{
+		SessionID:   sess.ID,
+		Destination: hello.Destination,
+		ClientNonce: hello.ClientNonce,
+		ServerNonce: serverNonce,
+		Canonical:   canonical,
+		Offer:       hello.Auth,
+	}
+	if !s.issueChallenge(conn, ch) {
+		return auth.Identity{}, nil, "", "", false
+	}
+	raw, ok := s.readAuth(conn)
+	if !ok {
+		s.authFail(conn, started)
+		return auth.Identity{}, nil, "", "", false
+	}
+	id, err := s.auth.Verify(ch, raw)
+	if err != nil {
+		s.authFail(conn, started)
+		return auth.Identity{}, nil, "", "", false
+	}
+	return id, sess, token, serverNonce, true
+}
+
+func (s *Server) resumeAuth(conn transport.Conn, msg proto.Resume, canonical []byte) bool {
+	if !s.auth.RequiresChallenge() {
+		return true
+	}
+	started := time.Now()
+	sess := s.store.Get(msg.SessionID)
+	if sess == nil || sess.Fingerprint == "" {
+		s.authFail(conn, started)
+		return false
+	}
+	serverNonce, err := proto.RandomNonce()
+	if err != nil {
+		s.authFail(conn, started)
+		return false
+	}
+	ch := auth.Challenge{
+		SessionID:   msg.SessionID,
+		Destination: sess.Destination,
+		ClientNonce: msg.ClientNonce,
+		ServerNonce: serverNonce,
+		Canonical:   canonical,
+		Offer:       msg.Auth,
+		BoundFP:     sess.Fingerprint,
+		RawPubKey:   sess.PublicKey,
+	}
+	if !s.issueChallenge(conn, ch) {
+		return false
+	}
+	raw, ok := s.readAuth(conn)
+	if !ok {
+		s.authFail(conn, started)
+		return false
+	}
+	if _, err := s.auth.Verify(ch, raw); err != nil {
+		s.authFail(conn, started)
+		return false
+	}
+	return true
+}
+
+func (s *Server) issueChallenge(conn transport.Conn, ch auth.Challenge) bool {
+	digest := auth.DeriveChallenge(ch)
+	ok := proto.AuthOK{
+		SessionID:   ch.SessionID,
+		ServerNonce: ch.ServerNonce,
+		Challenge:   base64.StdEncoding.EncodeToString(digest),
+		Destination: ch.Destination,
+	}
+	fr, err := proto.MarshalFrame(proto.TypeAuthOK, ok)
+	if err != nil {
+		return false
+	}
+	return writeFrameDeadline(conn, fr) == nil
+}
+
+func (s *Server) readAuth(conn transport.Conn) (json.RawMessage, bool) {
+	_ = conn.SetDeadline(time.Now().Add(handshakeTimeout))
+	af, err := conn.ReadFrame()
+	_ = conn.SetDeadline(time.Time{})
+	if err != nil || af.Type != proto.TypeAuth {
+		return nil, false
+	}
+	return json.RawMessage(af.Payload), true
+}
+
+func bytesOrEmpty(raw json.RawMessage) []byte {
+	if len(raw) == 0 {
+		return []byte("{}")
+	}
+	return raw
 }

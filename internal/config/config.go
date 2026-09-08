@@ -77,6 +77,9 @@ type Server struct {
 	LogFormat          string   `toml:"log_format"`
 	PprofListen        string   `toml:"pprof_listen"`
 	ExpvarListen       string   `toml:"expvar_listen"`
+	AuthMethod         string   `toml:"auth_method"`
+	AuthorizedKeys     string   `toml:"authorized_keys"`
+	AuthFailDelay      Duration `toml:"auth_fail_delay"`
 }
 
 type Client struct {
@@ -92,6 +95,9 @@ type Client struct {
 	ReconnectMaxElapsed Duration `toml:"reconnect_max_elapsed"`
 	LogLevel            string   `toml:"log_level"`
 	LogFormat           string   `toml:"log_format"`
+	AuthMethod          string   `toml:"auth_method"`
+	AuthUser            string   `toml:"auth_user"`
+	IdentityFiles       []string `toml:"identity_files"`
 }
 
 func DefaultServer() Server {
@@ -117,6 +123,8 @@ func DefaultServer() Server {
 		DialTimeout:        Duration(10 * time.Second),
 		LogLevel:           "info",
 		LogFormat:          "text",
+		AuthMethod:         "none",
+		AuthFailDelay:      Duration(200 * time.Millisecond),
 	}
 }
 
@@ -134,6 +142,7 @@ func DefaultClient() Client {
 		ReconnectMaxElapsed: Duration(5 * time.Minute),
 		LogLevel:            "warn",
 		LogFormat:           "text",
+		AuthMethod:          "none",
 	}
 }
 
@@ -275,6 +284,9 @@ func (s Server) Validate() error {
 	if s.DefaultDestination == "" {
 		return fmt.Errorf("default_destination is required")
 	}
+	if err := validAuthMethod(s.AuthMethod); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -299,7 +311,19 @@ func (c Client) Validate() error {
 	if strings.TrimSpace(c.Server) == "" {
 		return fmt.Errorf("server is required")
 	}
+	if err := validAuthMethod(c.AuthMethod); err != nil {
+		return err
+	}
 	return nil
+}
+
+func validAuthMethod(m string) error {
+	switch strings.ToLower(strings.TrimSpace(m)) {
+	case "", "none", "ssh-publickey":
+		return nil
+	default:
+		return fmt.Errorf("unknown auth_method %q", m)
+	}
 }
 
 func validTransport(t string) bool {

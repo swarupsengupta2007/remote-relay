@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/remote-relay/relay/internal/auth"
 	"github.com/remote-relay/relay/internal/config"
 	"github.com/remote-relay/relay/internal/proto"
 	"github.com/remote-relay/relay/internal/transport"
@@ -165,6 +166,7 @@ func writeResumeOn(ctx context.Context, conn transport.Conn, cfg config.Client, 
 	if err != nil {
 		return none, err
 	}
+	a := clientAuth(cfg)
 	msg := proto.Resume{
 		V:           1,
 		SessionID:   sessionID,
@@ -172,6 +174,13 @@ func writeResumeOn(ctx context.Context, conn transport.Conn, cfg config.Client, 
 		Transport:   cfg.TransportPreference(),
 		DownAcked:   downAcked,
 		ClientNonce: nonce,
+	}
+	if a.RequiresChallenge() {
+		offer, err := a.Respond(auth.Challenge{Destination: cfg.Destination, ClientNonce: nonce})
+		if err != nil {
+			return none, err
+		}
+		msg.Auth = offer
 	}
 	fr, err := proto.MarshalFrame(proto.TypeResume, msg)
 	if err != nil {
@@ -185,10 +194,29 @@ func writeResumeOn(ctx context.Context, conn transport.Conn, cfg config.Client, 
 		return none, err
 	}
 	reply, err := conn.ReadFrame()
-	_ = conn.SetDeadline(time.Time{})
 	if err != nil {
+		_ = conn.SetDeadline(time.Time{})
 		return none, err
 	}
+	if reply.Type == proto.TypeAuthOK {
+		ch := auth.Challenge{
+			SessionID:   sessionID,
+			Destination: cfg.Destination,
+			ClientNonce: nonce,
+			Canonical:   fr.Payload,
+			Offer:       msg.Auth,
+		}
+		if err := completeClientAuth(conn, a, ch, reply); err != nil {
+			_ = conn.SetDeadline(time.Time{})
+			return none, err
+		}
+		reply, err = conn.ReadFrame()
+		if err != nil {
+			_ = conn.SetDeadline(time.Time{})
+			return none, err
+		}
+	}
+	_ = conn.SetDeadline(time.Time{})
 	switch reply.Type {
 	case proto.TypeResumeFail, proto.TypeErr:
 		var fail proto.Fail

@@ -25,6 +25,10 @@ type Session struct {
 	currentPlain string
 	Destination  string
 	CreatedAt    time.Time
+	AuthMethod   string
+	AuthUser     string
+	Fingerprint  string
+	PublicKey    []byte
 }
 
 type Store struct {

@@ -15,13 +15,25 @@ const (
 	TypeSwitch     Type = 0x06
 	TypeBye        Type = 0x07
 	TypeErr        Type = 0x08
-	TypeData       Type = 0x10
-	TypeAck        Type = 0x11
-	TypeCloseDir   Type = 0x12
-	TypeProbe      Type = 0x13
-	TypeProbeOK    Type = 0x14
-	TypePing       Type = 0x15
-	TypePong       Type = 0x16
+	// TypeAuth (0x09) and TypeAuthOK (0x0A) are M5 JSON control frames.
+	// §5.2 has no AUTH type; we add them for ssh-publickey:
+	//   AUTH     C→S  Auth{sig}     signature over the challenge
+	//   AUTH_OK  S→C  AuthOK{...}   challenge (not a success verdict)
+	// none: HELLO → HELLO_OK (unchanged).
+	// ssh-publickey HELLO:  HELLO → AUTH_OK(challenge) → AUTH(sig) → HELLO_OK
+	// ssh-publickey RESUME: RESUME → AUTH_OK(challenge) → AUTH(sig) → RESUME_OK
+	// AUTH_OK is sent before allocating a session or dialing the destination.
+	// Success is HELLO_OK / RESUME_OK after Verify. Failure is ERR{ERR_AUTH}
+	// after a fixed delay.
+	TypeAuth     Type = 0x09
+	TypeAuthOK   Type = 0x0A
+	TypeData     Type = 0x10
+	TypeAck      Type = 0x11
+	TypeCloseDir Type = 0x12
+	TypeProbe    Type = 0x13
+	TypeProbeOK  Type = 0x14
+	TypePing     Type = 0x15
+	TypePong     Type = 0x16
 )
 
 const (
@@ -33,7 +45,7 @@ const (
 func (t Type) Known() bool {
 	switch t {
 	case TypeHello, TypeHelloOK, TypeResume, TypeResumeOK, TypeResumeFail,
-		TypeSwitch, TypeBye, TypeErr,
+		TypeSwitch, TypeBye, TypeErr, TypeAuth, TypeAuthOK,
 		TypeData, TypeAck, TypeCloseDir,
 		TypeProbe, TypeProbeOK, TypePing, TypePong:
 		return true
@@ -60,6 +72,10 @@ func (t Type) String() string {
 		return "BYE"
 	case TypeErr:
 		return "ERR"
+	case TypeAuth:
+		return "AUTH"
+	case TypeAuthOK:
+		return "AUTH_OK"
 	case TypeData:
 		return "DATA"
 	case TypeAck:

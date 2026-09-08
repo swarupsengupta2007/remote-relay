@@ -2,8 +2,11 @@ package relay
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"log/slog"
@@ -200,18 +203,27 @@ func interruptibleReader(r io.Reader) (io.Reader, func()) {
 	})
 }
 
+func clientAuth(cfg config.Client) auth.Authenticator {
+	return auth.New(auth.Config{
+		Method:        cfg.AuthMethod,
+		User:          cfg.AuthUser,
+		IdentityFiles: cfg.IdentityFiles,
+	})
+}
+
 func clientHello(ctx context.Context, cfg config.Client) (transport.Conn, proto.HelloOK, error) {
 	var none proto.HelloOK
 	conn, err := transport.DialTCP(ctx, cfg.Server)
 	if err != nil {
 		return nil, none, fmt.Errorf("dial server: %w", err)
 	}
-	authMsg, err := auth.None{}.Respond(auth.Challenge{Destination: cfg.Destination})
+	a := clientAuth(cfg)
+	nonce, err := proto.RandomNonce()
 	if err != nil {
 		_ = conn.Close()
 		return nil, none, err
 	}
-	nonce, err := proto.RandomNonce()
+	authMsg, err := a.Respond(auth.Challenge{Destination: cfg.Destination, ClientNonce: nonce})
 	if err != nil {
 		_ = conn.Close()
 		return nil, none, err
@@ -248,6 +260,23 @@ func clientHello(ctx context.Context, cfg config.Client) (transport.Conn, proto.
 		_ = conn.Close()
 		return nil, none, fmt.Errorf("read HELLO_OK: %w", err)
 	}
+	if reply.Type == proto.TypeAuthOK {
+		ch := auth.Challenge{
+			Destination: cfg.Destination,
+			ClientNonce: nonce,
+			Canonical:   fr.Payload,
+			Offer:       authMsg,
+		}
+		if err := completeClientAuth(conn, a, ch, reply); err != nil {
+			_ = conn.Close()
+			return nil, none, err
+		}
+		reply, err = conn.ReadFrame()
+		if err != nil {
+			_ = conn.Close()
+			return nil, none, fmt.Errorf("read HELLO_OK: %w", err)
+		}
+	}
 	_ = conn.SetDeadline(time.Time{})
 	if reply.Type == proto.TypeErr {
 		_ = conn.Close()
@@ -269,6 +298,29 @@ func clientHello(ctx context.Context, cfg config.Client) (transport.Conn, proto.
 		return nil, none, proto.ErrVersion
 	}
 	return conn, ok, nil
+}
+
+func completeClientAuth(conn transport.Conn, a auth.Authenticator, ch auth.Challenge, reply proto.Frame) error {
+	var ok proto.AuthOK
+	if err := proto.UnmarshalPayload(reply, &ok); err != nil {
+		return err
+	}
+	if ok.Destination != "" {
+		ch.Destination = ok.Destination
+	}
+	ch.SessionID = ok.SessionID
+	ch.ServerNonce = ok.ServerNonce
+	digest := auth.DeriveChallenge(ch)
+	want, err := base64.StdEncoding.DecodeString(ok.Challenge)
+	if err != nil || len(want) != sha256.Size || !bytes.Equal(digest, want) {
+		return proto.NewError(proto.CodeAuth, "challenge mismatch")
+	}
+	ch.Digest = digest
+	resp, err := a.Sign(ch)
+	if err != nil {
+		return err
+	}
+	return conn.WriteFrame(proto.Frame{Type: proto.TypeAuth, Payload: []byte(resp)})
 }
 
 func clientResume(ctx context.Context, cfg config.Client, sessionID, token string, downAcked uint64) (transport.Conn, proto.ResumeOK, error) {

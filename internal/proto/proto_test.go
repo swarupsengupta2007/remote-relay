@@ -81,7 +81,7 @@ func TestUnknownFrameType(t *testing.T) {
 
 func TestUnknownTypeGap(t *testing.T) {
 	var buf bytes.Buffer
-	buf.WriteByte(0x09)
+	buf.WriteByte(0x0B)
 	buf.Write([]byte{0, 0, 0, 0})
 	_, err := ReadFrame(&buf)
 	if !errors.Is(err, ErrProto) {
@@ -139,6 +139,12 @@ func TestControlRoundTrip(t *testing.T) {
 			},
 		},
 		{name: "fail", typ: TypeErr, v: Fail{Code: CodeProto, Msg: "nope"}},
+		{name: "auth", typ: TypeAuth, v: Auth{Sig: "AAAA"}},
+		{
+			name: "auth_ok",
+			typ:  TypeAuthOK,
+			v:    AuthOK{SessionID: "s-1", ServerNonce: "n", Challenge: "c", Destination: "127.0.0.1:22"},
+		},
 		{name: "switch", typ: TypeSwitch, v: Switch{Dir: DirBoth, From: "tcp", Offset: SwitchOffset{Up: 1, Down: 2}}},
 		{name: "bye", typ: TypeBye, v: Bye{Code: CodeShutdown, Msg: "bye"}},
 		{name: "close_dir", typ: TypeCloseDir, v: CloseDir{Dir: DirUp, FinalOffset: 99}},
@@ -213,6 +219,10 @@ func cloneEmpty(v any) any {
 		return &SessionState{}
 	case UdpInfo:
 		return &UdpInfo{}
+	case Auth:
+		return &Auth{}
+	case AuthOK:
+		return &AuthOK{}
 	default:
 		return nil
 	}
@@ -260,7 +270,8 @@ func TestAckPingProbeCodec(t *testing.T) {
 func TestKnownTypes(t *testing.T) {
 	for _, typ := range []Type{
 		TypeHello, TypeHelloOK, TypeResume, TypeResumeOK, TypeResumeFail,
-		TypeSwitch, TypeBye, TypeErr, TypeData, TypeAck, TypeCloseDir,
+		TypeSwitch, TypeBye, TypeErr, TypeAuth, TypeAuthOK,
+		TypeData, TypeAck, TypeCloseDir,
 		TypeProbe, TypeProbeOK, TypePing, TypePong,
 	} {
 		if !typ.Known() {
