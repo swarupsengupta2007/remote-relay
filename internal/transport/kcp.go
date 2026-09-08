@@ -25,6 +25,7 @@ func TuneKCP(sess *kcp.UDPSession) {
 		return
 	}
 	sess.SetNoDelay(1, 10, 2, 1)
+	//lint:ignore SA1019 stream mode is required for framing; kcp-go v5 maintains SetStreamMode
 	sess.SetStreamMode(true)
 	sess.SetMtu(kcpMTU)
 	sess.SetWindowSize(256, 256)

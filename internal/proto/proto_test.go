@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -268,14 +269,106 @@ func TestAckPingProbeCodec(t *testing.T) {
 }
 
 func TestKnownTypes(t *testing.T) {
-	for _, typ := range []Type{
+	types := []Type{
 		TypeHello, TypeHelloOK, TypeResume, TypeResumeOK, TypeResumeFail,
 		TypeSwitch, TypeBye, TypeErr, TypeAuth, TypeAuthOK,
 		TypeData, TypeAck, TypeCloseDir,
 		TypeProbe, TypeProbeOK, TypePing, TypePong,
-	} {
+	}
+	for _, typ := range types {
 		if !typ.Known() {
 			t.Fatalf("%s should be known", typ)
 		}
+		if s := typ.String(); s == "" || strings.HasPrefix(s, "Type(") {
+			t.Fatalf("expected known string for %d, got %q", typ, s)
+		}
+	}
+	unknown := Type(0xff)
+	if unknown.Known() {
+		t.Fatalf("0xff should not be known")
+	}
+	if s := unknown.String(); s != "0xff" {
+		t.Fatalf("unexpected unknown type string: %q", s)
+	}
+}
+
+func TestProtoErrors(t *testing.T) {
+	pe := NewError(CodeAuth, "authentication rejected")
+	if pe.Error() != "ERR_AUTH: authentication rejected" {
+		t.Fatalf("unexpected error string: %s", pe.Error())
+	}
+	peNoMsg := NewError(CodeAuth, "")
+	if peNoMsg.Error() != "ERR_AUTH" {
+		t.Fatalf("unexpected no-msg error string: %s", peNoMsg.Error())
+	}
+	if !errors.Is(pe, ErrAuth) {
+		t.Fatalf("expected errors.Is to match ErrAuth")
+	}
+	if errors.Is(pe, ErrVersion) {
+		t.Fatalf("did not expect ErrVersion match")
+	}
+	if errors.Is(pe, errors.New("other")) {
+		t.Fatalf("did not expect generic error match")
+	}
+}
+
+func TestMarshalUnmarshalPayload(t *testing.T) {
+	h := Hello{V: 1, Destination: "127.0.0.1:22"}
+	fr, err := MarshalFrame(TypeHello, h)
+	if err != nil {
+		t.Fatalf("MarshalFrame: %v", err)
+	}
+	if fr.Type != TypeHello {
+		t.Fatalf("expected TypeHello, got %s", fr.Type)
+	}
+
+	var got Hello
+	if err := UnmarshalPayload(fr, &got); err != nil {
+		t.Fatalf("UnmarshalPayload: %v", err)
+	}
+	if got.V != 1 || got.Destination != "127.0.0.1:22" {
+		t.Fatalf("unmarshaled mismatch: %+v", got)
+	}
+
+	// Corrupted JSON payload
+	badFr := Frame{Type: TypeHello, Payload: []byte("{invalid json")}
+	if err := UnmarshalPayload(badFr, &got); err == nil {
+		t.Fatalf("expected error unmarshaling bad json")
+	}
+}
+
+func TestRandomNonce(t *testing.T) {
+	n1, err := RandomNonce()
+	if err != nil {
+		t.Fatalf("RandomNonce 1: %v", err)
+	}
+	n2, err := RandomNonce()
+	if err != nil {
+		t.Fatalf("RandomNonce 2: %v", err)
+	}
+	if n1 == "" || n2 == "" {
+		t.Fatalf("expected non-empty nonces")
+	}
+	if n1 == n2 {
+		t.Fatalf("nonces must be random and unique: %s == %s", n1, n2)
+	}
+}
+
+func TestCorruptPayloadDecoders(t *testing.T) {
+	short := []byte{1, 2, 3}
+	if _, _, err := DecodeData(short); err == nil {
+		t.Fatalf("DecodeData should fail on short payload")
+	}
+	if _, err := DecodeAck(short); err == nil {
+		t.Fatalf("DecodeAck should fail on short payload")
+	}
+	if _, _, err := DecodePing(short); err == nil {
+		t.Fatalf("DecodePing should fail on short payload")
+	}
+	if _, _, err := DecodeProbe(short); err == nil {
+		t.Fatalf("DecodeProbe should fail on short payload")
+	}
+	if _, err := DecodeProbeOK(short); err == nil {
+		t.Fatalf("DecodeProbeOK should fail on short payload")
 	}
 }

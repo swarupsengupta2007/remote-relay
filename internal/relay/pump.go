@@ -390,6 +390,10 @@ func reconnectable(err error) bool {
 	if errors.Is(err, errByeSent) || errors.Is(err, errByeReceived) {
 		return false
 	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}

@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -29,9 +30,32 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 		log = logging.NewClient(cfg.LogLevel, cfg.LogFormat)
 	}
 
-	conn, helloOK, err := clientHello(ctx, cfg)
-	if err != nil {
-		return err
+	schedule := parseBackoff(cfg.ReconnectBackoff)
+	maxElapsed := cfg.ReconnectMaxElapsed.Duration()
+	if maxElapsed <= 0 {
+		maxElapsed = 5 * time.Minute
+	}
+
+	var conn transport.Conn
+	var helloOK proto.HelloOK
+	var err error
+	attempt := 0
+	helloDeadline := time.Now().Add(maxElapsed)
+	for {
+		helloCtx, helloCancel := context.WithDeadline(ctx, helloDeadline)
+		conn, helloOK, err = clientHello(helloCtx, cfg)
+		helloCancel()
+		if err == nil {
+			break
+		}
+		if (!reconnectable(err) && !errors.Is(err, context.DeadlineExceeded)) || time.Now().After(helloDeadline) || ctx.Err() != nil {
+			return err
+		}
+		log.Debug("handshake failed, retrying", "attempt", attempt, "err", err)
+		if serr := sleepBackoff(ctx, schedule, attempt, helloDeadline); serr != nil {
+			return err
+		}
+		attempt++
 	}
 	log = logging.WithSession(log, helloOK.SessionID)
 	log.Info("session established", "transport", helloOK.Transport)
@@ -94,8 +118,8 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 		}
 	}()
 
-	schedule := parseBackoff(cfg.ReconnectBackoff)
-	maxElapsed := cfg.ReconnectMaxElapsed.Duration()
+	schedule = parseBackoff(cfg.ReconnectBackoff)
+	maxElapsed = cfg.ReconnectMaxElapsed.Duration()
 	if maxElapsed <= 0 {
 		maxElapsed = 5 * time.Minute
 	}
@@ -146,9 +170,11 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 		attempt := 0
 		resumed := false
 		for reconnectable(err) && time.Now().Before(deadline) {
-			nconn, rok, rerr := clientResume(ctx, cfg, sessionID, token, p.delivered.Load())
+			dialCtx, dialCancel := context.WithDeadline(ctx, deadline)
+			nconn, rok, rerr := clientResume(dialCtx, cfg, sessionID, token, p.delivered.Load())
+			dialCancel()
 			if rerr != nil {
-				if !reconnectable(rerr) {
+				if !reconnectable(rerr) && !errors.Is(rerr, context.DeadlineExceeded) {
 					return rerr
 				}
 				err = rerr
@@ -179,12 +205,13 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 			current = nconn
 			sendFrom = rok.UpAcked
 			resumed = true
+			log.Info("session resumed", "transport", current.Kind().String())
 			break
 		}
 		if resumed {
 			continue
 		}
-		if reconnectable(err) {
+		if reconnectable(err) || errors.Is(err, context.DeadlineExceeded) {
 			return fmt.Errorf("reconnect budget exhausted: %w", err)
 		}
 		return p.classify(err)
