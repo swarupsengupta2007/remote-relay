@@ -7,8 +7,10 @@ the data plane upgrades to UDP (QUIC by default, KCP with `--kcp`) when a
 probe succeeds. If the WAN link breaks, the client reconnects and **resumes
 the same session** so the consumer (`ssh`) does not see a disconnect.
 
-v1 has no authentication. The payload is expected to be an already-encrypted
-SSH stream. See **Security** below.
+Handshake authentication is **off by default** (`auth_method = "none"`). Set
+`auth_method = "ssh-publickey"` to require a signed challenge before the
+server dials. The payload is still typically an already-encrypted SSH stream.
+See **Authentication** and **Security** below.
 
 ## Status
 
@@ -19,7 +21,7 @@ SSH stream. See **Security** below.
 | M2 QUIC upgrade | yes |
 | M3 KCP | yes |
 | M4 session limits, graceful shutdown, observability | yes |
-| M5 SSH public-key auth | no |
+| M5 SSH public-key auth | yes |
 
 Netem (delay/loss) comparison numbers for TCP vs QUIC vs KCP are **not
 recorded in this environment**.
@@ -87,6 +89,10 @@ log_level           = "info"           # debug|info|warn|error
 log_format          = "text"           # text|json
 pprof_listen        = ""               # empty = disabled
 expvar_listen       = ""               # empty = disabled
+
+auth_method         = "none"           # none | ssh-publickey
+authorized_keys     = ""               # empty = ~/.ssh/authorized_keys of the relay user
+auth_fail_delay     = "200ms"          # fixed delay on ERR_AUTH (no oracle)
 ```
 
 ## Client
@@ -118,6 +124,9 @@ reconnect_backoff     = ["100ms","250ms","500ms","1s","2s","5s","10s"]
 reconnect_max_elapsed = "5m"            # keep in sync with server hold_timeout
 log_level             = "warn"
 log_format            = "text"
+auth_method           = "none"          # none | ssh-publickey
+auth_user             = ""              # empty = current user
+identity_files        = []              # empty = try ~/.ssh/id_ed25519, id_ecdsa, id_rsa
 ```
 
 ### SSH ProxyCommand
@@ -151,6 +160,40 @@ Manual smoke test without SSH (needs an echo/discard listener on the dest):
 relay server --config server.toml --log-level debug
 printf 'hello\n' | relay client --server 127.0.0.1:7443 --dest 127.0.0.1:7
 ```
+
+## Authentication
+
+`auth_method` defaults to `"none"` so existing deployments stay open. Auth is
+TOML-only (no CLI flag).
+
+To require SSH public-key auth on the relay handshake:
+
+**Server** (`server.toml`):
+
+```toml
+auth_method     = "ssh-publickey"
+authorized_keys = "/var/lib/relay/authorized_keys"  # OpenSSH authorized_keys file
+auth_fail_delay = "200ms"
+```
+
+The server verifies the offered key against `authorized_keys` (ed25519, ecdsa
+P-256/384/521, RSA ≥ 2048 with `rsa-sha2-256`/`rsa-sha2-512`). It sends a
+challenge **before** allocating a session or dialing the destination. Failure
+is `ERR_AUTH` after `auth_fail_delay` (same delay for unknown key and bad
+signature). `RESUME` must re-sign with the same key; `resumeToken` alone is
+not enough.
+
+**Client** (`client.toml`):
+
+```toml
+auth_method    = "ssh-publickey"
+auth_user      = "alice"
+identity_files = ["/home/alice/.ssh/id_ed25519"]
+```
+
+If `identity_files` is empty the client tries `~/.ssh/id_ed25519`, `id_ecdsa`,
+`id_rsa` (PEM and OpenSSH formats). Both sides must set `ssh-publickey`; a
+`none` client against an authenticating server gets `ERR_AUTH`.
 
 ## Resume, hold, and UDP upgrade
 
@@ -211,19 +254,22 @@ include `resumeToken` or payload bytes.
 
 If both are set to the same address, one HTTP server serves both.
 
-## Security (v1)
+## Security
 
 - TCP handshake is cleartext (HELLO / RESUME, including `resumeToken`).
 - QUIC data plane is TLS 1.3 but unauthenticated (ephemeral self-signed cert
   by default).
 - KCP data plane is cleartext.
-- Anyone who can reach `listen_tcp` can open a session to any destination
-  the server allows.
+- With the default `auth_method = "none"`, anyone who can reach `listen_tcp`
+  can open a session to any destination the server allows.
+
+With `auth_method = "ssh-publickey"`, the server does not dial until a
+signature over a dest-bound challenge verifies against `authorized_keys`, and
+RESUME is bound to that key fingerprint.
 
 This is tolerable when the payload is SSH: SSH already authenticates and
-encrypts end-to-end. The realistic blast radius is denial of service and
-metadata disclosure, not authentication bypass. M5 adds SSH public-key auth
-on the relay handshake.
+encrypts end-to-end. The realistic blast radius without relay auth is denial
+of service and metadata disclosure, not authentication bypass of `sshd`.
 
 ## License
 

@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/pem"
 	"errors"
 	"io"
@@ -138,6 +139,96 @@ func TestUnauthorizedKeyERRAuthFixedDelay(t *testing.T) {
 	time.Sleep(30 * time.Millisecond)
 	if n := accepts.Load(); n != 0 {
 		t.Fatalf("destination accepted %d connections", n)
+	}
+}
+
+func TestAuthOKDestMismatchDoesNotSendAUTH(t *testing.T) {
+	rec := &writeRecordConn{}
+	ok := proto.AuthOK{
+		SessionID:   "s-1",
+		ServerNonce: "n",
+		Challenge:   base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, sha256.Size)),
+		Destination: "10.0.0.1:99",
+	}
+	fr, err := proto.MarshalFrame(proto.TypeAuthOK, ok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = completeClientAuth(rec, auth.None{}, auth.Challenge{
+		Destination: "127.0.0.1:22",
+		Canonical:   []byte(`{"v":1}`),
+	}, fr)
+	if !errors.Is(err, proto.ErrAuth) {
+		t.Fatalf("got %v want ERR_AUTH", err)
+	}
+	if !strings.Contains(err.Error(), "challenge mismatch") {
+		t.Fatalf("err=%v", err)
+	}
+	for _, w := range rec.writes {
+		if w.Type == proto.TypeAuth {
+			t.Fatal("client produced AUTH after dest mismatch")
+		}
+	}
+
+	dir := t.TempDir()
+	priv, _ := writeEd25519Key(t, dir, "id")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	sawAuth := make(chan bool, 1)
+	go func() {
+		sent := false
+		defer func() { sawAuth <- sent }()
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		conn, err := transport.WrapTCP(c)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+		if _, err := conn.ReadFrame(); err != nil {
+			return
+		}
+		nonce, err := proto.RandomNonce()
+		if err != nil {
+			return
+		}
+		fr, err := proto.MarshalFrame(proto.TypeAuthOK, proto.AuthOK{
+			SessionID:   "s-x",
+			ServerNonce: nonce,
+			Challenge:   base64.StdEncoding.EncodeToString(make([]byte, sha256.Size)),
+			Destination: "10.255.255.1:1",
+		})
+		if err != nil {
+			return
+		}
+		if err := conn.WriteFrame(fr); err != nil {
+			return
+		}
+		f, err := conn.ReadFrame()
+		sent = err == nil && f.Type == proto.TypeAuth
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	ccfg := authClient(ln.Addr().String(), "127.0.0.1:22", priv)
+	_, _, err = clientHello(ctx, ccfg)
+	if !errors.Is(err, proto.ErrAuth) {
+		t.Fatalf("clientHello got %v want ERR_AUTH", err)
+	}
+	select {
+	case sent := <-sawAuth:
+		if sent {
+			t.Fatal("client sent AUTH on the wire")
+		}
+	case <-ctx.Done():
+		t.Fatal("timeout waiting for stub server")
 	}
 }
 
@@ -563,3 +654,18 @@ func rawResumeAuthFail(t *testing.T, ctx context.Context, addr, sessionID, token
 	}
 	return fail
 }
+
+type writeRecordConn struct {
+	writes []proto.Frame
+}
+
+func (c *writeRecordConn) ReadFrame() (proto.Frame, error) { return proto.Frame{}, io.EOF }
+func (c *writeRecordConn) WriteFrame(f proto.Frame) error {
+	c.writes = append(c.writes, f)
+	return nil
+}
+func (c *writeRecordConn) SetDeadline(time.Time) error { return nil }
+func (c *writeRecordConn) LocalAddr() net.Addr         { return nil }
+func (c *writeRecordConn) RemoteAddr() net.Addr        { return nil }
+func (c *writeRecordConn) Kind() transport.Kind        { return transport.KindTCP }
+func (c *writeRecordConn) Close() error                { return nil }

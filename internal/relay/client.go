@@ -305,7 +305,14 @@ func completeClientAuth(conn transport.Conn, a auth.Authenticator, ch auth.Chall
 	if err := proto.UnmarshalPayload(reply, &ok); err != nil {
 		return err
 	}
-	if ok.Destination != "" {
+	// AUTH_OK.destination is a check, not an input. Adopt it only when the
+	// client omitted dest (server default). A non-empty client dest must match
+	// so a MITM cannot make us sign a host we did not request.
+	if ch.Destination != "" {
+		if ok.Destination != ch.Destination {
+			return proto.NewError(proto.CodeAuth, "challenge mismatch")
+		}
+	} else {
 		ch.Destination = ok.Destination
 	}
 	ch.SessionID = ok.SessionID

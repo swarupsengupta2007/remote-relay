@@ -248,7 +248,7 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 		return
 	}
 
-	id, sess, token, serverNonce, ok := s.helloAuth(conn, hello, f.Payload)
+	id, sess, token, serverNonce, ok := s.helloAuth(conn, hello, f.Payload, dest)
 	if !ok {
 		return
 	}
@@ -795,17 +795,19 @@ func (s *Server) heldCount() int {
 
 func (s *Server) authFail(conn transport.Conn, started time.Time) {
 	if d := s.auth.FailDelay(); d > 0 {
-		if rem := d - time.Since(started); rem > 0 {
+		if started.IsZero() {
+			time.Sleep(d)
+		} else if rem := d - time.Since(started); rem > 0 {
 			time.Sleep(rem)
 		}
 	}
 	writeErr(conn, proto.CodeAuth, "auth failed")
 }
 
-func (s *Server) helloAuth(conn transport.Conn, hello proto.Hello, canonical []byte) (auth.Identity, *session.Session, string, string, bool) {
+func (s *Server) helloAuth(conn transport.Conn, hello proto.Hello, canonical []byte, dest string) (auth.Identity, *session.Session, string, string, bool) {
 	if !s.auth.RequiresChallenge() {
 		id, err := s.auth.Verify(auth.Challenge{
-			Destination: hello.Destination,
+			Destination: dest,
 			ClientNonce: hello.ClientNonce,
 		}, hello.Auth)
 		if err != nil {
@@ -820,10 +822,9 @@ func (s *Server) helloAuth(conn transport.Conn, hello proto.Hello, canonical []b
 		return id, sess, token, "", true
 	}
 
-	started := time.Now()
 	var offer auth.Offer
 	if err := json.Unmarshal(bytesOrEmpty(hello.Auth), &offer); err != nil || offer.Method != auth.MethodPublicKey {
-		s.authFail(conn, started)
+		s.authFail(conn, time.Time{})
 		return auth.Identity{}, nil, "", "", false
 	}
 	sess, token, err := session.New()
@@ -838,7 +839,7 @@ func (s *Server) helloAuth(conn transport.Conn, hello proto.Hello, canonical []b
 	}
 	ch := auth.Challenge{
 		SessionID:   sess.ID,
-		Destination: hello.Destination,
+		Destination: dest,
 		ClientNonce: hello.ClientNonce,
 		ServerNonce: serverNonce,
 		Canonical:   canonical,
@@ -849,9 +850,10 @@ func (s *Server) helloAuth(conn transport.Conn, hello proto.Hello, canonical []b
 	}
 	raw, ok := s.readAuth(conn)
 	if !ok {
-		s.authFail(conn, started)
+		s.authFail(conn, time.Time{})
 		return auth.Identity{}, nil, "", "", false
 	}
+	started := time.Now()
 	id, err := s.auth.Verify(ch, raw)
 	if err != nil {
 		s.authFail(conn, started)
@@ -864,15 +866,14 @@ func (s *Server) resumeAuth(conn transport.Conn, msg proto.Resume, canonical []b
 	if !s.auth.RequiresChallenge() {
 		return true
 	}
-	started := time.Now()
 	sess := s.store.Get(msg.SessionID)
 	if sess == nil || sess.Fingerprint == "" {
-		s.authFail(conn, started)
+		s.authFail(conn, time.Time{})
 		return false
 	}
 	serverNonce, err := proto.RandomNonce()
 	if err != nil {
-		s.authFail(conn, started)
+		s.authFail(conn, time.Time{})
 		return false
 	}
 	ch := auth.Challenge{
@@ -890,9 +891,10 @@ func (s *Server) resumeAuth(conn transport.Conn, msg proto.Resume, canonical []b
 	}
 	raw, ok := s.readAuth(conn)
 	if !ok {
-		s.authFail(conn, started)
+		s.authFail(conn, time.Time{})
 		return false
 	}
+	started := time.Now()
 	if _, err := s.auth.Verify(ch, raw); err != nil {
 		s.authFail(conn, started)
 		return false
