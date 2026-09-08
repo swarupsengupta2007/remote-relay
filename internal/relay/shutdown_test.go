@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"net"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/remote-relay/relay/internal/config"
 	"github.com/remote-relay/relay/internal/logging"
+	"github.com/remote-relay/relay/internal/proto"
 )
 
 func TestShutdownDrainsNoHang(t *testing.T) {
@@ -96,6 +98,159 @@ func (s *syncBuffer) Bytes() []byte {
 	out := make([]byte, s.b.Len())
 	copy(out, s.b.Bytes())
 	return out
+}
+
+func TestShutdownWritesBye(t *testing.T) {
+	dest := startHoldDest(t)
+	cfg := config.DefaultServer()
+	cfg.ListenTCP = "127.0.0.1:0"
+	cfg.DefaultDestination = dest
+	cfg.AllowDestinations = []string{dest, "*"}
+	cfg.Transports = []string{"tcp"}
+	cfg.HoldTimeout = config.Duration(30 * time.Second)
+	srv, addr, _ := startRelayCfg(t, cfg)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	conn, _, err := rawHello(ctx, addr, dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	waitUntil(t, 5*time.Second, func() bool { return srv.sessionCount() == 1 })
+
+	go func() {
+		shutCtx, c := context.WithTimeout(context.Background(), 3*time.Second)
+		defer c()
+		_ = srv.Shutdown(shutCtx)
+	}()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		_ = conn.SetDeadline(deadline)
+		f, err := conn.ReadFrame()
+		if err != nil {
+			t.Fatalf("read after Shutdown: %v", err)
+		}
+		switch f.Type {
+		case proto.TypeBye:
+			var bye proto.Bye
+			if err := proto.UnmarshalPayload(f, &bye); err != nil {
+				t.Fatal(err)
+			}
+			if bye.Code != proto.CodeShutdown {
+				t.Fatalf("BYE code %q want %s", bye.Code, proto.CodeShutdown)
+			}
+			return
+		case proto.TypePing, proto.TypePong, proto.TypeAck, proto.TypeData:
+			continue
+		default:
+			t.Fatalf("unexpected frame %s", f.Type)
+		}
+	}
+	t.Fatal("no BYE{ERR_SHUTDOWN} on the wire")
+}
+
+func TestClientReturnsOnServerShutdown(t *testing.T) {
+	dest := startHoldDest(t)
+	cfg := config.DefaultServer()
+	cfg.ListenTCP = "127.0.0.1:0"
+	cfg.DefaultDestination = dest
+	cfg.AllowDestinations = []string{dest, "*"}
+	cfg.Transports = []string{"tcp"}
+	cfg.HoldTimeout = config.Duration(30 * time.Second)
+	srv, addr, _ := startRelayCfg(t, cfg)
+
+	inR, inW := io.Pipe()
+	defer inW.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	ccfg := config.DefaultClient()
+	ccfg.Server = addr
+	ccfg.Destination = dest
+	ccfg.Transport = "tcp"
+	ccfg.ReconnectMaxElapsed = config.Duration(500 * time.Millisecond)
+	ccfg.ReconnectBackoff = []string{"10ms"}
+	errc := make(chan error, 1)
+	go func() {
+		errc <- RunClient(ctx, ccfg, inR, io.Discard, logging.New(io.Discard, "error", "text"))
+	}()
+	waitUntil(t, 5*time.Second, func() bool { return srv.sessionCount() == 1 })
+
+	shutCtx, scancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer scancel()
+	if err := srv.Shutdown(shutCtx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-errc:
+	case <-ctx.Done():
+		t.Fatal("RunClient hung after server Shutdown (stdin left open)")
+	}
+}
+
+func TestShutdownUnblocksFullCtrlQ(t *testing.T) {
+	destLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = destLn.Close() })
+	go func() {
+		c, err := destLn.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		chunk := bytes.Repeat([]byte("n"), 32*1024)
+		for {
+			if _, err := c.Write(chunk); err != nil {
+				return
+			}
+		}
+	}()
+
+	cfg := config.DefaultServer()
+	cfg.ListenTCP = "127.0.0.1:0"
+	cfg.DefaultDestination = destLn.Addr().String()
+	cfg.AllowDestinations = []string{destLn.Addr().String(), "*"}
+	cfg.Transports = []string{"tcp"}
+	cfg.BufferBytes = 64 * 1024
+	cfg.TotalBufferBytes = 256 * 1024
+	cfg.SendWindow = 256 * 1024
+	cfg.DataChunkBytes = 1024
+	cfg.KeepaliveInterval = config.Duration(time.Millisecond)
+	cfg.IdleTimeout = config.Duration(time.Minute)
+	cfg.HoldTimeout = config.Duration(30 * time.Second)
+	srv, addr, _ := startRelayCfg(t, cfg)
+
+	inR, inW := io.Pipe()
+	defer inW.Close()
+	outR, outW := io.Pipe()
+	t.Cleanup(func() { _ = outR.Close(); _ = outW.Close() })
+	cctx, ccancel := context.WithCancel(context.Background())
+	defer ccancel()
+	ccfg := config.DefaultClient()
+	ccfg.Server = addr
+	ccfg.Destination = destLn.Addr().String()
+	ccfg.Transport = "tcp"
+	go func() {
+		_ = RunClient(cctx, ccfg, inR, outW, logging.New(io.Discard, "error", "text"))
+	}()
+	waitUntil(t, 5*time.Second, func() bool { return srv.sessionCount() == 1 })
+	waitUntil(t, 3*time.Second, func() bool {
+		return maxLens(srv.sessionBufferLens()) > 0 || srv.budgetUsed() > 0
+	})
+	time.Sleep(150 * time.Millisecond)
+
+	start := time.Now()
+	shutCtx, scancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer scancel()
+	if err := srv.Shutdown(shutCtx); err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(start); d > 3*time.Second {
+		t.Fatalf("Shutdown hung with full ctrlQ/down path: %s", d)
+	}
 }
 
 func TestStructuredLogsOmitSecrets(t *testing.T) {

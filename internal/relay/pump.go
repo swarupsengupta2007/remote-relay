@@ -99,6 +99,7 @@ type pump struct {
 	onPeerFrame func()
 
 	connMu     sync.Mutex
+	writeMu    sync.Mutex
 	conn       transport.Conn
 	connCtx    context.Context
 	connCancel context.CancelFunc
@@ -428,6 +429,38 @@ func (p *pump) sendCtrl(f proto.Frame) error {
 	}
 }
 
+// tryWriteShutdownBye best-effort writes BYE without blocking on a stuck
+// netWriter or a full ctrlQ. Callers must still fail+dropConn.
+func (p *pump) tryWriteShutdownBye() {
+	fr, err := proto.MarshalFrame(proto.TypeBye, proto.Bye{
+		Code: proto.CodeShutdown,
+		Msg:  "shutting down",
+	})
+	if err != nil {
+		return
+	}
+	if p.writeMu.TryLock() {
+		p.connMu.Lock()
+		c := p.conn
+		up := p.linkUp.Load()
+		p.connMu.Unlock()
+		if c != nil && up {
+			_ = c.SetDeadline(time.Now().Add(50 * time.Millisecond))
+			if werr := c.WriteFrame(fr); werr == nil {
+				p.finished.Store(true)
+			}
+		}
+		p.writeMu.Unlock()
+		return
+	}
+	select {
+	case p.ctrlQ <- fr:
+		p.nudge()
+	default:
+		p.nudge()
+	}
+}
+
 func (p *pump) srcReader() error {
 	buf := make([]byte, p.cfg.chunk)
 	for {
@@ -466,6 +499,8 @@ func (p *pump) writeConn(f proto.Frame) error {
 	if c == nil {
 		return net.ErrClosed
 	}
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
 	if err := c.WriteFrame(f); err != nil {
 		return err
 	}

@@ -24,6 +24,8 @@ func startHeldClients(t *testing.T, n int, server, dest string) {
 		ccfg.Server = server
 		ccfg.Destination = dest
 		ccfg.Transport = "tcp"
+		ccfg.ReconnectMaxElapsed = config.Duration(15 * time.Second)
+		ccfg.ReconnectBackoff = []string{"20ms", "50ms", "100ms"}
 		errc := make(chan error, 1)
 		go func() {
 			err := RunClient(ctx, ccfg, inR, outW, logging.New(io.Discard, "error", "text"))
@@ -98,6 +100,75 @@ func TestMaxConnsPerIPRefusesNinth(t *testing.T) {
 	if srv.sessionCount() != 8 {
 		t.Fatalf("existing sessions died, count=%d", srv.sessionCount())
 	}
+}
+
+func dropOneLive(s *Server) bool {
+	s.livesMu.Lock()
+	defer s.livesMu.Unlock()
+	for _, l := range s.lives {
+		l.dropConn()
+		return true
+	}
+	return false
+}
+
+func TestMaxConnsPerIPResumeThenNinthHELLO(t *testing.T) {
+	dest := startHoldDest(t)
+	cfg := config.DefaultServer()
+	cfg.ListenTCP = "127.0.0.1:0"
+	cfg.DefaultDestination = dest
+	cfg.AllowDestinations = []string{dest, "*"}
+	cfg.Transports = []string{"tcp"}
+	cfg.MaxSessions = 1024
+	cfg.MaxConnsPerIP = 8
+	cfg.HoldTimeout = config.Duration(30 * time.Second)
+	srv, addr, _ := startRelayCfg(t, cfg)
+
+	startHeldClients(t, 8, addr, dest)
+	waitUntil(t, 8*time.Second, func() bool { return srv.sessionCount() == 8 })
+	if !dropOneLive(srv) {
+		t.Fatal("no live session to drop")
+	}
+	waitUntil(t, 8*time.Second, func() bool {
+		return srv.sessionCount() == 8 && srv.heldCount() == 0
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	ccfg := config.DefaultClient()
+	ccfg.Server = addr
+	ccfg.Destination = dest
+	ccfg.Transport = "tcp"
+	err := RunClient(ctx, ccfg, bytes.NewReader(nil), io.Discard, logging.New(io.Discard, "error", "text"))
+	if !errors.Is(err, proto.ErrNoCapacity) {
+		t.Fatalf("9th HELLO after resume: got %v want ERR_NO_CAPACITY", err)
+	}
+	if srv.sessionCount() != 8 {
+		t.Fatalf("existing sessions died, count=%d", srv.sessionCount())
+	}
+}
+
+func TestMaxConnsPerIPFourResumedStillAcceptFifth(t *testing.T) {
+	dest := startHoldDest(t)
+	cfg := config.DefaultServer()
+	cfg.ListenTCP = "127.0.0.1:0"
+	cfg.DefaultDestination = dest
+	cfg.AllowDestinations = []string{dest, "*"}
+	cfg.Transports = []string{"tcp"}
+	cfg.MaxSessions = 1024
+	cfg.MaxConnsPerIP = 8
+	cfg.HoldTimeout = config.Duration(30 * time.Second)
+	srv, addr, _ := startRelayCfg(t, cfg)
+
+	startHeldClients(t, 4, addr, dest)
+	waitUntil(t, 5*time.Second, func() bool { return srv.sessionCount() == 4 })
+	srv.dropLiveTransports()
+	waitUntil(t, 8*time.Second, func() bool {
+		return srv.sessionCount() == 4 && srv.heldCount() == 0
+	})
+
+	startHeldClients(t, 1, addr, dest)
+	waitUntil(t, 5*time.Second, func() bool { return srv.sessionCount() == 5 })
 }
 
 func TestClientIP(t *testing.T) {

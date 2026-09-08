@@ -69,14 +69,8 @@ func (s *Server) tryReserveIPSess(ip string) error {
 	if s.ipSess == nil {
 		s.ipSess = make(map[string]int)
 	}
-	if max := s.cfg.MaxConnsPerIP; max > 0 {
-		if s.ipSess[ip] >= max {
-			return proto.ErrNoCapacity
-		}
-		// Current TCP accept is already counted; a 9th live conn is over the cap.
-		if s.ipConns[ip] > max {
-			return proto.ErrNoCapacity
-		}
+	if max := s.cfg.MaxConnsPerIP; max > 0 && s.ipSess[ip] >= max {
+		return proto.ErrNoCapacity
 	}
 	s.ipSess[ip]++
 	return nil

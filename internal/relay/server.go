@@ -178,13 +178,9 @@ func (s *Server) handle(raw net.Conn) {
 	defer raw.Close()
 	ip := clientIP(raw.RemoteAddr())
 	n := s.incIPConn(ip)
-	defer s.decIPConn(ip)
-	if max := s.cfg.MaxConnsPerIP; max > 0 && n > 2*max {
-		// Headroom of 2× covers in-flight RESUME while the original handle
-		// goroutine is still alive; beyond that this is a handshake flood.
-		s.refused.Add(1)
-		return
-	}
+	var once sync.Once
+	releaseTCP := func() { once.Do(func() { s.decIPConn(ip) }) }
+	defer releaseTCP()
 
 	conn, err := transport.WrapTCP(raw)
 	if err != nil {
@@ -209,17 +205,24 @@ func (s *Server) handle(raw net.Conn) {
 		}
 		return
 	}
+	// Flood cap counts live TCP sockets (2× max_conns_per_ip). HELLO is
+	// refused with ERR_NO_CAPACITY; RESUME of an existing session proceeds.
+	if max := s.cfg.MaxConnsPerIP; max > 0 && n > 2*max && f.Type == proto.TypeHello {
+		s.refused.Add(1)
+		writeErr(conn, proto.CodeNoCapacity, "too many connections from this address")
+		return
+	}
 	switch f.Type {
 	case proto.TypeResume:
 		s.handleResume(ctx, conn, f)
 	case proto.TypeHello:
-		s.handleHello(ctx, conn, f, ip)
+		s.handleHello(ctx, conn, f, ip, releaseTCP)
 	default:
 		writeErr(conn, proto.CodeProto, "expected HELLO")
 	}
 }
 
-func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.Frame, ip string) {
+func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.Frame, ip string, releaseTCP func()) {
 	var hello proto.Hello
 	if err := proto.UnmarshalPayload(f, &hello); err != nil {
 		writeErr(conn, proto.CodeProto, "bad HELLO")
@@ -367,18 +370,19 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 	}, sendLog)
 
 	l := &live{
-		pump:        p,
-		id:          sess.ID,
-		srv:         s,
-		store:       s.store,
-		cfg:         s.cfg,
-		window:      window,
-		holdTimeout: s.cfg.HoldTimeout.Duration(),
-		dest:        dtcp,
-		log:         log,
-		clientIP:    ip,
-		attachCh:    make(chan attachReq, 4),
-		deadCh:      make(chan struct{}),
+		pump:            p,
+		id:              sess.ID,
+		srv:             s,
+		store:           s.store,
+		cfg:             s.cfg,
+		window:          window,
+		holdTimeout:     s.cfg.HoldTimeout.Duration(),
+		dest:            dtcp,
+		log:             log,
+		clientIP:        ip,
+		releaseHelloTCP: releaseTCP,
+		attachCh:        make(chan attachReq, 4),
+		deadCh:          make(chan struct{}),
 	}
 	l.onPeerFrame = func() { l.store.ConfirmToken(l.id) }
 	s.livesMu.Lock()
@@ -457,17 +461,18 @@ type attachReq struct {
 
 type live struct {
 	*pump
-	id          string
-	srv         *Server
-	store       *session.Store
-	cfg         config.Server
-	window      int
-	holdTimeout time.Duration
-	dest        *net.TCPConn
-	log         *slog.Logger
-	clientIP    string
-	attachCh    chan attachReq
-	deadCh      chan struct{}
+	id              string
+	srv             *Server
+	store           *session.Store
+	cfg             config.Server
+	window          int
+	holdTimeout     time.Duration
+	dest            *net.TCPConn
+	log             *slog.Logger
+	clientIP        string
+	releaseHelloTCP func()
+	attachCh        chan attachReq
+	deadCh          chan struct{}
 
 	mu       sync.Mutex
 	heldAt   time.Time
@@ -561,6 +566,10 @@ func (l *live) run(ctx context.Context, first transport.Conn) {
 	l.startIO()
 	l.notePath(first)
 	err := l.serveConn(l.sessCtx, first, 0)
+	if l.releaseHelloTCP != nil {
+		l.releaseHelloTCP()
+		l.releaseHelloTCP = nil
+	}
 	for reconnectable(err) && ctx.Err() == nil && l.sessionErr() == nil {
 		req, ok := l.holdWait(ctx)
 		if !ok {

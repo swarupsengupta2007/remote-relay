@@ -24,6 +24,12 @@ SSH stream. See **Security** below.
 Netem (delay/loss) comparison numbers for TCP vs QUIC vs KCP are **not
 recorded in this environment**.
 
+The default CI 64-session soak mixes TCP+QUIC on the shared UDP mux (~10s,
+random link kills). Mixed KCP at that kill rate expired instead of resuming
+(likely liveness/scale with KCP's delayed Close and idle timers, not a mux
+`conv` identity bug). A smaller 8+8 KCP/QUIC test uses the M3 idle/keepalive
+settings. A 60s mixed soak is not run in default CI.
+
 ## Build
 
 Go 1.23 or later.

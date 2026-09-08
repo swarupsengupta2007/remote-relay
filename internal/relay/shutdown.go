@@ -2,6 +2,7 @@ package relay
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/remote-relay/relay/internal/proto"
@@ -51,8 +52,23 @@ func (s *Server) beginShutdown() {
 		s.log.Info("shutting down", "sessions", s.sessionCount())
 	}
 	s.closeListener()
-	for _, l := range s.snapshotLives() {
-		l.requestShutdown()
+	lives := s.snapshotLives()
+	done := make(chan struct{})
+	go func() {
+		var wg sync.WaitGroup
+		for _, l := range lives {
+			wg.Add(1)
+			go func(l *live) {
+				defer wg.Done()
+				l.requestShutdown()
+			}(l)
+		}
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
 	}
 }
 
@@ -104,16 +120,10 @@ func (s *Server) Shutdown(ctx context.Context) error {
 func (l *live) requestShutdown() {
 	l.log.Info("session shutdown", "code", proto.CodeShutdown)
 	if l.linkUp.Load() {
-		fr, err := proto.MarshalFrame(proto.TypeBye, proto.Bye{
-			Code: proto.CodeShutdown,
-			Msg:  "shutting down",
-		})
-		if err == nil {
-			_ = l.sendCtrl(fr)
-		}
-		return
+		l.tryWriteShutdownBye()
 	}
 	l.fail(proto.ErrShutdown)
+	l.dropConn()
 }
 
 func (l *live) isHeld() bool {
