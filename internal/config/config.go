@@ -98,6 +98,8 @@ type Client struct {
 	AuthMethod          string   `toml:"auth_method"`
 	AuthUser            string   `toml:"auth_user"`
 	IdentityFiles       []string `toml:"identity_files"`
+	AllowHA             bool     `toml:"allow_ha"`
+	HAProbeInterval     Duration `toml:"ha_probe_interval"`
 }
 
 func DefaultServer() Server {
@@ -143,6 +145,8 @@ func DefaultClient() Client {
 		LogLevel:            "warn",
 		LogFormat:           "text",
 		AuthMethod:          "none",
+		AllowHA:             false,
+		HAProbeInterval:     Duration(10 * time.Second),
 	}
 }
 
@@ -159,6 +163,8 @@ type ClientOptions struct {
 	DestSet    bool
 	TCP        bool
 	KCP        bool
+	AllowHA    bool
+	AllowHASet bool
 	LogLevel   string
 	PosHost    string
 	PosPort    string
@@ -213,6 +219,12 @@ func LoadClient(opts ClientOptions) (Client, error) {
 		cfg.Transport = "tcp"
 	} else if opts.KCP {
 		cfg.Transport = "kcp"
+	}
+	if opts.AllowHASet {
+		cfg.AllowHA = opts.AllowHA
+	}
+	if cfg.HAProbeInterval <= 0 {
+		cfg.HAProbeInterval = Duration(10 * time.Second)
 	}
 	if opts.LogLevel != "" {
 		cfg.LogLevel = opts.LogLevel
@@ -314,6 +326,9 @@ func (c Client) Validate() error {
 	if err := validAuthMethod(c.AuthMethod); err != nil {
 		return err
 	}
+	if strings.ToLower(strings.TrimSpace(c.Transport)) == "tcp" && c.AllowHA {
+		return fmt.Errorf("--allow-ha cannot be used with tcp transport")
+	}
 	return nil
 }
 
@@ -345,6 +360,10 @@ func (c Client) TransportPreference() []string {
 	default:
 		return []string{"quic", "kcp"}
 	}
+}
+
+func (c Client) IsTCP() bool {
+	return strings.EqualFold(strings.TrimSpace(c.Transport), "tcp")
 }
 
 func (s Server) QUICEnabled() bool {

@@ -103,7 +103,7 @@ internal/logging/              # slog setup, per-session fields
 | Module | Use | Milestone |
 |---|---|---|
 | `github.com/quic-go/quic-go` | QUIC data plane | M2 |
-| `github.com/xtaci/kcp-go/v2` | KCP data plane (verify exact path/version at implementation time) | M3 |
+| `github.com/xtaci/kcp-go/v5` | KCP data plane (verify exact path/version at implementation time) | M3 |
 | `github.com/BurntSushi/toml` | config files | M0 |
 | `golang.org/x/crypto/ssh` | parse `authorized_keys` / sign with `~/.ssh/id_*` | M5 |
 

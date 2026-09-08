@@ -115,6 +115,7 @@ func TestRunClientArgs(t *testing.T) {
 		{"client invalid single positional dest", []string{"client", "--server", "127.0.0.1:7443", "nohostport"}, 2, "invalid destination"},
 		{"client too many positional args", []string{"client", "--server", "127.0.0.1:7443", "host", "22", "extra"}, 2, "extra arguments"},
 		{"client missing server", []string{"client", "--config", emptyServerConf}, 1, "server is required"},
+		{"client tcp and allow-ha mutual exclusion", []string{"client", "--tcp", "--allow-ha", "--server", "127.0.0.1:7443"}, 2, "--allow-ha cannot be used with --tcp"},
 	}
 
 	for _, tt := range tests {
@@ -206,5 +207,29 @@ log_level = "info"
 	}
 	if cfg.Destination != "[2001:db8::1]:22" {
 		t.Fatalf("expected destination [2001:db8::1]:22, got %q", cfg.Destination)
+	}
+
+	// 6. AllowHA flag override
+	cfg, err = config.LoadClient(config.ClientOptions{
+		ConfigPath: confPath,
+		AllowHA:    true,
+		AllowHASet: true,
+	})
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if !cfg.AllowHA {
+		t.Fatal("expected AllowHA to be true")
+	}
+
+	// 7. AllowHA with TCP fails validation
+	_, err = config.LoadClient(config.ClientOptions{
+		ConfigPath: confPath,
+		TCP:        true,
+		AllowHA:    true,
+		AllowHASet: true,
+	})
+	if err == nil {
+		t.Fatal("expected error with TCP and AllowHA both true")
 	}
 }

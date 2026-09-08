@@ -46,7 +46,7 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `usage: relay <server|client|version> [flags]
 
   relay server [--config PATH] [--listen HOST:PORT] [--log-level LVL]
-  relay client --server HOST:PORT [--dest HOST:PORT] [--tcp|--kcp] [--config PATH] [--log-level LVL] [%%h %%p]
+  relay client --server HOST:PORT [--dest HOST:PORT] [--tcp|--kcp] [--allow-ha] [--config PATH] [--log-level LVL] [%%h %%p]
   relay version
 `)
 }
@@ -91,6 +91,7 @@ func runClient(args []string) int {
 	dest := fs.String("dest", "", "destination host:port")
 	tcp := fs.Bool("tcp", false, "use TCP data plane")
 	kcp := fs.Bool("kcp", false, "use KCP data plane")
+	allowHA := fs.Bool("allow-ha", false, "allow HA dual-path failover (UDP > TCP)")
 	logLevel := fs.String("log-level", "", "log level")
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
@@ -100,11 +101,20 @@ func runClient(args []string) int {
 	}
 
 	destSet := false
+	allowHASet := false
 	fs.Visit(func(f *flag.Flag) {
 		if f.Name == "dest" {
 			destSet = true
 		}
+		if f.Name == "allow-ha" {
+			allowHASet = true
+		}
 	})
+
+	if *tcp && *allowHA {
+		fmt.Fprintf(os.Stderr, "relay client: --allow-ha cannot be used with --tcp\n")
+		return 2
+	}
 
 	var posHost, posPort string
 	rest := fs.Args()
@@ -131,6 +141,8 @@ func runClient(args []string) int {
 		DestSet:    destSet,
 		TCP:        *tcp,
 		KCP:        *kcp,
+		AllowHA:    *allowHA,
+		AllowHASet: allowHASet,
 		LogLevel:   *logLevel,
 		PosHost:    posHost,
 		PosPort:    posPort,

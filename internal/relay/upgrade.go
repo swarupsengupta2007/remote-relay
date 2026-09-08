@@ -3,6 +3,7 @@ package relay
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -17,6 +18,14 @@ import (
 
 var testFailQUICDial atomic.Bool
 var testGateUpgrade atomic.Pointer[chan struct{}]
+var testDropUDPProbe atomic.Bool
+
+func probeUDP(ctx context.Context, mux *transport.UDPMux, addr net.Addr, tok [16]byte, attempts int, timeout time.Duration) error {
+	if testDropUDPProbe.Load() {
+		return errors.New("udp probe timeout")
+	}
+	return transport.Probe(ctx, mux, addr, tok, attempts, timeout)
+}
 
 type upgradeResult struct {
 	conn transport.Conn
@@ -54,6 +63,7 @@ func takeUpgrade(ch <-chan upgradeResult, cancel context.CancelFunc, p *pump) up
 		return upgradeResult{}
 	}
 	if p.upgrading.Load() {
+		defer p.upgrading.Store(false)
 		return <-ch
 	}
 	select {
@@ -69,95 +79,184 @@ func tryUpgrade(ctx context.Context, p *pump, cfg config.Client, tcpConn transpo
 	tok, ok := transport.ParseProbeToken(udp.ProbeToken)
 	if !ok {
 		res.err = proto.NewError(proto.CodeProto, "bad probe token")
+		if !cfg.AllowHA {
+			p.fail(res.err)
+			_ = tcpConn.Close()
+		}
 		return res
 	}
 	addr, err := net.ResolveUDPAddr("udp", udp.Addr)
 	if err != nil {
 		res.err = err
+		if !cfg.AllowHA {
+			p.fail(err)
+			_ = tcpConn.Close()
+		}
 		return res
 	}
 	mux, err := transport.ListenUDPMux(transport.UDPBindAll(addr))
 	if err != nil {
 		res.err = err
+		if !cfg.AllowHA {
+			p.fail(err)
+			_ = tcpConn.Close()
+		}
 		return res
 	}
 	cleanup := true
 	defer func() {
-		if cleanup {
+		if cleanup && mux != nil {
 			_ = mux.Close()
 		}
 	}()
 
 	attempts := udp.ProbeAttempts
 	timeout := time.Duration(udp.ProbeTimeoutMs) * time.Millisecond
-	if timeout <= 0 {
+	if cfg.ProbeTimeout.Duration() > 0 && (timeout <= 0 || cfg.ProbeTimeout.Duration() < timeout) {
 		timeout = cfg.ProbeTimeout.Duration()
 	}
 	if timeout <= 0 {
 		timeout = 2 * time.Second
 	}
-	if err := transport.Probe(ctx, mux, addr, tok, attempts, timeout); err != nil {
-		if log != nil {
-			log.Info("udp probe failed; staying on tcp")
+	firstErr := probeUDP(ctx, mux, addr, tok, attempts, timeout)
+	if firstErr != nil {
+		if !cfg.AllowHA {
+			if log != nil {
+				log.Error("udp probe failed and --allow-ha not specified", "err", firstErr)
+			}
+			failErr := fmt.Errorf("udp route unavailable and --allow-ha not specified: %w", firstErr)
+			p.fail(failErr)
+			_ = tcpConn.Close()
+			res.err = failErr
+			return res
 		}
-		res.err = err
-		return res
-	}
-
-	st := p.cfg.switchTimeout
-	up, down, err := p.waitQuiesced(ctx, st)
-	if err != nil {
 		if log != nil {
-			log.Info("path switch aborted; staying on tcp")
+			log.Info("udp probe failed; operating on tcp in HA mode", "err", firstErr)
 		}
-		res.err = err
-		return res
 	}
 
-	p.upgrading.Store(true)
-	defer p.upgrading.Store(false)
+	interval := cfg.HAProbeInterval.Duration()
+	if interval <= 0 {
+		interval = 10 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 
-	if testFailQUICDial.Load() && target != "kcp" {
-		p.abortQuiesce()
-		res.err = errors.New("test: quic dial fail")
-		return res
-	}
+	for {
+		if firstErr != nil {
+			select {
+			case <-ctx.Done():
+				res.err = ctx.Err()
+				return res
+			case <-p.sessCtx.Done():
+				res.err = p.sessCtx.Err()
+				return res
+			case <-ticker.C:
+				if err := probeUDP(ctx, mux, addr, tok, attempts, timeout); err != nil {
+					if log != nil {
+						log.Debug("ha udp probe attempt failed", "err", err)
+					}
+					continue
+				}
+				if log != nil {
+					log.Info("udp route became available; initiating HA upgrade")
+				}
+			}
+		}
+		firstErr = nil
 
-	var uconn transport.Conn
-	if target == "kcp" {
-		uconn, err = transport.DialKCP(ctx, mux.KCP(), addr)
-	} else {
-		qconf := transport.NewQUICConfig(p.cfg.idle, p.cfg.keepalive, p.cfg.window)
-		uconn, err = transport.DialQUIC(ctx, mux.QUIC(), addr, qconf)
-	}
-	if err != nil {
-		p.abortQuiesce()
-		res.err = err
+		st := p.cfg.switchTimeout
+		up, down, err := p.waitQuiesced(ctx, st)
+		if err != nil {
+			if log != nil {
+				log.Info("path switch aborted; staying on tcp", "err", err)
+			}
+			if !cfg.AllowHA {
+				res.err = err
+				return res
+			}
+			firstErr = err
+			continue
+		}
+
+		p.upgrading.Store(true)
+
+		if testFailQUICDial.Load() && target != "kcp" {
+			p.upgrading.Store(false)
+			p.abortQuiesce()
+			res.err = errors.New("test: quic dial fail")
+			if !cfg.AllowHA {
+				return res
+			}
+			firstErr = res.err
+			continue
+		}
+
+		var uconn transport.Conn
+		if target == "kcp" {
+			uconn, err = transport.DialKCP(ctx, mux.KCP(), addr)
+		} else {
+			qconf := transport.NewQUICConfig(p.cfg.idle, p.cfg.keepalive, p.cfg.window)
+			uconn, err = transport.DialQUIC(ctx, mux.QUIC(), addr, qconf)
+		}
+		if err != nil {
+			p.upgrading.Store(false)
+			p.abortQuiesce()
+			if log != nil {
+				log.Info("udp dial failed; staying on tcp", "err", err)
+			}
+			if !cfg.AllowHA {
+				res.err = err
+				return res
+			}
+			_ = mux.Close()
+			mux, err = transport.ListenUDPMux(transport.UDPBindAll(addr))
+			if err != nil {
+				res.err = err
+				return res
+			}
+			firstErr = err
+			continue
+		}
+		if err := p.sendSwitch(ctx, proto.Switch{
+			Dir:    proto.DirBoth,
+			From:   "tcp",
+			Offset: proto.SwitchOffset{Up: up, Down: down},
+		}); err != nil {
+			p.upgrading.Store(false)
+			_ = uconn.Close()
+			p.abortQuiesce()
+			res.err = err
+			return res
+		}
+		rok, err := writeResumeOn(ctx, uconn, cfg, sessionID, token, p.delivered.Load())
+		if err != nil {
+			p.upgrading.Store(false)
+			_ = uconn.Close()
+			p.abortQuiesce()
+			if log != nil {
+				log.Info("udp resume failed; staying on tcp", "err", err)
+			}
+			if !cfg.AllowHA {
+				res.err = err
+				return res
+			}
+			_ = mux.Close()
+			mux, err = transport.ListenUDPMux(transport.UDPBindAll(addr))
+			if err != nil {
+				res.err = err
+				return res
+			}
+			firstErr = err
+			continue
+		}
+		cleanup = false
+		_ = tcpConn.Close()
+		res.conn = uconn
+		res.rok = rok
+		res.hold = mux
 		return res
 	}
-	if err := p.sendSwitch(ctx, proto.Switch{
-		Dir:    proto.DirBoth,
-		From:   "tcp",
-		Offset: proto.SwitchOffset{Up: up, Down: down},
-	}); err != nil {
-		_ = uconn.Close()
-		p.abortQuiesce()
-		res.err = err
-		return res
-	}
-	rok, err := writeResumeOn(ctx, uconn, cfg, sessionID, token, p.delivered.Load())
-	if err != nil {
-		_ = uconn.Close()
-		p.abortQuiesce()
-		res.err = err
-		return res
-	}
-	cleanup = false
-	_ = tcpConn.Close()
-	res.conn = uconn
-	res.rok = rok
-	res.hold = mux
-	return res
 }
 
 func writeResumeOn(ctx context.Context, conn transport.Conn, cfg config.Client, sessionID, token string, downAcked uint64) (proto.ResumeOK, error) {

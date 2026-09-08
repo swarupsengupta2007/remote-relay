@@ -12,6 +12,7 @@ import (
 	"io"
 	"log/slog"
 	"math/big"
+	"net"
 	"sync"
 	"time"
 
@@ -58,6 +59,14 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 		attempt++
 	}
 	log = logging.WithSession(log, helloOK.SessionID)
+	if !cfg.AllowHA && !cfg.IsTCP() && (helloOK.Transport == "tcp" || helloOK.UDP == nil) {
+		_ = conn.Close()
+		return fmt.Errorf("udp route unavailable and --allow-ha not specified: server does not provide udp transport")
+	}
+	if err := checkStrictUDPProbe(ctx, cfg, conn, helloOK.UDP); err != nil {
+		_ = conn.Close()
+		return err
+	}
 	log.Info("session established", "transport", helloOK.Transport)
 
 	chunk := clampChunk(helloOK.Limits.DataChunkBytes)
@@ -201,6 +210,14 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 			if udpHold != nil {
 				_ = udpHold.Close()
 				udpHold = nil
+			}
+			if !cfg.AllowHA && !cfg.IsTCP() && (target == "tcp" || udp == nil) {
+				_ = nconn.Close()
+				return fmt.Errorf("udp route unavailable and --allow-ha not specified: server does not provide udp transport")
+			}
+			if err := checkStrictUDPProbe(ctx, cfg, nconn, udp); err != nil {
+				_ = nconn.Close()
+				return err
 			}
 			current = nconn
 			sendFrom = rok.UpAcked
@@ -427,4 +444,35 @@ func deadlineOr(ctx context.Context, d time.Duration) time.Time {
 		return abs
 	}
 	return t
+}
+
+func checkStrictUDPProbe(ctx context.Context, cfg config.Client, conn transport.Conn, udp *proto.UdpInfo) error {
+	if cfg.AllowHA || cfg.IsTCP() || testGateUpgrade.Load() != nil || conn == nil || conn.Kind() != transport.KindTCP || udp == nil {
+		return nil
+	}
+	attempts := udp.ProbeAttempts
+	timeout := time.Duration(udp.ProbeTimeoutMs) * time.Millisecond
+	if cfg.ProbeTimeout.Duration() > 0 && (timeout <= 0 || cfg.ProbeTimeout.Duration() < timeout) {
+		timeout = cfg.ProbeTimeout.Duration()
+	}
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+	tok, ok := transport.ParseProbeToken(udp.ProbeToken)
+	if !ok {
+		return proto.NewError(proto.CodeProto, "bad probe token")
+	}
+	addr, err := net.ResolveUDPAddr("udp", udp.Addr)
+	if err != nil {
+		return err
+	}
+	mux, err := transport.ListenUDPMux(transport.UDPBindAll(addr))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = mux.Close() }()
+	if err := probeUDP(ctx, mux, addr, tok, attempts, timeout); err != nil {
+		return fmt.Errorf("udp route unavailable and --allow-ha not specified: %w", err)
+	}
+	return nil
 }

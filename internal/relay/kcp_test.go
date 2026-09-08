@@ -140,6 +140,7 @@ func TestKCPProbeFailureStaysTCP(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	ccfg := defaultKCPClient(relayAddr, dest)
+	ccfg.AllowHA = true
 	ccfg.ProbeTimeout = config.Duration(150 * time.Millisecond)
 	errc := make(chan error, 1)
 	go func() {
