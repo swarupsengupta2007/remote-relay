@@ -4,7 +4,7 @@ Hand-off log. Each agent writes **only its own work** under its heading.
 Do not rewrite another agent's section. Do not replace this file with a
 snapshot of the tree; later agents append below.
 
-Last updated: 2026-09-09 (Grok).
+Last updated: 2026-09-09 (Antigravity).
 
 ---
 
@@ -93,6 +93,42 @@ These were **not** done here:
 - Field `tc netem` numbers were not recorded (no netem in that environment).
 - Mixed-KCP 64-session soak at the CI kill rate.
 - No GitHub origin / PRs at assembly time (plain-git local stack only).
+
+---
+
+## Antigravity
+
+Date: 2026-09-08 – 2026-09-09.
+Requests:
+1. Verify `--tcp` route, break matrix, resource leaks, backpressure, and netem benchmarks inside isolated network namespaces without touching hot host networking.
+2. Design and implement High Availability dual-path failover (`--allow-ha`), eliminate silent fallback to TCP, and support seamless dynamic path switching (UDP > TCP).
+
+### 1. TCP Route & Resilience Verification (`todo.md`)
+- **Isolation Setup**: Built dual netns test harness (`ns-srv` <-> `ns-cli` via `veth`) with 20 Mbit/s TBF rate limiting. Hot host networking remained 100% clean (`lo` qdisc stayed `noqueue`, zero lingering netns, zero host firewall rules).
+- **TCP Break Matrix (T0–T11)**: Executed 13 trials with real OpenSSH `ProxyCommand` and 32 MiB binary payloads. All 13 trials passed with byte-exact SHA-256 verification (silent blackhole under/over idle timeout, RST injection, multiple repeated RSTs, upload-direction breaks, handshake breaks, idle breaks, hold timeout boundaries, process restart, and budget exhaustion).
+- **Backpressure & Leak Checks**: Standard output reader paused for 5s mid-stream confirmed bounded ring buffer without data loss. 50 sequential broken/resumed sessions had 0 leaked FDs and 0 leaked expvars (`sessions=0`, `held=0`, `buffer_used=0`).
+- **Netem Benchmarks**: Evaluated 16 MiB payloads across the veth link:
+  - *80ms RTT, 3% loss*: KCP sustained 2.00 MB/s (33x–50x faster than TCP 0.06 MB/s and QUIC 0.04 MB/s).
+  - *80ms RTT, 25% reordering, 1% duplication*: All transports completed byte-exact (validating I3 deduplication and frame sequencing).
+- **Quality & CI**: Fixed `reconnectable(err)` wrapped timeout handling in `pump.go`, added client backoff retry and structured resume logging in `client.go`, expanded unit tests across `cmd/relay`, `proto`, `transport`, and added GitHub Actions CI (`.github/workflows/ci.yml`).
+
+### 2. High Availability Dual-Path System (`--allow-ha`) (`relay_ha.md`)
+- **Strict UDP Enforcement by Default**: Eliminated silent TCP fallback when UDP (QUIC or KCP) is requested without `--allow-ha`. Added `checkStrictUDPProbe` pre-flight check before streaming user data; if UDP probe fails or the server lacks UDP, the client terminates immediately with `udp route unavailable and --allow-ha not specified` without leaking user bytes over TCP.
+- **Configuration & CLI Flag**:
+  - Added `--allow-ha` flag to `relay client`.
+  - Added `allow_ha` and `ha_probe_interval` (default 10s) TOML configuration.
+  - Enforced mutual exclusion: `--tcp` and `--allow-ha` together return CLI exit code 2.
+- **Dynamic HA Path Switching (`UDP > TCP`)**:
+  - When `--allow-ha` is enabled and UDP fails initially or mid-session, client seamlessly falls back to TCP via `RESUME` without dropping bytes.
+  - While operating on TCP, a background supervisor continuously probes UDP at `ha_probe_interval`.
+  - Once UDP connectivity is restored, client quiesces TCP, sends `SWITCH` frame, dials UDP, resumes on UDP, and swaps connections with zero dropped or duplicate bytes.
+- **Testing & Verification**:
+  - Added unit test suite in `internal/relay/ha_test.go` (`TestHAStrictUDPProbeFails`, `TestHAStrictServerNoUDP`, `TestHAUpgradeSeamless`, `TestHADowngradeToTCP`, `TestHAFlappingOscillate`) passing with `-race`.
+  - Dual-netns integration suite (`test_ha.py`) verified live in isolated namespaces with real OpenSSH and 32 MiB binary payloads: HA-Strict (aborted rc=255), HA-Upgrade (seamless upgrade from TCP to QUIC), HA-Downgrade (seamless downgrade from QUIC to TCP), and HA-Oscillate (4 flapping cycles between QUIC and TCP, all completing byte-exact).
+- **Commits**:
+  - `e827780`: `test: add unit tests, CI workflow, and network resilience fixes`
+  - `f19b691`: `feat: implement high availability dual-path failover (--allow-ha) and strict UDP mode`
+  - Pushed to `origin/main`.
 
 ---
 
