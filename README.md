@@ -23,8 +23,12 @@ See **Authentication** and **Security** below.
 | M4 session limits, graceful shutdown, observability | yes |
 | M5 SSH public-key auth | yes |
 
-Netem (delay/loss) comparison numbers for TCP vs QUIC vs KCP are **not
-recorded in this environment**.
+### Netem Benchmarks (16 MiB payload, 80ms RTT, dual-netns veth)
+
+| Scenario | TCP (`--tcp`) | QUIC (default) | KCP (`--kcp`) |
+|---|---|---|---|
+| **High Latency & Loss** (80ms RTT, 3% loss) | 257.0s (0.06 MB/s) | 356.3s (0.04 MB/s) | **7.98s (2.00 MB/s)** *(33x–50x faster)* |
+| **Reorder & Duplicate** (80ms RTT, 25% reorder, 1% dup) | 319.2s (0.05 MB/s) | 471.2s (0.03 MB/s) | **5.47s (2.93 MB/s)** *(byte-exact)* |
 
 The default CI 64-session soak mixes TCP+QUIC on the shared UDP mux (~10s,
 random link kills). Mixed KCP at that kill rate expired instead of resuming
@@ -101,7 +105,7 @@ Logs go to **stderr**. stdout is the relayed byte stream and must stay clean
 (it is the SSH transport).
 
 ```
-./relay client --server HOST:PORT [--dest HOST:PORT] [--tcp|--kcp] [--config PATH] [--log-level warn] [%h %p]
+./relay client --server HOST:PORT [--dest HOST:PORT] [--tcp|--kcp] [--allow-ha] [--config PATH] [--log-level warn] [%h %p]
 ```
 
 Default client config path: `$HOME/.config/relay/client.toml` (optional).
@@ -110,6 +114,12 @@ Transport selection: `--tcp` > `--kcp` > config `transport` > default `quic`.
 `--kcp` selects the KCP data plane (cleartext; the SSH payload is still
 encrypted). `--tcp` disables UDP upgrade and stays on TCP for the whole
 session.
+
+`--allow-ha` enables dual-path High Availability (`UDP > TCP`). If UDP is
+unavailable or blocked, the client seamlessly falls back to TCP, continuously
+re-probes UDP in the background, and upgrades dynamically mid-stream. Without
+`--allow-ha`, requesting UDP strictly mandates UDP reachability and terminates
+immediately if blocked.
 
 ### Example `client.toml`
 
@@ -272,6 +282,6 @@ encrypts end-to-end. The realistic blast radius without relay auth is denial
 of service and metadata disclosure, not authentication bypass of `sshd`.
 
 ## License
-
-See the repository. Not a network-performance paper; field `tc netem`
-numbers were not collected here.
+ 
+See the repository. Emulated WAN network benchmarks (`tc netem`) are
+recorded under **Status** above.

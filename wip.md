@@ -103,14 +103,35 @@ Requests:
 1. Verify `--tcp` route, break matrix, resource leaks, backpressure, and netem benchmarks inside isolated network namespaces without touching hot host networking.
 2. Design and implement High Availability dual-path failover (`--allow-ha`), eliminate silent fallback to TCP, and support seamless dynamic path switching (UDP > TCP).
 
-### 1. TCP Route & Resilience Verification (`todo.md`)
+### 1. TCP Route & Resilience Verification (Full Verification Matrix & Benchmark Results)
 - **Isolation Setup**: Built dual netns test harness (`ns-srv` <-> `ns-cli` via `veth`) with 20 Mbit/s TBF rate limiting. Hot host networking remained 100% clean (`lo` qdisc stayed `noqueue`, zero lingering netns, zero host firewall rules).
-- **TCP Break Matrix (T0–T11)**: Executed 13 trials with real OpenSSH `ProxyCommand` and 32 MiB binary payloads. All 13 trials passed with byte-exact SHA-256 verification (silent blackhole under/over idle timeout, RST injection, multiple repeated RSTs, upload-direction breaks, handshake breaks, idle breaks, hold timeout boundaries, process restart, and budget exhaustion).
-- **Backpressure & Leak Checks**: Standard output reader paused for 5s mid-stream confirmed bounded ring buffer without data loss. 50 sequential broken/resumed sessions had 0 leaked FDs and 0 leaked expvars (`sessions=0`, `held=0`, `buffer_used=0`).
-- **Netem Benchmarks**: Evaluated 16 MiB payloads across the veth link:
-  - *80ms RTT, 3% loss*: KCP sustained 2.00 MB/s (33x–50x faster than TCP 0.06 MB/s and QUIC 0.04 MB/s).
-  - *80ms RTT, 25% reordering, 1% duplication*: All transports completed byte-exact (validating I3 deduplication and frame sequencing).
-- **Quality & CI**: Fixed `reconnectable(err)` wrapped timeout handling in `pump.go`, added client backoff retry and structured resume logging in `client.go`, expanded unit tests across `cmd/relay`, `proto`, `transport`, and added GitHub Actions CI (`.github/workflows/ci.yml`).
+- **Verification Results Summary**:
+  - *Code Quality & CI*: Clean `gofmt`, `go vet`, `staticcheck` (0 findings).
+  - *Race & Unit Tests*: `go test -race -count=1 ./...` clean across all packages.
+  - *Code Coverage*: `cmd/relay` 74.3%, `auth` 75.0%, `config` 77.9%, `logging` 82.4%, `proto` 94.2%, `relay` 77.1%, `session` 77.1%, `transport` 76.5%.
+  - *Cross-Builds*: `linux/amd64`, `linux/arm64`, `darwin/arm64` compile cleanly.
+- **TCP Break Matrix (T0–T11)**: 13/13 trials passed with real OpenSSH `ProxyCommand`, 32 MiB binary payloads, and SHA-256 byte-exact verification:
+  - `T0`: No UDP opened in `--tcp` mode (pass, only TCP listener bound).
+  - `T1`: Silent blackhole 5s < `idle_timeout` 30s (pass, 0 resumes).
+  - `T2`: Silent blackhole 40s > `idle_timeout` 30s (pass, 1 resume, heldMs=10046).
+  - `T3`: RST kill 1s (pass, 1 resume).
+  - `T4`: 3 repeated RST kills in one session (pass, 3 resumes).
+  - `T5`: RST kill during UPLOAD direction (pass, 1 resume).
+  - `T6`: Negative control `hold_timeout=10s` + 15s outage (pass, rc=255, ERR_UNKNOWN_SESSION).
+  - `T7`: Break during initial handshake (pass, established cleanly).
+  - `T8`: Break while session is idle, then transfer (pass, 2 resumes).
+  - `T9a`: Hold boundary under: 5s outage < 10s hold (pass, byte-exact).
+  - `T9b`: Hold boundary over: 15s outage > 10s hold (pass, rc=255, clean failure).
+  - `T10`: Server process restart mid-session (pass, rc=255, clean ERR_UNKNOWN_SESSION).
+  - `T11`: Outage longer than client `reconnect_max_elapsed` (pass, rc=255, reconnect budget exhausted).
+- **Backpressure & Leak Checks**:
+  - Paused stdout reader for 5s mid-stream during 32 MiB download: ring buffer bounded, flow control paused upstream, byte-exact match.
+  - FD leak check: counted before/after 50 sequential broken/resumed sessions: baseline 7 FDs, final 7 FDs (delta: 0 leaks).
+  - Expvar leak check: scraped `/debug/vars`: `sessions=0`, `held=0`, `buffer_used=0`.
+- **Realistic Network Path Benchmarks (16 MiB payloads)**:
+  - *Scenario A (80ms RTT, 3% loss)*: TCP 257.03s (0.06 MB/s), QUIC 356.31s (0.04 MB/s), KCP 7.98s (2.00 MB/s, 33x–50x faster).
+  - *Scenario B (80ms RTT, 25% reorder, 1% dup)*: TCP 319.20s (0.05 MB/s), QUIC 471.21s (0.03 MB/s), KCP 5.47s (2.93 MB/s, byte-exact deduplication).
+- **Quality & CI Fixes**: Fixed `reconnectable(err)` wrapped timeout handling in `pump.go`, added client backoff retry and structured resume logging in `client.go`, expanded unit tests across `cmd/relay`, `proto`, `transport`, and added GitHub Actions CI (`.github/workflows/ci.yml`).
 
 ### 2. High Availability Dual-Path System (`--allow-ha`) (`relay_ha.md`)
 - **Strict UDP Enforcement by Default**: Eliminated silent TCP fallback when UDP (QUIC or KCP) is requested without `--allow-ha`. Added `checkStrictUDPProbe` pre-flight check before streaming user data; if UDP probe fails or the server lacks UDP, the client terminates immediately with `udp route unavailable and --allow-ha not specified` without leaking user bytes over TCP.
@@ -128,6 +149,7 @@ Requests:
 - **Commits**:
   - `e827780`: `test: add unit tests, CI workflow, and network resilience fixes`
   - `f19b691`: `feat: implement high availability dual-path failover (--allow-ha) and strict UDP mode`
+  - `f229ba2`: `docs: add features and roadmap specification (features.md)`
   - Pushed to `origin/main`.
 
 ---
