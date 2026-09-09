@@ -3,6 +3,7 @@ package relay
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/remote-relay/relay/internal/config"
+	"github.com/remote-relay/relay/internal/crypto/kex"
 	"github.com/remote-relay/relay/internal/logging"
 	"github.com/remote-relay/relay/internal/proto"
 	"github.com/remote-relay/relay/internal/transport"
@@ -975,46 +977,12 @@ func startHoldDest(t *testing.T) string {
 }
 
 func rawHello(ctx context.Context, addr, dest string) (transport.Conn, proto.HelloOK, error) {
-	var none proto.HelloOK
-	conn, err := transport.DialTCP(ctx, addr)
-	if err != nil {
-		return nil, none, err
-	}
-	nonce, err := proto.RandomNonce()
-	if err != nil {
-		_ = conn.Close()
-		return nil, none, err
-	}
-	hello := proto.Hello{
-		V: 1, Transport: []string{"tcp"}, Destination: dest,
-		ClientNonce: nonce, Auth: proto.EmptyAuth(), Window: 65536,
-	}
-	fr, err := proto.MarshalFrame(proto.TypeHello, hello)
-	if err != nil {
-		_ = conn.Close()
-		return nil, none, err
-	}
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	if err := conn.WriteFrame(fr); err != nil {
-		_ = conn.Close()
-		return nil, none, err
-	}
-	reply, err := conn.ReadFrame()
-	_ = conn.SetDeadline(time.Time{})
-	if err != nil {
-		_ = conn.Close()
-		return nil, none, err
-	}
-	if reply.Type != proto.TypeHelloOK {
-		_ = conn.Close()
-		return nil, none, proto.NewError(proto.CodeProto, reply.Type.String())
-	}
-	var ok proto.HelloOK
-	if err := proto.UnmarshalPayload(reply, &ok); err != nil {
-		_ = conn.Close()
-		return nil, none, err
-	}
-	return conn, ok, nil
+	cfg := config.DefaultClient()
+	cfg.Server = addr
+	cfg.Destination = dest
+	cfg.Transport = "tcp"
+	cfg.StrictHostKeyChecking = "no"
+	return clientHello(ctx, cfg)
 }
 
 func rawResumeWrite(ctx context.Context, addr, sessionID, token string, downAcked uint64) (transport.Conn, error) {
@@ -1022,9 +990,42 @@ func rawResumeWrite(ctx context.Context, addr, sessionID, token string, downAcke
 	if err != nil {
 		return nil, err
 	}
-	nonce, err := proto.RandomNonce()
+	cfg := config.DefaultClient()
+	cfg.Server = addr
+	cfg.Transport = "tcp"
+	cfg.StrictHostKeyChecking = "no"
+
+	kexCli, err := kex.NewClientSession()
 	if err != nil {
 		_ = conn.Close()
+		return nil, err
+	}
+	if err := conn.WriteFrame(proto.Frame{Type: proto.TypeKexInit, Payload: kexCli.InitPayload()}); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	reply, err := conn.ReadFrame()
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	verifyHostKey := func(pub ed25519.PublicKey) error {
+		return kex.VerifyKnownHosts(cfg.KnownHosts, cfg.Server, pub, cfg.ServerFingerprint, cfg.StrictHostKeyChecking)
+	}
+	c2sKey, s2cKey, err := kexCli.ProcessReply(reply.Payload, verifyHostKey)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	cipherConn, err := kex.NewCipherConn(conn, c2sKey, s2cKey)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+
+	nonce, err := proto.RandomNonce()
+	if err != nil {
+		_ = cipherConn.Close()
 		return nil, err
 	}
 	msg := proto.Resume{
@@ -1033,46 +1034,22 @@ func rawResumeWrite(ctx context.Context, addr, sessionID, token string, downAcke
 	}
 	fr, err := proto.MarshalFrame(proto.TypeResume, msg)
 	if err != nil {
-		_ = conn.Close()
+		_ = cipherConn.Close()
 		return nil, err
 	}
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	if err := conn.WriteFrame(fr); err != nil {
-		_ = conn.Close()
+	if err := cipherConn.WriteFrame(fr); err != nil {
+		_ = cipherConn.Close()
 		return nil, err
 	}
-	_ = conn.SetDeadline(time.Time{})
-	return conn, nil
+	return cipherConn.Underlying(), nil
 }
 
 func rawResumeOK(ctx context.Context, addr, sessionID, token string, downAcked uint64) (transport.Conn, proto.ResumeOK, error) {
-	var none proto.ResumeOK
-	conn, err := rawResumeWrite(ctx, addr, sessionID, token, downAcked)
-	if err != nil {
-		return nil, none, err
-	}
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	reply, err := conn.ReadFrame()
-	_ = conn.SetDeadline(time.Time{})
-	if err != nil {
-		_ = conn.Close()
-		return nil, none, err
-	}
-	if reply.Type != proto.TypeResumeOK {
-		_ = conn.Close()
-		var fail proto.Fail
-		_ = proto.UnmarshalPayload(reply, &fail)
-		if fail.Code == "" {
-			fail.Code = proto.CodeProto
-		}
-		return nil, none, proto.NewError(fail.Code, fail.Msg)
-	}
-	var ok proto.ResumeOK
-	if err := proto.UnmarshalPayload(reply, &ok); err != nil {
-		_ = conn.Close()
-		return nil, none, err
-	}
-	return conn, ok, nil
+	cfg := config.DefaultClient()
+	cfg.Server = addr
+	cfg.Transport = "tcp"
+	cfg.StrictHostKeyChecking = "no"
+	return clientResumeRole(ctx, cfg, sessionID, token, downAcked, "")
 }
 
 func rawResumeFail(t *testing.T, ctx context.Context, addr, sessionID, token string, downAcked uint64) proto.Fail {
@@ -1082,6 +1059,27 @@ func rawResumeFail(t *testing.T, ctx context.Context, addr, sessionID, token str
 		t.Fatal(err)
 	}
 	defer conn.Close()
+
+	kexCli, err := kex.NewClientSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.WriteFrame(proto.Frame{Type: proto.TypeKexInit, Payload: kexCli.InitPayload()}); err != nil {
+		t.Fatal(err)
+	}
+	reply, err := conn.ReadFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2sKey, s2cKey, err := kexCli.ProcessReply(reply.Payload, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cipherConn, err := kex.NewCipherConn(conn, c2sKey, s2cKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	nonce, err := proto.RandomNonce()
 	if err != nil {
 		t.Fatal(err)
@@ -1094,11 +1092,11 @@ func rawResumeFail(t *testing.T, ctx context.Context, addr, sessionID, token str
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	if err := conn.WriteFrame(fr); err != nil {
+	_ = cipherConn.SetDeadline(time.Now().Add(5 * time.Second))
+	if err := cipherConn.WriteFrame(fr); err != nil {
 		t.Fatal(err)
 	}
-	reply, err := conn.ReadFrame()
+	reply, err = cipherConn.ReadFrame()
 	if err != nil {
 		t.Fatal(err)
 	}

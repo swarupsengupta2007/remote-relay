@@ -232,4 +232,18 @@ log_level = "info"
 	if err == nil {
 		t.Fatal("expected error with TCP and AllowHA both true")
 	}
+
+	// 8. Security options: KnownHosts, ServerFingerprint, StrictHostKeyChecking
+	cfg, err = config.LoadClient(config.ClientOptions{
+		ConfigPath:            confPath,
+		KnownHosts:            "/tmp/custom_known_hosts",
+		ServerFingerprint:     "SHA256:abc123",
+		StrictHostKeyChecking: "yes",
+	})
+	if err != nil {
+		t.Fatalf("load config security options: %v", err)
+	}
+	if cfg.KnownHosts != "/tmp/custom_known_hosts" || cfg.ServerFingerprint != "SHA256:abc123" || cfg.StrictHostKeyChecking != "yes" {
+		t.Fatalf("unexpected security options: %+v", cfg)
+	}
 }

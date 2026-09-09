@@ -23,6 +23,7 @@ See **Authentication** and **Security** below.
 | M4 session limits, graceful shutdown, observability | yes |
 | M5 SSH public-key auth | yes |
 | FEAT-ROB-01 BFD Sub-Second Detection & Dual-Path HA | yes |
+| FEAT-SEC-01 Encrypted Handshake (X25519 & ChaCha20-Poly1305) | yes |
 
 ### Netem & BFD Benchmarks (dual-netns veth)
 
@@ -51,7 +52,7 @@ go build -o relay ./cmd/relay
 ## Server
 
 ```
-./relay server [--config /etc/relay/server.toml] [--listen 0.0.0.0:7443] [--heartbeat-interval 750ms] [--dead-peer-threshold 3] [--log-level info]
+./relay server [--config /etc/relay/server.toml] [--listen 0.0.0.0:7443] [--host-key /etc/relay/ssh_host_ed25519_key] [--heartbeat-interval 750ms] [--dead-peer-threshold 3] [--log-level info]
 ```
 
 If `--config` is omitted the server loads `/etc/relay/server.toml` when that
@@ -110,7 +111,7 @@ Logs go to **stderr**. stdout is the relayed byte stream and must stay clean
 (it is the SSH transport).
 
 ```
-./relay client --server HOST:PORT [--dest HOST:PORT] [--tcp|--kcp] [--allow-ha] [--heartbeat-interval 750ms] [--dead-peer-threshold 3] [--config PATH] [--log-level warn] [%h %p]
+./relay client --server HOST:PORT [--dest HOST:PORT] [--tcp|--kcp] [--allow-ha] [--server-fingerprint FP] [--known-hosts PATH] [--strict-host-key-checking yes|no|accept-new] [--heartbeat-interval 750ms] [--dead-peer-threshold 3] [--config PATH] [--log-level warn] [%h %p]
 ```
 
 Default client config path: `$HOME/.config/relay/client.toml` (optional).

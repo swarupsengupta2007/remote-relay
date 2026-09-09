@@ -82,7 +82,7 @@ func TestUnknownFrameType(t *testing.T) {
 
 func TestUnknownTypeGap(t *testing.T) {
 	var buf bytes.Buffer
-	buf.WriteByte(0x0B)
+	buf.WriteByte(0x0E)
 	buf.Write([]byte{0, 0, 0, 0})
 	_, err := ReadFrame(&buf)
 	if !errors.Is(err, ErrProto) {
@@ -272,6 +272,7 @@ func TestKnownTypes(t *testing.T) {
 	types := []Type{
 		TypeHello, TypeHelloOK, TypeResume, TypeResumeOK, TypeResumeFail,
 		TypeSwitch, TypeBye, TypeErr, TypeAuth, TypeAuthOK,
+		TypeKexInit, TypeKexReply, TypeEncrypted,
 		TypeData, TypeAck, TypeCloseDir,
 		TypeProbe, TypeProbeOK, TypePing, TypePong,
 	}
@@ -370,5 +371,46 @@ func TestCorruptPayloadDecoders(t *testing.T) {
 	}
 	if _, err := DecodeProbeOK(short); err == nil {
 		t.Fatalf("DecodeProbeOK should fail on short payload")
+	}
+}
+
+func TestKexFrameTypes(t *testing.T) {
+	for _, typ := range []Type{TypeKexInit, TypeKexReply, TypeEncrypted} {
+		if !typ.Known() {
+			t.Fatalf("expected %v to be known", typ)
+		}
+	}
+	if got := TypeKexInit.String(); got != "KEX_INIT" {
+		t.Fatalf("TypeKexInit.String() = %q, want KEX_INIT", got)
+	}
+	if got := TypeKexReply.String(); got != "KEX_REPLY" {
+		t.Fatalf("TypeKexReply.String() = %q, want KEX_REPLY", got)
+	}
+	if got := TypeEncrypted.String(); got != "ENCRYPTED" {
+		t.Fatalf("TypeEncrypted.String() = %q, want ENCRYPTED", got)
+	}
+}
+
+func TestKexFrameRoundTrip(t *testing.T) {
+	frames := []Frame{
+		{Type: TypeKexInit, Payload: make([]byte, 48)},
+		{Type: TypeKexReply, Payload: make([]byte, 144)},
+		{Type: TypeEncrypted, Payload: []byte("encrypted-ciphertext-payload")},
+	}
+	for _, want := range frames {
+		var buf bytes.Buffer
+		if err := WriteFrame(&buf, want); err != nil {
+			t.Fatalf("WriteFrame %v: %v", want.Type, err)
+		}
+		got, err := ReadFrame(&buf)
+		if err != nil {
+			t.Fatalf("ReadFrame %v: %v", want.Type, err)
+		}
+		if got.Type != want.Type {
+			t.Fatalf("type mismatch: got %v, want %v", got.Type, want.Type)
+		}
+		if !bytes.Equal(got.Payload, want.Payload) {
+			t.Fatalf("payload mismatch for %v", want.Type)
+		}
 	}
 }

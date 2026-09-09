@@ -272,62 +272,28 @@ func TestServerStandbyAttachAndPromotion(t *testing.T) {
 	go func() { _ = srv.Serve(ctx) }()
 
 	// 1. Establish active client connection over TCP
-	c1, err := net.Dial("tcp", srv.ln.Addr().String())
+	cliCfg1 := config.DefaultClient()
+	cliCfg1.Server = srv.ln.Addr().String()
+	cliCfg1.Destination = destLn.Addr().String()
+	cliCfg1.Transport = "tcp"
+	cliCfg1.StrictHostKeyChecking = "no"
+	tc1, hok, err := clientHello(ctx, cliCfg1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c1.Close()
-	tc1, err := transport.WrapTCP(c1)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	hFr, _ := proto.MarshalFrame(proto.TypeHello, proto.Hello{
-		V:           1,
-		Transport:   []string{"tcp"},
-		Destination: destLn.Addr().String(),
-	})
-	if err := tc1.WriteFrame(hFr); err != nil {
-		t.Fatal(err)
-	}
-	hResp, err := tc1.ReadFrame()
-	if err != nil {
-		t.Fatal(err)
-	}
-	var hok proto.HelloOK
-	if err := proto.UnmarshalPayload(hResp, &hok); err != nil {
-		t.Fatal(err)
-	}
+	defer tc1.Close()
 
 	// 2. Establish standby connection over TCP with Role: "standby"
-	c2, err := net.Dial("tcp", srv.ln.Addr().String())
+	cliCfg2 := config.DefaultClient()
+	cliCfg2.Server = srv.ln.Addr().String()
+	cliCfg2.Destination = destLn.Addr().String()
+	cliCfg2.Transport = "tcp"
+	cliCfg2.StrictHostKeyChecking = "no"
+	tc2, rok, err := clientResumeRole(ctx, cliCfg2, hok.SessionID, hok.ResumeToken, 0, "standby")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c2.Close()
-	tc2, err := transport.WrapTCP(c2)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	rFr, _ := proto.MarshalFrame(proto.TypeResume, proto.Resume{
-		V:           1,
-		SessionID:   hok.SessionID,
-		ResumeToken: hok.ResumeToken,
-		Transport:   []string{"tcp"},
-		Role:        "standby",
-	})
-	if err := tc2.WriteFrame(rFr); err != nil {
-		t.Fatal(err)
-	}
-	rResp, err := tc2.ReadFrame()
-	if err != nil {
-		t.Fatal(err)
-	}
-	var rok proto.ResumeOK
-	if err := proto.UnmarshalPayload(rResp, &rok); err != nil {
-		t.Fatal(err)
-	}
+	defer tc2.Close()
 	if rok.Role != "standby" {
 		t.Fatalf("expected ResumeOK with Role: standby, got %q", rok.Role)
 	}

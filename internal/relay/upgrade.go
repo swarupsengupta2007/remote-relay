@@ -2,6 +2,7 @@ package relay
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/remote-relay/relay/internal/auth"
 	"github.com/remote-relay/relay/internal/config"
+	"github.com/remote-relay/relay/internal/crypto/kex"
 	"github.com/remote-relay/relay/internal/proto"
 	"github.com/remote-relay/relay/internal/transport"
 )
@@ -273,6 +275,40 @@ func writeResumeOn(ctx context.Context, conn transport.Conn, cfg config.Client, 
 
 func writeResumeRole(ctx context.Context, conn transport.Conn, cfg config.Client, sessionID, token string, downAcked uint64, role string) (proto.ResumeOK, error) {
 	var none proto.ResumeOK
+	controlConn := conn
+	if conn.Kind() == transport.KindTCP {
+		kexCli, err := kex.NewClientSession()
+		if err != nil {
+			return none, fmt.Errorf("kex new client session: %w", err)
+		}
+		if err := conn.SetDeadline(deadlineOr(ctx, handshakeTimeout)); err != nil {
+			return none, err
+		}
+		if err := conn.WriteFrame(proto.Frame{Type: proto.TypeKexInit, Payload: kexCli.InitPayload()}); err != nil {
+			return none, fmt.Errorf("send KEX_INIT: %w", err)
+		}
+		reply, err := conn.ReadFrame()
+		_ = conn.SetDeadline(time.Time{})
+		if err != nil {
+			return none, fmt.Errorf("read KEX_REPLY: %w", err)
+		}
+		if reply.Type != proto.TypeKexReply {
+			return none, proto.NewError(proto.CodeProto, "expected KEX_REPLY, got "+reply.Type.String())
+		}
+		verifyHostKey := func(pub ed25519.PublicKey) error {
+			return kex.VerifyKnownHosts(cfg.KnownHosts, cfg.Server, pub, cfg.ServerFingerprint, cfg.StrictHostKeyChecking)
+		}
+		c2sKey, s2cKey, err := kexCli.ProcessReply(reply.Payload, verifyHostKey)
+		if err != nil {
+			return none, fmt.Errorf("kex verify reply: %w", err)
+		}
+		cipherConn, err := kex.NewCipherConn(conn, c2sKey, s2cKey)
+		if err != nil {
+			return none, fmt.Errorf("create cipher conn: %w", err)
+		}
+		controlConn = cipherConn
+	}
+
 	nonce, err := proto.RandomNonce()
 	if err != nil {
 		return none, err
@@ -302,16 +338,16 @@ func writeResumeRole(ctx context.Context, conn transport.Conn, cfg config.Client
 	if err != nil {
 		return none, err
 	}
-	if err := conn.SetDeadline(deadlineOr(ctx, handshakeTimeout)); err != nil {
+	if err := controlConn.SetDeadline(deadlineOr(ctx, handshakeTimeout)); err != nil {
 		return none, err
 	}
-	if err := conn.WriteFrame(fr); err != nil {
-		_ = conn.SetDeadline(time.Time{})
+	if err := controlConn.WriteFrame(fr); err != nil {
+		_ = controlConn.SetDeadline(time.Time{})
 		return none, err
 	}
-	reply, err := conn.ReadFrame()
+	reply, err := controlConn.ReadFrame()
 	if err != nil {
-		_ = conn.SetDeadline(time.Time{})
+		_ = controlConn.SetDeadline(time.Time{})
 		return none, err
 	}
 	if reply.Type == proto.TypeAuthOK {
@@ -322,17 +358,17 @@ func writeResumeRole(ctx context.Context, conn transport.Conn, cfg config.Client
 			Canonical:   fr.Payload,
 			Offer:       msg.Auth,
 		}
-		if err := completeClientAuth(conn, a, ch, reply); err != nil {
-			_ = conn.SetDeadline(time.Time{})
+		if err := completeClientAuth(controlConn, a, ch, reply); err != nil {
+			_ = controlConn.SetDeadline(time.Time{})
 			return none, err
 		}
-		reply, err = conn.ReadFrame()
+		reply, err = controlConn.ReadFrame()
 		if err != nil {
-			_ = conn.SetDeadline(time.Time{})
+			_ = controlConn.SetDeadline(time.Time{})
 			return none, err
 		}
 	}
-	_ = conn.SetDeadline(time.Time{})
+	_ = controlConn.SetDeadline(time.Time{})
 	switch reply.Type {
 	case proto.TypeResumeFail, proto.TypeErr:
 		var fail proto.Fail

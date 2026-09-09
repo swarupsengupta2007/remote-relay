@@ -21,6 +21,7 @@ import (
 
 	"github.com/remote-relay/relay/internal/auth"
 	"github.com/remote-relay/relay/internal/config"
+	"github.com/remote-relay/relay/internal/crypto/kex"
 	"github.com/remote-relay/relay/internal/logging"
 	"github.com/remote-relay/relay/internal/proto"
 	"github.com/remote-relay/relay/internal/transport"
@@ -192,9 +193,33 @@ func TestAuthOKDestMismatchDoesNotSendAUTH(t *testing.T) {
 		}
 		defer conn.Close()
 		_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
-		if _, err := conn.ReadFrame(); err != nil {
+		initFrame, err := conn.ReadFrame()
+		if err != nil {
 			return
 		}
+		_, hostPriv, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			return
+		}
+		kexSrv, err := kex.NewServerSession(hostPriv)
+		if err != nil {
+			return
+		}
+		replyPayload, c2sKey, s2cKey, err := kexSrv.ProcessInit(initFrame.Payload)
+		if err != nil {
+			return
+		}
+		if err := conn.WriteFrame(proto.Frame{Type: proto.TypeKexReply, Payload: replyPayload}); err != nil {
+			return
+		}
+		cipherConn, err := kex.NewCipherConn(conn, s2cKey, c2sKey)
+		if err != nil {
+			return
+		}
+		if _, err := cipherConn.ReadFrame(); err != nil {
+			return
+		}
+
 		nonce, err := proto.RandomNonce()
 		if err != nil {
 			return
@@ -208,16 +233,17 @@ func TestAuthOKDestMismatchDoesNotSendAUTH(t *testing.T) {
 		if err != nil {
 			return
 		}
-		if err := conn.WriteFrame(fr); err != nil {
+		if err := cipherConn.WriteFrame(fr); err != nil {
 			return
 		}
-		f, err := conn.ReadFrame()
+		f, err := cipherConn.ReadFrame()
 		sent = err == nil && f.Type == proto.TypeAuth
 	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel()
 	ccfg := authClient(ln.Addr().String(), "127.0.0.1:22", priv)
+	ccfg.StrictHostKeyChecking = "no"
 	_, _, err = clientHello(ctx, ccfg)
 	if !errors.Is(err, proto.ErrAuth) {
 		t.Fatalf("clientHello got %v want ERR_AUTH", err)
@@ -527,67 +553,17 @@ func writeEd25519Key(t *testing.T, dir, name string) (privPath, pubLine string) 
 }
 
 func rawHelloAuth(ctx context.Context, addr, dest, identity, user string) (transport.Conn, proto.HelloOK, error) {
-	var none proto.HelloOK
-	conn, err := transport.DialTCP(ctx, addr)
-	if err != nil {
-		return nil, none, err
+	cfg := config.DefaultClient()
+	cfg.Server = addr
+	cfg.Destination = dest
+	cfg.Transport = "tcp"
+	cfg.StrictHostKeyChecking = "no"
+	cfg.AuthMethod = auth.MethodPublicKey
+	cfg.AuthUser = user
+	if identity != "" {
+		cfg.IdentityFiles = []string{identity}
 	}
-	a := auth.New(auth.Config{Method: auth.MethodPublicKey, User: user, IdentityFiles: []string{identity}})
-	nonce, err := proto.RandomNonce()
-	if err != nil {
-		_ = conn.Close()
-		return nil, none, err
-	}
-	offer, err := a.Respond(auth.Challenge{Destination: dest, ClientNonce: nonce})
-	if err != nil {
-		_ = conn.Close()
-		return nil, none, err
-	}
-	hello := proto.Hello{
-		V: 1, Transport: []string{"tcp"}, Destination: dest,
-		ClientNonce: nonce, Auth: offer, Window: 65536,
-	}
-	fr, err := proto.MarshalFrame(proto.TypeHello, hello)
-	if err != nil {
-		_ = conn.Close()
-		return nil, none, err
-	}
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	if err := conn.WriteFrame(fr); err != nil {
-		_ = conn.Close()
-		return nil, none, err
-	}
-	reply, err := conn.ReadFrame()
-	if err != nil {
-		_ = conn.Close()
-		return nil, none, err
-	}
-	if reply.Type != proto.TypeAuthOK {
-		_ = conn.Close()
-		return nil, none, proto.NewError(proto.CodeProto, reply.Type.String())
-	}
-	if err := completeClientAuth(conn, a, auth.Challenge{
-		Destination: dest, ClientNonce: nonce, Canonical: fr.Payload, Offer: offer,
-	}, reply); err != nil {
-		_ = conn.Close()
-		return nil, none, err
-	}
-	reply, err = conn.ReadFrame()
-	_ = conn.SetDeadline(time.Time{})
-	if err != nil {
-		_ = conn.Close()
-		return nil, none, err
-	}
-	if reply.Type != proto.TypeHelloOK {
-		_ = conn.Close()
-		return nil, none, proto.NewError(proto.CodeProto, reply.Type.String())
-	}
-	var ok proto.HelloOK
-	if err := proto.UnmarshalPayload(reply, &ok); err != nil {
-		_ = conn.Close()
-		return nil, none, err
-	}
-	return conn, ok, nil
+	return clientHello(ctx, cfg)
 }
 
 func rawResumeAuthFail(t *testing.T, ctx context.Context, addr, sessionID, token, dest, identity string) proto.Fail {
@@ -597,6 +573,31 @@ func rawResumeAuthFail(t *testing.T, ctx context.Context, addr, sessionID, token
 		t.Fatal(err)
 	}
 	defer conn.Close()
+
+	// 1. KEX
+	kexCli, err := kex.NewClientSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.WriteFrame(proto.Frame{Type: proto.TypeKexInit, Payload: kexCli.InitPayload()}); err != nil {
+		t.Fatal(err)
+	}
+	reply, err := conn.ReadFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reply.Type != proto.TypeKexReply {
+		t.Fatalf("expected KEX_REPLY, got %v", reply.Type)
+	}
+	c2sKey, s2cKey, err := kexCli.ProcessReply(reply.Payload, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cipherConn, err := kex.NewCipherConn(conn, c2sKey, s2cKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	nonce, err := proto.RandomNonce()
 	if err != nil {
 		t.Fatal(err)
@@ -618,11 +619,11 @@ func rawResumeAuthFail(t *testing.T, ctx context.Context, addr, sessionID, token
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	if err := conn.WriteFrame(fr); err != nil {
+	_ = cipherConn.SetDeadline(time.Now().Add(5 * time.Second))
+	if err := cipherConn.WriteFrame(fr); err != nil {
 		t.Fatal(err)
 	}
-	reply, err := conn.ReadFrame()
+	reply, err = cipherConn.ReadFrame()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -632,15 +633,15 @@ func rawResumeAuthFail(t *testing.T, ctx context.Context, addr, sessionID, token
 				SessionID: sessionID, Destination: dest, ClientNonce: nonce,
 				Canonical: fr.Payload, Offer: msg.Auth,
 			}
-			if err := completeClientAuth(conn, a, ch, reply); err != nil {
+			if err := completeClientAuth(cipherConn, a, ch, reply); err != nil {
 				t.Fatal(err)
 			}
 		} else {
-			if err := conn.WriteFrame(proto.Frame{Type: proto.TypeAuth, Payload: []byte(`{"sig":""}`)}); err != nil {
+			if err := cipherConn.WriteFrame(proto.Frame{Type: proto.TypeAuth, Payload: []byte(`{"sig":""}`)}); err != nil {
 				t.Fatal(err)
 			}
 		}
-		reply, err = conn.ReadFrame()
+		reply, err = cipherConn.ReadFrame()
 		if err != nil {
 			t.Fatal(err)
 		}

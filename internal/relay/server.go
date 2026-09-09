@@ -2,6 +2,7 @@ package relay
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -9,6 +10,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,6 +19,7 @@ import (
 	"github.com/remote-relay/relay/internal/auth"
 	"github.com/remote-relay/relay/internal/bfd"
 	"github.com/remote-relay/relay/internal/config"
+	"github.com/remote-relay/relay/internal/crypto/kex"
 	"github.com/remote-relay/relay/internal/logging"
 	"github.com/remote-relay/relay/internal/proto"
 	"github.com/remote-relay/relay/internal/session"
@@ -30,6 +34,9 @@ type Server struct {
 	auth   auth.Authenticator
 	store  *session.Store
 	budget *session.Budget
+
+	hostKey    ed25519.PrivateKey
+	hostKeyErr error
 
 	mu      sync.Mutex
 	ln      net.Listener
@@ -76,12 +83,36 @@ func NewServer(cfg config.Server, log *slog.Logger) *Server {
 		log = logging.New(nil, cfg.LogLevel, cfg.LogFormat)
 	}
 	runCtx, runCancel := context.WithCancel(context.Background())
+
+	hostKeyPath := cfg.HostKey
+	if hostKeyPath == "" {
+		hostKeyPath = "/etc/relay/ssh_host_ed25519_key"
+	}
+	hostKey, hostErr := kex.LoadOrGenerateHostKey(hostKeyPath)
+	if hostErr != nil {
+		home, herr := os.UserHomeDir()
+		fallback := filepath.Join(os.TempDir(), "relay_ssh_host_ed25519_key")
+		if herr == nil && home != "" {
+			fallback = filepath.Join(home, ".config", "relay", "host_key")
+		}
+		hostKey, hostErr = kex.LoadOrGenerateHostKey(fallback)
+	}
+	if hostKey != nil {
+		pub := hostKey.Public().(ed25519.PublicKey)
+		fp := kex.FingerprintSHA256(pub)
+		log.Info("host key active", "fingerprint", fp)
+	} else if hostErr != nil {
+		log.Error("failed to load host key", "err", hostErr)
+	}
+
 	return &Server{
 		cfg:         cfg,
 		log:         log,
 		auth:        auth.New(auth.Config{Method: cfg.AuthMethod, AuthorizedKeys: cfg.AuthorizedKeys, FailDelay: cfg.AuthFailDelay.Duration()}),
 		store:       session.NewStore(cfg.MaxSessions),
 		budget:      session.NewBudget(int64(cfg.TotalBufferBytes)),
+		hostKey:     hostKey,
+		hostKeyErr:  hostErr,
 		lives:       make(map[string]*live),
 		probes:      make(map[[16]byte]string),
 		probeBySess: make(map[string][16]byte),
@@ -90,6 +121,21 @@ func NewServer(cfg config.Server, log *slog.Logger) *Server {
 		runCtx:      runCtx,
 		runCancel:   runCancel,
 	}
+}
+
+func (s *Server) HostPublicKey() ed25519.PublicKey {
+	if s.hostKey == nil {
+		return nil
+	}
+	return s.hostKey.Public().(ed25519.PublicKey)
+}
+
+func (s *Server) HostFingerprint() string {
+	pub := s.HostPublicKey()
+	if pub == nil {
+		return ""
+	}
+	return kex.FingerprintSHA256(pub)
 }
 
 func (s *Server) Addr() string {
@@ -177,6 +223,13 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 }
 
+func unwrapConn(c transport.Conn) transport.Conn {
+	if cc, ok := c.(*kex.CipherConn); ok {
+		return cc.Underlying()
+	}
+	return c
+}
+
 func (s *Server) handle(raw net.Conn) {
 	defer raw.Close()
 	ip := clientIP(raw.RemoteAddr())
@@ -199,12 +252,64 @@ func (s *Server) handle(raw net.Conn) {
 		s.log.Debug("handshake read", "err", err)
 		return
 	}
+
+	// Strict encrypted-only enforcement (FEAT-SEC-01)
+	if f.Type != proto.TypeKexInit {
+		s.log.Warn("rejecting unencrypted handshake: expected KEX_INIT", "type", f.Type.String(), "from", raw.RemoteAddr().String())
+		writeErr(conn, proto.CodeProto, "encrypted handshake required (expected KEX_INIT)")
+		return
+	}
+
+	if s.hostKey == nil {
+		s.log.Error("server host key unavailable", "err", s.hostKeyErr)
+		writeErr(conn, proto.CodeInternal, "server host key unavailable")
+		return
+	}
+
+	kexSrv, err := kex.NewServerSession(s.hostKey)
+	if err != nil {
+		s.log.Error("kex new server session", "err", err)
+		writeErr(conn, proto.CodeInternal, "kex init failed")
+		return
+	}
+
+	replyPayload, c2sKey, s2cKey, err := kexSrv.ProcessInit(f.Payload)
+	if err != nil {
+		s.log.Debug("kex process init", "err", err)
+		writeErr(conn, proto.CodeProto, "kex init failed: "+err.Error())
+		return
+	}
+
+	_ = conn.SetDeadline(time.Now().Add(handshakeTimeout))
+	if err := conn.WriteFrame(proto.Frame{Type: proto.TypeKexReply, Payload: replyPayload}); err != nil {
+		_ = conn.SetDeadline(time.Time{})
+		s.log.Debug("write kex reply", "err", err)
+		return
+	}
+	_ = conn.SetDeadline(time.Time{})
+
+	// Wrap in CipherConn (server sends s2cKey, receives c2sKey)
+	cipherConn, err := kex.NewCipherConn(conn, s2cKey, c2sKey)
+	if err != nil {
+		s.log.Error("new cipher conn", "err", err)
+		return
+	}
+
+	// Read encrypted control frame
+	_ = cipherConn.SetDeadline(time.Now().Add(handshakeTimeout))
+	f, err = cipherConn.ReadFrame()
+	_ = cipherConn.SetDeadline(time.Time{})
+	if err != nil {
+		s.log.Debug("encrypted handshake read", "err", err)
+		return
+	}
+
 	ctx := s.sessionContext()
 	if s.shutting() {
 		if f.Type == proto.TypeResume {
-			writeResumeFail(conn, proto.CodeShutdown, "shutting down")
+			writeResumeFail(cipherConn, proto.CodeShutdown, "shutting down")
 		} else {
-			writeErr(conn, proto.CodeShutdown, "shutting down")
+			writeErr(cipherConn, proto.CodeShutdown, "shutting down")
 		}
 		return
 	}
@@ -212,16 +317,16 @@ func (s *Server) handle(raw net.Conn) {
 	// refused with ERR_NO_CAPACITY; RESUME of an existing session proceeds.
 	if max := s.cfg.MaxConnsPerIP; max > 0 && n > 2*max && f.Type == proto.TypeHello {
 		s.refused.Add(1)
-		writeErr(conn, proto.CodeNoCapacity, "too many connections from this address")
+		writeErr(cipherConn, proto.CodeNoCapacity, "too many connections from this address")
 		return
 	}
 	switch f.Type {
 	case proto.TypeResume:
-		s.handleResume(ctx, conn, f)
+		s.handleResume(ctx, cipherConn, f)
 	case proto.TypeHello:
-		s.handleHello(ctx, conn, f, ip, releaseTCP)
+		s.handleHello(ctx, cipherConn, f, ip, releaseTCP)
 	default:
-		writeErr(conn, proto.CodeProto, "expected HELLO")
+		writeErr(cipherConn, proto.CodeProto, "expected HELLO")
 	}
 }
 
@@ -351,10 +456,11 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 		return
 	}
 
+	rawConn := unwrapConn(conn)
 	log := logging.WithSession(s.log, sess.ID)
 	sendLog := session.NewRing(bufCap, s.budget)
 	p := newPump(ctx, sessionIO{
-		conn:       conn,
+		conn:       rawConn,
 		src:        dtcp,
 		sink:       dtcp,
 		closeWrite: dtcp.CloseWrite,
@@ -403,8 +509,8 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 	if err := writeFrameDeadline(conn, fr); err != nil {
 		return
 	}
-	log.Info("session started", "dest", dest, "peer", conn.RemoteAddr().String(), "transport", selected)
-	l.run(ctx, conn)
+	log.Info("session started", "dest", dest, "peer", rawConn.RemoteAddr().String(), "transport", selected)
+	l.run(ctx, rawConn)
 }
 
 func (s *Server) handleResume(ctx context.Context, conn transport.Conn, f proto.Frame) {
@@ -658,17 +764,18 @@ func (l *live) AttachStandby(req attachReq) error {
 	promoteCh := make(chan struct{})
 	promotedDone := make(chan struct{})
 
-	l.standbyConn = req.conn
+	rawStandbyConn := unwrapConn(req.conn)
+	l.standbyConn = rawStandbyConn
 	l.standbyBFD = bfdSess
 	l.standbyStop = standbyCancel
 	l.standbyPromote = promoteCh
 	l.standbyPromotedDone = promotedDone
 	l.standbyDone = req.done
 
-	l.notePath(req.conn)
-	l.log.Info("standby connection attached", "transport", req.conn.Kind().String(), "peer", req.conn.RemoteAddr().String())
+	l.notePath(rawStandbyConn)
+	l.log.Info("standby connection attached", "transport", rawStandbyConn.Kind().String(), "peer", rawStandbyConn.RemoteAddr().String())
 
-	go l.runStandby(standbyCtx, req.conn, bfdSess, promoteCh, promotedDone, req.done)
+	go l.runStandby(standbyCtx, rawStandbyConn, bfdSess, promoteCh, promotedDone, req.done)
 	return nil
 }
 
@@ -838,6 +945,7 @@ func (l *live) takeStandbyForPromotion() (transport.Conn, *bfd.Session, []proto.
 }
 
 func (l *live) run(ctx context.Context, first transport.Conn) {
+	first = unwrapConn(first)
 	l.startIO()
 	l.notePath(first)
 	err := l.serveConn(l.sessCtx, first, 0)
@@ -895,8 +1003,9 @@ func (l *live) run(ctx context.Context, first transport.Conn) {
 		}
 		sendFrom := req.resume.DownAcked
 		l.sendLog.AdvanceTo(sendFrom)
-		l.notePath(req.conn)
-		err = l.serveConn(l.sessCtx, req.conn, sendFrom)
+		rawReqConn := unwrapConn(req.conn)
+		l.notePath(rawReqConn)
+		err = l.serveConn(l.sessCtx, rawReqConn, sendFrom)
 		select {
 		case req.done <- err:
 		default:

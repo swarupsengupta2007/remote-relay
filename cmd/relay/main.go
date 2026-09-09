@@ -45,8 +45,8 @@ func run(args []string) int {
 func usage() {
 	fmt.Fprintf(os.Stderr, `usage: relay <server|client|version> [flags]
 
-  relay server [--config PATH] [--listen HOST:PORT] [--log-level LVL]
-  relay client --server HOST:PORT [--dest HOST:PORT] [--tcp|--kcp] [--allow-ha] [--config PATH] [--log-level LVL] [%%h %%p]
+  relay server [--config PATH] [--listen HOST:PORT] [--host-key PATH] [--log-level LVL]
+  relay client --server HOST:PORT [--dest HOST:PORT] [--tcp|--kcp] [--allow-ha] [--server-fingerprint FP] [--known-hosts PATH] [--config PATH] [--log-level LVL] [%%h %%p]
   relay version
 `)
 }
@@ -59,6 +59,7 @@ func runServer(args []string) int {
 	logLevel := fs.String("log-level", "", "log level")
 	heartbeat := fs.Duration("heartbeat-interval", 0, "BFD heartbeat interval (default: 750ms)")
 	deadThreshold := fs.Int("dead-peer-threshold", 0, "BFD dead peer missed heartbeat threshold (default: 3)")
+	hostKey := fs.String("host-key", "", "path to server Ed25519 host key")
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return 0
@@ -71,6 +72,7 @@ func runServer(args []string) int {
 		LogLevel:          *logLevel,
 		HeartbeatInterval: *heartbeat,
 		DeadPeerThreshold: *deadThreshold,
+		HostKey:           *hostKey,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "relay server: %v\n", err)
@@ -99,6 +101,9 @@ func runClient(args []string) int {
 	logLevel := fs.String("log-level", "", "log level")
 	heartbeat := fs.Duration("heartbeat-interval", 0, "BFD heartbeat interval (default: 750ms)")
 	deadThreshold := fs.Int("dead-peer-threshold", 0, "BFD dead peer missed heartbeat threshold (default: 3)")
+	knownHosts := fs.String("known-hosts", "", "path to client known_hosts file")
+	fingerprint := fs.String("server-fingerprint", "", "pinned SHA256 server host key fingerprint (SHA256:...)")
+	strictChecking := fs.String("strict-host-key-checking", "", "strict host key checking: yes|no|ask")
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return 0
@@ -141,19 +146,22 @@ func runClient(args []string) int {
 	}
 
 	cfg, err := config.LoadClient(config.ClientOptions{
-		ConfigPath:        *configPath,
-		Server:            *server,
-		Dest:              *dest,
-		DestSet:           destSet,
-		TCP:               *tcp,
-		KCP:               *kcp,
-		AllowHA:           *allowHA,
-		AllowHASet:        allowHASet,
-		LogLevel:          *logLevel,
-		PosHost:           posHost,
-		PosPort:           posPort,
-		HeartbeatInterval: *heartbeat,
-		DeadPeerThreshold: *deadThreshold,
+		ConfigPath:            *configPath,
+		Server:                *server,
+		Dest:                  *dest,
+		DestSet:               destSet,
+		TCP:                   *tcp,
+		KCP:                   *kcp,
+		AllowHA:               *allowHA,
+		AllowHASet:            allowHASet,
+		LogLevel:              *logLevel,
+		PosHost:               posHost,
+		PosPort:               posPort,
+		HeartbeatInterval:     *heartbeat,
+		DeadPeerThreshold:     *deadThreshold,
+		KnownHosts:            *knownHosts,
+		ServerFingerprint:     *fingerprint,
+		StrictHostKeyChecking: *strictChecking,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "relay client: %v\n", err)

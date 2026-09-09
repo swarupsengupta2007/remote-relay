@@ -23,7 +23,7 @@ Each proposal includes:
 | **FEAT-UTL-02** | Terminal Reconnection HUD & Desktop Notifications | Tier 2: Utility | **P1** | Low | Clear visual feedback and status during link drops |
 | **FEAT-UTL-03** | SOCKS5 Dynamic Forwarding Mode (`relay socks`) | Tier 2: Utility | **P2** | Medium | Expands relay beyond SSH to generic browser/DB proxy |
 | **FEAT-UTL-04** | Reverse Relay & NAT Gateway Mode (Inverted Tunnel) | Tier 2: Utility | **P2** | High | Reaches home labs and private VPCs behind NAT |
-| **FEAT-SEC-01** | Encrypted Handshake Control Plane (TLS 1.3 / Noise) | Tier 3: Security | **P2** | Medium | Eliminates cleartext token and metadata sniffing |
+| **FEAT-SEC-01** | Encrypted Handshake Control Plane (X25519 / ChaCha20-Poly1305) | Tier 3: Security | **P1** | Complete | SSH-style X25519 ECDH + Ed25519 host keys + ChaCha20-Poly1305 control encryption |
 | **FEAT-SEC-02** | WebSocket & HTTPS Port 443 Fallback Transport | Tier 3: Security | **P3** | High | Bypasses restrictive enterprise firewalls & DPI |
 | **FEAT-SEC-03** | Per-User RBAC & Live `SIGHUP` Configuration Reload | Tier 3: Security | **P2** | Medium | Hot updates to `authorized_keys` & destination ACLs |
 | **FEAT-PERF-01**| Linux Kernel Zero-Copy Stream Splicing (`splice(2)`) | Tier 4: Performance | **P3** | Medium | Halves CPU & memory bus overhead on multi-gigabit links |
@@ -232,26 +232,37 @@ The current architecture assumes the server has a public IP address and the dest
 
 ## Tier 3: Security & Network Traversal Hardening
 
-### FEAT-SEC-01: Encrypted Handshake Control Plane (TLS 1.3 / Noise Protocol)
-* **Priority**: `P2` (Medium)
-* **Status**: Proposed
-* **Target Package**: `internal/transport`, `internal/relay`, `internal/proto`
+### FEAT-SEC-01: Encrypted Handshake Control Plane (X25519 & ChaCha20-Poly1305)
+* **Priority**: `P1` (High)
+* **Status**: Implemented (Complete)
+* **Target Package**: `internal/crypto/kex`, `internal/proto`, `internal/config`, `internal/relay`, `cmd/relay`
 
 #### 1. Problem Statement
-As noted in [`design.md` §10.1](file:///root/remote-relay/design.md#L500-L511), the TCP control plane is sent in cleartext JSON. Although SSH payloads are encrypted, on-path network observers can inspect `HELLO`, `RESUME`, `sessionId`, `resumeToken`, and target destinations. This enables metadata tracking, token interception, and targeted DPI filtering.
+As noted in [`design.md` §10.1](file:///root/remote-relay/design.md#L500-L511), the TCP control plane was originally sent in cleartext JSON. Although SSH payloads are encrypted, on-path network observers could inspect `HELLO`, `RESUME`, `sessionId`, `resumeToken`, destination IPs/ports, and authentication tokens. This enabled metadata tracking, session token interception, and targeted middlebox DPI filtering.
 
 #### 2. Technical Specification
-- **Option A: Standard TLS 1.3 Termination**:
-  - Server exposes TLS on `listen_tcp`.
-  - Client verifies server certificate (or pins public key fingerprint).
-- **Option B: Noise Protocol Handshake (`Noise_IKpsk2`)**:
-  - Implement a lightweight Noise Protocol handshake for zero PKI overhead.
-  - Encrypt all control plane frames using ChaCha20-Poly1305.
-  - Session tokens and destination strings are never sent in cleartext.
+- **SSH-Style Ephemeral Key Exchange (`internal/crypto/kex`)**:
+  - Ephemeral X25519 Diffie-Hellman key agreement with HKDF-SHA256 key derivation for distinct directional keys (`Key_c2s` and `Key_s2c`).
+  - Server identity authenticated via Ed25519 host key signature over the complete cryptographic exchange transcript hash $H$.
+- **Host Key Management & Fingerprint Verification**:
+  - Auto-generated or file-based OpenSSH Ed25519 server host keys (`--host-key`).
+  - OpenSSH-format `known_hosts` verification (`~/.config/relay/known_hosts`, `--known-hosts`) with Trust On First Use (TOFU), MITM change detection, and strict checking policies (`--strict-host-key-checking=yes|no|accept-new`).
+  - Explicit fingerprint pinning via `--server-fingerprint SHA256:...`.
+- **ChaCha20-Poly1305 AEAD Symmetric Framing (`TypeEncrypted` 0x0D)**:
+  - ChaCha20-Poly1305 authenticated encryption with strictly increasing 64-bit sequence counters (`CipherConn`).
+  - Strict encrypted-only mode: cleartext handshakes are rejected immediately with `ERR_PROTO`.
+- **Option A Clean Phase Cut Transition**:
+  - Once the encrypted control handshake (`HELLO`/`HELLO_OK` or `RESUME`/`RESUME_OK`) finishes, the connection cleanly transitions to raw wire frames for `TypeData` (0x10), avoiding double-encryption overhead with inner SSH payloads.
 
-#### 3. Benefits & Verification
-- Complete metadata privacy; immune to passive eavesdropping and middlebox tamper attacks.
-- **Verification**: Run `tcpdump -X` on the control connection and verify that no JSON strings or session tokens appear in plaintext.
+#### 3. Verification & Benchmark Results
+- **Unit & Concurrency Tests**: 100% pass across `internal/crypto/kex`, `internal/proto`, `internal/config`, `internal/relay`, and `cmd/relay` under `-race`.
+- **Dual-Netns Linux Verification Matrix**: 6/6 tests passing in isolated network namespaces (`ns-srv` <-> `ns-cli` via `veth`) with real OpenSSH 10 MiB payload tunneling:
+  - `SEC-01-E2E-Transfer`: PASS (10 MiB byte-exact SHA-256 match, host key recorded).
+  - `SEC-02-Fingerprint-Correct`: PASS (matching fingerprint verified).
+  - `SEC-02-Fingerprint-Mismatch-Reject`: PASS (immediate non-zero exit).
+  - `SEC-02-MITM-Detection`: PASS (altered known_hosts entry rejected instantly).
+  - `SEC-03-Plaintext-Probe-Rejected`: PASS (server drops cleartext probe with `ERR_PROTO`).
+  - `SEC-04-Wire-Inspection`: PASS (`tcpdump` inspection confirmed zero cleartext metadata or session tokens on wire).
 
 ---
 

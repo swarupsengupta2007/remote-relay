@@ -189,6 +189,47 @@ Requests:
 
 ---
 
+## Antigravity — FEAT-SEC-01: Encrypted Handshake Control Plane (X25519 & ChaCha20-Poly1305)
+
+Date: 2026-09-10.
+Implementation & Verification Summary:
+
+### 1. Architectural Implementation
+- **Cryptographic Engine (`internal/crypto/kex`)**:
+  - Ephemeral X25519 ECDH key agreement with HKDF-SHA256 derivation (`c2s` and `s2c` 32-byte keys).
+  - Exchange transcript hash $H = \text{SHA-256}(\text{Version} \parallel \text{ClientInit} \parallel \text{ServerInit} \parallel \text{ServerHostPub})$.
+  - Ed25519 host key authentication: server signs transcript hash $H$; client verifies before computing symmetric keys.
+  - Monotonically increasing 64-bit sequence counters with ChaCha20-Poly1305 AEAD symmetric framing (`CipherConn`).
+  - OpenSSH Ed25519 host key loader, generator, and fingerprint calculation (`internal/crypto/kex/hostkey.go`).
+  - OpenSSH `known_hosts` store with Trust On First Use (TOFU), MITM key mutation detection, and strict checking policies (`yes` | `no` | `accept-new`).
+- **Protocol Framing (`internal/proto`)**:
+  - Added `TypeKexInit` (0x0B), `TypeKexReply` (0x0C), and `TypeEncrypted` (0x0D).
+  - Encrypted frames carry encrypted control payloads (`HELLO`, `HELLO_OK`, `AUTH`, `AUTH_OK`, `RESUME`, `RESUME_OK`, `FAIL`).
+- **Configuration & CLI (`internal/config`, `cmd/relay`)**:
+  - Added `--host-key` to server (auto-generated on first boot if omitted).
+  - Added `--known-hosts`, `--server-fingerprint`, and `--strict-host-key-checking` to client.
+- **Relay Integration & Option A Clean Phase Cut (`internal/relay`)**:
+  - Server enforces strictly encrypted control plane: unencrypted handshakes rejected immediately with `ERR_PROTO`.
+  - Client performs KEX and verifies server host key / fingerprint prior to issuing `HELLO` or `RESUME`.
+  - Option A Clean Phase Cut: upon handshake completion (`HELLO_OK` or `RESUME_OK`), the underlying connection transitions cleanly to raw framing for `TypeData` (0x10), eliminating double-encryption overhead with inner SSH payloads.
+  - Wrapped `kex.ErrHostKey` and non-reconnectable failure checks in `reconnectable(err)` to prevent endless retry loops on invalid host keys or MITM detections.
+
+### 2. Verification & Testing
+- **Unit & Concurrency Tests**:
+  - `go test -race ./...` 100% PASS across all packages.
+  - Dedicated cryptographic test suite in `internal/crypto/kex/kex_test.go` PASS.
+  - Dedicated security integration suite in `internal/relay/sec_test.go` PASS (7/7 tests).
+- **Live Dual-Netns Verification Matrix (`/tmp/relay-verify/test_sec_netns.py`)**:
+  - `SEC-01-E2E-Transfer`: PASS (10 MiB binary payload transferred byte-exact via OpenSSH `ProxyCommand`, server host key recorded).
+  - `SEC-02-Fingerprint-Correct`: PASS (matching fingerprint verified).
+  - `SEC-02-Fingerprint-Mismatch-Reject`: PASS (immediate non-zero exit).
+  - `SEC-02-MITM-Detection`: PASS (altered known_hosts entry rejected instantly).
+  - `SEC-03-Plaintext-Probe-Rejected`: PASS (server drops cleartext probe with `ERR_PROTO`).
+  - `SEC-04-Wire-Inspection`: PASS (`tcpdump` inspection confirmed zero cleartext metadata or session tokens on wire).
+  - Hot host networking remained 100% clean (zero lingering netns, zero host firewall rules).
+
+---
+
 ## Next agent
 
 Append a new `## <Agent>` heading below this line. Write what you changed,

@@ -241,51 +241,64 @@ A dedicated cryptographic package implementing the handshake primitives:
 
 ```
 Phase 1: Cryptographic Engine & Host Key Management
-├── Task 1.1: Create internal/crypto/kex package (X25519 key exchange & HKDF-SHA256)
-├── Task 1.2: Implement ChaCha20-Poly1305 AEAD framing (CipherConn with 64-bit sequence counters)
-├── Task 1.3: Implement OpenSSH Ed25519 host key loader, generator, and fingerprint calculation
-└── Task 1.4: Implement known_hosts parsing, verification, and TOFU store
+├── [x] Task 1.1: Create internal/crypto/kex package (X25519 key exchange & HKDF-SHA256)
+├── [x] Task 1.2: Implement ChaCha20-Poly1305 AEAD framing (CipherConn with 64-bit sequence counters)
+├── [x] Task 1.3: Implement OpenSSH Ed25519 host key loader, generator, and fingerprint calculation
+└── [x] Task 1.4: Implement known_hosts parsing, verification, and TOFU store
 
 Phase 2: Protocol Framing Updates
-├── Task 2.1: Add TypeKexInit, TypeKexReply, and TypeEncrypted to internal/proto
-├── Task 2.2: Implement binary serialization for KEX payloads
-└── Task 2.3: Add proto unit tests for KEX and Encrypted frame codecs
+├── [x] Task 2.1: Add TypeKexInit, TypeKexReply, and TypeEncrypted to internal/proto
+├── [x] Task 2.2: Implement binary serialization for KEX payloads
+└── [x] Task 2.3: Add proto unit tests for KEX and Encrypted frame codecs
 
 Phase 3: Configuration & CLI Flags
-├── Task 3.1: Add host_key to config.Server and known_hosts/server_fingerprint to config.Client
-├── Task 3.2: Wire CLI flags in cmd/relay/main.go
-└── Task 3.3: Update config tests to validate defaults and overrides
+├── [x] Task 3.1: Add host_key to config.Server and known_hosts/server_fingerprint to config.Client
+├── [x] Task 3.2: Wire CLI flags in cmd/relay/main.go
+└── [x] Task 3.3: Update config tests to validate defaults and overrides
 
 Phase 4: Relay Pipeline Integration (Server & Client)
-├── Task 4.1: Integrate KEX and AEAD control plane into internal/relay/server.go
-├── Task 4.2: Enforce encrypted-only mode on server (drop unencrypted handshakes)
-├── Task 4.3: Integrate KEX and AEAD control plane into internal/relay/client.go
-└── Task 4.4: Implement Option A Clean Phase Cut transition to raw framing for pump.go
+├── [x] Task 4.1: Integrate KEX and AEAD control plane into internal/relay/server.go
+├── [x] Task 4.2: Enforce encrypted-only mode on server (drop unencrypted handshakes)
+├── [x] Task 4.3: Integrate KEX and AEAD control plane into internal/relay/client.go
+└── [x] Task 4.4: Implement Option A Clean Phase Cut transition to raw framing for pump.go
 
 Phase 5: Verification & End-to-End Tests
-├── Task 5.1: Unit tests for KEX transcript validation, invalid signatures, replay attacks
-├── Task 5.2: E2E tests for client-server handshake, known_hosts mismatch rejection, and reconnect
-├── Task 5.3: Packet capture verification (assert zero plaintext strings in tcpdump inspection)
-└── Task 5.4: Update features.md status to Implemented
+├── [x] Task 5.1: Unit tests for KEX transcript validation, invalid signatures, replay attacks
+├── [x] Task 5.2: E2E tests for client-server handshake, known_hosts mismatch rejection, and reconnect
+├── [x] Task 5.3: Packet capture verification (assert zero plaintext strings in tcpdump inspection)
+└── [x] Task 5.4: Update features.md status to Implemented
 ```
 
 ---
 
-## 5. Verification & Test Strategy
+## 5. Verification & Test Results
 
-### 5.1 Unit Tests
+### 5.1 Unit & Concurrency Tests
 1. **`internal/crypto/kex/kex_test.go`**:
-   - `TestKexHandshakeSuccess`: Validates shared secret convergence and matching derived keys.
-   - `TestKexInvalidSignature`: Validates rejection when signature does not match transcript.
-   - `TestAEADSequenceReplay`: Injects out-of-order or duplicate sequence numbers; asserts decryption failure.
-2. **`internal/crypto/kex/hostkey_test.go`**:
-   - `TestHostKeyAutoGeneration`: Tests key generation, file permissions (`0600`), and fingerprint formatting.
-   - `TestKnownHostsVerification`: Tests known host match, mismatch (MITM trigger), and TOFU appending.
+   - `TestKexHandshakeSuccess`: Validates shared secret convergence and matching derived directional keys.
+   - `TestKexInvalidSignature`: Validates rejection when Ed25519 signature does not match transcript.
+   - `TestAEADSequenceReplay`: Validates AEAD decryption rejection on duplicate or out-of-order counter injection.
+   - `TestHostKeyVerification`: Validates match, mismatch (MITM detection), and TOFU appending in `known_hosts`.
+2. **`internal/proto/proto_test.go`**:
+   - Frame codecs for `TypeKexInit` (0x0B), `TypeKexReply` (0x0C), and `TypeEncrypted` (0x0D).
+3. **`internal/relay/sec_test.go`**:
+   - `TestSecE2EEncryptedHandshakeAndDataTransfer`: Full client-server handshake and byte-exact data tunneling.
+   - `TestSecCleartextHelloRejected`: Server returns `proto.CodeProto` ("encrypted handshake required") on raw cleartext `HELLO`.
+   - `TestSecCleartextResumeRejected`: Server returns `proto.CodeProto` on raw cleartext `RESUME`.
+   - `TestSecHostKeyFingerprintValidation`: Matching fingerprint connects; mismatching fingerprint rejects.
+   - `TestSecStrictHostKeyCheckingModes`: Validates `yes` (requires known key), `accept-new` (stores new key), `no` (bypasses).
+   - `TestSecWireEncryptionNoCleartextLeak`: Verifies all tokens/JSON keys are invisible to TCP recording proxy.
+   - `TestSecOptionACleanPhaseCut`: Verifies `TypeData` (0x10) frames are used for post-handshake user payload.
 
-### 5.2 Integration & E2E Tests (`internal/relay/sec_test.go`)
-1. **`TestEncryptedHandshakeEndToEnd`**: Client and server complete handshake and transfer data over TCP.
-2. **`TestEncryptedHandshakeRejectPlaintext`**: Plaintext `HELLO` sent to server is rejected with error.
-3. **`TestHostKeyMismatchAborts`**: Client with outdated `known_hosts` entry rejects server connection immediately.
-4. **`TestPacketInspectionZeroPlaintext`**:
-   - Intercept TCP handshake bytes using a virtual pipe recorder.
-   - Assert that ASCII substrings `"HELLO"`, `"sessionId"`, `"resumeToken"`, and destination strings NEVER appear in the raw bytes.
+### 5.2 Live Linux Dual-Netns Verification Matrix (`test_sec_netns.py`)
+Tests executed live in isolated network namespaces (`ns-srv` <-> `ns-cli` via `veth` pair `10.200.1.0/24`):
+
+| Test ID | Description | Target / Action | Result | Details |
+|:---|:---|:---|:---:|:---|
+| **SEC-01** | E2E OpenSSH Tunnel | 10 MiB payload via `ProxyCommand` | **PASS** | Byte-exact SHA-256 match; server host key recorded to client `known_hosts`. |
+| **SEC-02a**| Host Key Pinning | `--server-fingerprint <actual>` | **PASS** | Handshake verified with pinned SHA-256 fingerprint. |
+| **SEC-02b**| Fingerprint Mismatch | `--server-fingerprint <invalid>` | **PASS** | Mismatched fingerprint rejected immediately with non-zero exit code. |
+| **SEC-02c**| MITM Protection | Altered host key in `known_hosts` | **PASS** | Connection aborted immediately with remote host identification changed error. |
+| **SEC-03** | Plaintext Probe Rejection | Raw `TypeHello` frame over TCP | **PASS** | Server immediately returned `ERR_PROTO` (`encrypted handshake required`). |
+| **SEC-04** | Wire Inspection & Clean Cut | `tcpdump -i veth-cli` packet inspection | **PASS** | 0 cleartext tokens (`sessionId`, `resumeToken`, destinations) detected on wire. |
+

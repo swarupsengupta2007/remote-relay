@@ -25,15 +25,18 @@ const (
 	// AUTH_OK is sent before allocating a session or dialing the destination.
 	// Success is HELLO_OK / RESUME_OK after Verify. Failure is ERR{ERR_AUTH}
 	// after a fixed delay.
-	TypeAuth     Type = 0x09
-	TypeAuthOK   Type = 0x0A
-	TypeData     Type = 0x10
-	TypeAck      Type = 0x11
-	TypeCloseDir Type = 0x12
-	TypeProbe    Type = 0x13
-	TypeProbeOK  Type = 0x14
-	TypePing     Type = 0x15
-	TypePong     Type = 0x16
+	TypeAuth      Type = 0x09
+	TypeAuthOK    Type = 0x0A
+	TypeKexInit   Type = 0x0B
+	TypeKexReply  Type = 0x0C
+	TypeEncrypted Type = 0x0D
+	TypeData      Type = 0x10
+	TypeAck       Type = 0x11
+	TypeCloseDir  Type = 0x12
+	TypeProbe     Type = 0x13
+	TypeProbeOK   Type = 0x14
+	TypePing      Type = 0x15
+	TypePong      Type = 0x16
 )
 
 const (
@@ -46,6 +49,7 @@ func (t Type) Known() bool {
 	switch t {
 	case TypeHello, TypeHelloOK, TypeResume, TypeResumeOK, TypeResumeFail,
 		TypeSwitch, TypeBye, TypeErr, TypeAuth, TypeAuthOK,
+		TypeKexInit, TypeKexReply, TypeEncrypted,
 		TypeData, TypeAck, TypeCloseDir,
 		TypeProbe, TypeProbeOK, TypePing, TypePong:
 		return true
@@ -56,6 +60,12 @@ func (t Type) Known() bool {
 
 func (t Type) String() string {
 	switch t {
+	case TypeKexInit:
+		return "KEX_INIT"
+	case TypeKexReply:
+		return "KEX_REPLY"
+	case TypeEncrypted:
+		return "ENCRYPTED"
 	case TypeHello:
 		return "HELLO"
 	case TypeHelloOK:

@@ -82,28 +82,32 @@ type Server struct {
 	AuthFailDelay      Duration `toml:"auth_fail_delay"`
 	HeartbeatInterval  Duration `toml:"heartbeat_interval"`
 	DeadPeerThreshold  int      `toml:"dead_peer_threshold"`
+	HostKey            string   `toml:"host_key"`
 }
 
 type Client struct {
-	Server              string   `toml:"server"`
-	Destination         string   `toml:"destination"`
-	Transport           string   `toml:"transport"`
-	BufferBytes         int      `toml:"buffer_bytes"`
-	SendWindow          int      `toml:"send_window"`
-	ProbeTimeout        Duration `toml:"probe_timeout"`
-	KeepaliveInterval   Duration `toml:"keepalive_interval"`
-	IdleTimeout         Duration `toml:"idle_timeout"`
-	ReconnectBackoff    []string `toml:"reconnect_backoff"`
-	ReconnectMaxElapsed Duration `toml:"reconnect_max_elapsed"`
-	LogLevel            string   `toml:"log_level"`
-	LogFormat           string   `toml:"log_format"`
-	AuthMethod          string   `toml:"auth_method"`
-	AuthUser            string   `toml:"auth_user"`
-	IdentityFiles       []string `toml:"identity_files"`
-	AllowHA             bool     `toml:"allow_ha"`
-	HAProbeInterval     Duration `toml:"ha_probe_interval"`
-	HeartbeatInterval   Duration `toml:"heartbeat_interval"`
-	DeadPeerThreshold   int      `toml:"dead_peer_threshold"`
+	Server                string   `toml:"server"`
+	Destination           string   `toml:"destination"`
+	Transport             string   `toml:"transport"`
+	BufferBytes           int      `toml:"buffer_bytes"`
+	SendWindow            int      `toml:"send_window"`
+	ProbeTimeout          Duration `toml:"probe_timeout"`
+	KeepaliveInterval     Duration `toml:"keepalive_interval"`
+	IdleTimeout           Duration `toml:"idle_timeout"`
+	ReconnectBackoff      []string `toml:"reconnect_backoff"`
+	ReconnectMaxElapsed   Duration `toml:"reconnect_max_elapsed"`
+	LogLevel              string   `toml:"log_level"`
+	LogFormat             string   `toml:"log_format"`
+	AuthMethod            string   `toml:"auth_method"`
+	AuthUser              string   `toml:"auth_user"`
+	IdentityFiles         []string `toml:"identity_files"`
+	AllowHA               bool     `toml:"allow_ha"`
+	HAProbeInterval       Duration `toml:"ha_probe_interval"`
+	HeartbeatInterval     Duration `toml:"heartbeat_interval"`
+	DeadPeerThreshold     int      `toml:"dead_peer_threshold"`
+	KnownHosts            string   `toml:"known_hosts"`
+	ServerFingerprint     string   `toml:"server_fingerprint"`
+	StrictHostKeyChecking string   `toml:"strict_host_key_checking"`
 }
 
 func DefaultServer() Server {
@@ -133,28 +137,32 @@ func DefaultServer() Server {
 		AuthFailDelay:      Duration(200 * time.Millisecond),
 		HeartbeatInterval:  Duration(750 * time.Millisecond),
 		DeadPeerThreshold:  3,
+		HostKey:            "/etc/relay/ssh_host_ed25519_key",
 	}
 }
 
 func DefaultClient() Client {
 	return Client{
-		Server:              "relay.example.com:7443",
-		Destination:         "",
-		Transport:           "quic",
-		BufferBytes:         67108864,
-		SendWindow:          4194304,
-		ProbeTimeout:        Duration(2 * time.Second),
-		KeepaliveInterval:   Duration(5 * time.Second),
-		IdleTimeout:         Duration(30 * time.Second),
-		ReconnectBackoff:    []string{"100ms", "250ms", "500ms", "1s", "2s", "5s", "10s"},
-		ReconnectMaxElapsed: Duration(5 * time.Minute),
-		LogLevel:            "warn",
-		LogFormat:           "text",
-		AuthMethod:          "none",
-		AllowHA:             false,
-		HAProbeInterval:     Duration(10 * time.Second),
-		HeartbeatInterval:   Duration(750 * time.Millisecond),
-		DeadPeerThreshold:   3,
+		Server:                "relay.example.com:7443",
+		Destination:           "",
+		Transport:             "quic",
+		BufferBytes:           67108864,
+		SendWindow:            4194304,
+		ProbeTimeout:          Duration(2 * time.Second),
+		KeepaliveInterval:     Duration(5 * time.Second),
+		IdleTimeout:           Duration(30 * time.Second),
+		ReconnectBackoff:      []string{"100ms", "250ms", "500ms", "1s", "2s", "5s", "10s"},
+		ReconnectMaxElapsed:   Duration(5 * time.Minute),
+		LogLevel:              "warn",
+		LogFormat:             "text",
+		AuthMethod:            "none",
+		AllowHA:               false,
+		HAProbeInterval:       Duration(10 * time.Second),
+		HeartbeatInterval:     Duration(750 * time.Millisecond),
+		DeadPeerThreshold:     3,
+		KnownHosts:            "",
+		ServerFingerprint:     "",
+		StrictHostKeyChecking: "ask",
 	}
 }
 
@@ -164,22 +172,26 @@ type ServerOptions struct {
 	LogLevel          string
 	HeartbeatInterval time.Duration
 	DeadPeerThreshold int
+	HostKey           string
 }
 
 type ClientOptions struct {
-	ConfigPath        string
-	Server            string
-	Dest              string
-	DestSet           bool
-	TCP               bool
-	KCP               bool
-	AllowHA           bool
-	AllowHASet        bool
-	LogLevel          string
-	PosHost           string
-	PosPort           string
-	HeartbeatInterval time.Duration
-	DeadPeerThreshold int
+	ConfigPath            string
+	Server                string
+	Dest                  string
+	DestSet               bool
+	TCP                   bool
+	KCP                   bool
+	AllowHA               bool
+	AllowHASet            bool
+	LogLevel              string
+	PosHost               string
+	PosPort               string
+	HeartbeatInterval     time.Duration
+	DeadPeerThreshold     int
+	KnownHosts            string
+	ServerFingerprint     string
+	StrictHostKeyChecking string
 }
 
 func LoadServer(opts ServerOptions) (Server, error) {
@@ -202,6 +214,9 @@ func LoadServer(opts ServerOptions) (Server, error) {
 	}
 	if opts.DeadPeerThreshold > 0 {
 		cfg.DeadPeerThreshold = opts.DeadPeerThreshold
+	}
+	if opts.HostKey != "" {
+		cfg.HostKey = opts.HostKey
 	}
 	if err := cfg.Validate(); err != nil {
 		return Server{}, err
@@ -252,6 +267,15 @@ func LoadClient(opts ClientOptions) (Client, error) {
 	}
 	if opts.DeadPeerThreshold > 0 {
 		cfg.DeadPeerThreshold = opts.DeadPeerThreshold
+	}
+	if opts.KnownHosts != "" {
+		cfg.KnownHosts = opts.KnownHosts
+	}
+	if opts.ServerFingerprint != "" {
+		cfg.ServerFingerprint = opts.ServerFingerprint
+	}
+	if opts.StrictHostKeyChecking != "" {
+		cfg.StrictHostKeyChecking = opts.StrictHostKeyChecking
 	}
 	if err := cfg.Validate(); err != nil {
 		return Client{}, err

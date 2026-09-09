@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -19,6 +20,7 @@ import (
 	"github.com/remote-relay/relay/internal/auth"
 	"github.com/remote-relay/relay/internal/bfd"
 	"github.com/remote-relay/relay/internal/config"
+	"github.com/remote-relay/relay/internal/crypto/kex"
 	"github.com/remote-relay/relay/internal/logging"
 	"github.com/remote-relay/relay/internal/proto"
 	"github.com/remote-relay/relay/internal/session"
@@ -293,15 +295,58 @@ func clientHello(ctx context.Context, cfg config.Client) (transport.Conn, proto.
 	if err != nil {
 		return nil, none, fmt.Errorf("dial server: %w", err)
 	}
+
+	// 1. KEX Handshake
+	kexCli, err := kex.NewClientSession()
+	if err != nil {
+		_ = conn.Close()
+		return nil, none, fmt.Errorf("kex new client session: %w", err)
+	}
+	if err := conn.SetDeadline(deadlineOr(ctx, handshakeTimeout)); err != nil {
+		_ = conn.Close()
+		return nil, none, err
+	}
+	if err := conn.WriteFrame(proto.Frame{Type: proto.TypeKexInit, Payload: kexCli.InitPayload()}); err != nil {
+		_ = conn.Close()
+		return nil, none, fmt.Errorf("send KEX_INIT: %w", err)
+	}
+	reply, err := conn.ReadFrame()
+	_ = conn.SetDeadline(time.Time{})
+	if err != nil {
+		_ = conn.Close()
+		return nil, none, fmt.Errorf("read KEX_REPLY: %w", err)
+	}
+	if reply.Type != proto.TypeKexReply {
+		_ = conn.Close()
+		return nil, none, proto.NewError(proto.CodeProto, "expected KEX_REPLY, got "+reply.Type.String())
+	}
+
+	verifyHostKey := func(pub ed25519.PublicKey) error {
+		return kex.VerifyKnownHosts(cfg.KnownHosts, cfg.Server, pub, cfg.ServerFingerprint, cfg.StrictHostKeyChecking)
+	}
+	c2sKey, s2cKey, err := kexCli.ProcessReply(reply.Payload, verifyHostKey)
+	if err != nil {
+		_ = conn.Close()
+		return nil, none, fmt.Errorf("kex verify reply: %w", err)
+	}
+
+	// 2. Wrap in CipherConn (client: send c2sKey, recv s2cKey)
+	cipherConn, err := kex.NewCipherConn(conn, c2sKey, s2cKey)
+	if err != nil {
+		_ = conn.Close()
+		return nil, none, fmt.Errorf("create cipher conn: %w", err)
+	}
+
+	// 3. Send encrypted HELLO, complete auth, read encrypted HELLO_OK
 	a := clientAuth(cfg)
 	nonce, err := proto.RandomNonce()
 	if err != nil {
-		_ = conn.Close()
+		_ = cipherConn.Close()
 		return nil, none, err
 	}
 	authMsg, err := a.Respond(auth.Challenge{Destination: cfg.Destination, ClientNonce: nonce})
 	if err != nil {
-		_ = conn.Close()
+		_ = cipherConn.Close()
 		return nil, none, err
 	}
 	hello := proto.Hello{
@@ -316,24 +361,24 @@ func clientHello(ctx context.Context, cfg config.Client) (transport.Conn, proto.
 	}
 	fr, err := proto.MarshalFrame(proto.TypeHello, hello)
 	if err != nil {
-		_ = conn.Close()
+		_ = cipherConn.Close()
 		return nil, none, err
 	}
-	if err := conn.SetDeadline(deadlineOr(ctx, handshakeTimeout)); err != nil {
-		_ = conn.Close()
+	if err := cipherConn.SetDeadline(deadlineOr(ctx, handshakeTimeout)); err != nil {
+		_ = cipherConn.Close()
 		return nil, none, err
 	}
-	if err := conn.WriteFrame(fr); err != nil {
-		_ = conn.Close()
+	if err := cipherConn.WriteFrame(fr); err != nil {
+		_ = cipherConn.Close()
 		return nil, none, fmt.Errorf("send HELLO: %w", err)
 	}
-	if err := conn.SetDeadline(deadlineOr(ctx, handshakeTimeout+config.DefaultServer().DialTimeout.Duration())); err != nil {
-		_ = conn.Close()
+	if err := cipherConn.SetDeadline(deadlineOr(ctx, handshakeTimeout+config.DefaultServer().DialTimeout.Duration())); err != nil {
+		_ = cipherConn.Close()
 		return nil, none, err
 	}
-	reply, err := conn.ReadFrame()
+	reply, err = cipherConn.ReadFrame()
 	if err != nil {
-		_ = conn.Close()
+		_ = cipherConn.Close()
 		return nil, none, fmt.Errorf("read HELLO_OK: %w", err)
 	}
 	if reply.Type == proto.TypeAuthOK {
@@ -343,37 +388,38 @@ func clientHello(ctx context.Context, cfg config.Client) (transport.Conn, proto.
 			Canonical:   fr.Payload,
 			Offer:       authMsg,
 		}
-		if err := completeClientAuth(conn, a, ch, reply); err != nil {
-			_ = conn.Close()
+		if err := completeClientAuth(cipherConn, a, ch, reply); err != nil {
+			_ = cipherConn.Close()
 			return nil, none, err
 		}
-		reply, err = conn.ReadFrame()
+		reply, err = cipherConn.ReadFrame()
 		if err != nil {
-			_ = conn.Close()
+			_ = cipherConn.Close()
 			return nil, none, fmt.Errorf("read HELLO_OK: %w", err)
 		}
 	}
-	_ = conn.SetDeadline(time.Time{})
+	_ = cipherConn.SetDeadline(time.Time{})
 	if reply.Type == proto.TypeErr {
-		_ = conn.Close()
+		_ = cipherConn.Close()
 		var fail proto.Fail
 		_ = proto.UnmarshalPayload(reply, &fail)
 		return nil, none, proto.NewError(fail.Code, fail.Msg)
 	}
 	if reply.Type != proto.TypeHelloOK {
-		_ = conn.Close()
+		_ = cipherConn.Close()
 		return nil, none, proto.NewError(proto.CodeProto, "expected HELLO_OK, got "+reply.Type.String())
 	}
 	var ok proto.HelloOK
 	if err := proto.UnmarshalPayload(reply, &ok); err != nil {
-		_ = conn.Close()
+		_ = cipherConn.Close()
 		return nil, none, err
 	}
 	if ok.V != 1 {
-		_ = conn.Close()
+		_ = cipherConn.Close()
 		return nil, none, proto.ErrVersion
 	}
-	return conn, ok, nil
+	// Option A Clean Phase Cut: return the unencrypted underlying conn
+	return cipherConn.Underlying(), ok, nil
 }
 
 func completeClientAuth(conn transport.Conn, a auth.Authenticator, ch auth.Challenge, reply proto.Frame) error {

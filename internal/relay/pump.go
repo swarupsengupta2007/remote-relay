@@ -7,11 +7,13 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/remote-relay/relay/internal/bfd"
+	"github.com/remote-relay/relay/internal/crypto/kex"
 	"github.com/remote-relay/relay/internal/proto"
 	"github.com/remote-relay/relay/internal/session"
 	"github.com/remote-relay/relay/internal/transport"
@@ -426,6 +428,9 @@ func reconnectable(err error) bool {
 		return false
 	}
 	if errors.Is(err, errByeSent) || errors.Is(err, errByeReceived) {
+		return false
+	}
+	if errors.Is(err, kex.ErrHostKey) || strings.Contains(err.Error(), "kex:") || strings.Contains(err.Error(), "host key") {
 		return false
 	}
 	var ne net.Error
