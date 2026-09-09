@@ -80,6 +80,8 @@ type Server struct {
 	AuthMethod         string   `toml:"auth_method"`
 	AuthorizedKeys     string   `toml:"authorized_keys"`
 	AuthFailDelay      Duration `toml:"auth_fail_delay"`
+	HeartbeatInterval  Duration `toml:"heartbeat_interval"`
+	DeadPeerThreshold  int      `toml:"dead_peer_threshold"`
 }
 
 type Client struct {
@@ -100,6 +102,8 @@ type Client struct {
 	IdentityFiles       []string `toml:"identity_files"`
 	AllowHA             bool     `toml:"allow_ha"`
 	HAProbeInterval     Duration `toml:"ha_probe_interval"`
+	HeartbeatInterval   Duration `toml:"heartbeat_interval"`
+	DeadPeerThreshold   int      `toml:"dead_peer_threshold"`
 }
 
 func DefaultServer() Server {
@@ -127,6 +131,8 @@ func DefaultServer() Server {
 		LogFormat:          "text",
 		AuthMethod:         "none",
 		AuthFailDelay:      Duration(200 * time.Millisecond),
+		HeartbeatInterval:  Duration(750 * time.Millisecond),
+		DeadPeerThreshold:  3,
 	}
 }
 
@@ -147,27 +153,33 @@ func DefaultClient() Client {
 		AuthMethod:          "none",
 		AllowHA:             false,
 		HAProbeInterval:     Duration(10 * time.Second),
+		HeartbeatInterval:   Duration(750 * time.Millisecond),
+		DeadPeerThreshold:   3,
 	}
 }
 
 type ServerOptions struct {
-	ConfigPath string
-	Listen     string
-	LogLevel   string
+	ConfigPath        string
+	Listen            string
+	LogLevel          string
+	HeartbeatInterval time.Duration
+	DeadPeerThreshold int
 }
 
 type ClientOptions struct {
-	ConfigPath string
-	Server     string
-	Dest       string
-	DestSet    bool
-	TCP        bool
-	KCP        bool
-	AllowHA    bool
-	AllowHASet bool
-	LogLevel   string
-	PosHost    string
-	PosPort    string
+	ConfigPath        string
+	Server            string
+	Dest              string
+	DestSet           bool
+	TCP               bool
+	KCP               bool
+	AllowHA           bool
+	AllowHASet        bool
+	LogLevel          string
+	PosHost           string
+	PosPort           string
+	HeartbeatInterval time.Duration
+	DeadPeerThreshold int
 }
 
 func LoadServer(opts ServerOptions) (Server, error) {
@@ -184,6 +196,12 @@ func LoadServer(opts ServerOptions) (Server, error) {
 	}
 	if opts.LogLevel != "" {
 		cfg.LogLevel = opts.LogLevel
+	}
+	if opts.HeartbeatInterval > 0 {
+		cfg.HeartbeatInterval = Duration(opts.HeartbeatInterval)
+	}
+	if opts.DeadPeerThreshold > 0 {
+		cfg.DeadPeerThreshold = opts.DeadPeerThreshold
 	}
 	if err := cfg.Validate(); err != nil {
 		return Server{}, err
@@ -228,6 +246,12 @@ func LoadClient(opts ClientOptions) (Client, error) {
 	}
 	if opts.LogLevel != "" {
 		cfg.LogLevel = opts.LogLevel
+	}
+	if opts.HeartbeatInterval > 0 {
+		cfg.HeartbeatInterval = Duration(opts.HeartbeatInterval)
+	}
+	if opts.DeadPeerThreshold > 0 {
+		cfg.DeadPeerThreshold = opts.DeadPeerThreshold
 	}
 	if err := cfg.Validate(); err != nil {
 		return Client{}, err
@@ -299,6 +323,12 @@ func (s Server) Validate() error {
 	if err := validAuthMethod(s.AuthMethod); err != nil {
 		return err
 	}
+	if s.HeartbeatInterval <= 0 {
+		return fmt.Errorf("heartbeat_interval must be positive")
+	}
+	if s.DeadPeerThreshold <= 0 {
+		return fmt.Errorf("dead_peer_threshold must be positive")
+	}
 	return nil
 }
 
@@ -328,6 +358,12 @@ func (c Client) Validate() error {
 	}
 	if strings.ToLower(strings.TrimSpace(c.Transport)) == "tcp" && c.AllowHA {
 		return fmt.Errorf("--allow-ha cannot be used with tcp transport")
+	}
+	if c.HeartbeatInterval <= 0 {
+		return fmt.Errorf("heartbeat_interval must be positive")
+	}
+	if c.DeadPeerThreshold <= 0 {
+		return fmt.Errorf("dead_peer_threshold must be positive")
 	}
 	return nil
 }

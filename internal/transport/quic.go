@@ -157,6 +157,10 @@ func (c *quicConn) Close() error {
 	return nil
 }
 
+func (c *quicConn) ResetReader() {
+	c.br.Reset(c.st)
+}
+
 func ParseProbeToken(s string) ([16]byte, bool) {
 	var tok [16]byte
 	raw, err := base64.StdEncoding.DecodeString(s)

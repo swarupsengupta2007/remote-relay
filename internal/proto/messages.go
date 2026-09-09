@@ -35,6 +35,7 @@ type Resume struct {
 	DownAcked   uint64          `json:"downAcked"`
 	ClientNonce string          `json:"clientNonce"`
 	Auth        json.RawMessage `json:"auth,omitempty"`
+	Role        string          `json:"role,omitempty"`
 }
 
 // Auth is C→S TypeAuth: the signature over the AUTH_OK challenge.
@@ -61,6 +62,7 @@ type ResumeOK struct {
 	Transport   string       `json:"transport"`
 	UDP         *UdpInfo     `json:"udp"`
 	Limits      Limits       `json:"limits"`
+	Role        string       `json:"role,omitempty"`
 }
 
 type SessionState struct {

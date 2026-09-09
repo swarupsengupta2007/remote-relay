@@ -57,6 +57,8 @@ func runServer(args []string) int {
 	configPath := fs.String("config", "", "path to server TOML config")
 	listen := fs.String("listen", "", "TCP listen address (overrides config)")
 	logLevel := fs.String("log-level", "", "log level")
+	heartbeat := fs.Duration("heartbeat-interval", 0, "BFD heartbeat interval (default: 750ms)")
+	deadThreshold := fs.Int("dead-peer-threshold", 0, "BFD dead peer missed heartbeat threshold (default: 3)")
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return 0
@@ -64,9 +66,11 @@ func runServer(args []string) int {
 		return 2
 	}
 	cfg, err := config.LoadServer(config.ServerOptions{
-		ConfigPath: *configPath,
-		Listen:     *listen,
-		LogLevel:   *logLevel,
+		ConfigPath:        *configPath,
+		Listen:            *listen,
+		LogLevel:          *logLevel,
+		HeartbeatInterval: *heartbeat,
+		DeadPeerThreshold: *deadThreshold,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "relay server: %v\n", err)
@@ -93,6 +97,8 @@ func runClient(args []string) int {
 	kcp := fs.Bool("kcp", false, "use KCP data plane")
 	allowHA := fs.Bool("allow-ha", false, "allow HA dual-path failover (UDP > TCP)")
 	logLevel := fs.String("log-level", "", "log level")
+	heartbeat := fs.Duration("heartbeat-interval", 0, "BFD heartbeat interval (default: 750ms)")
+	deadThreshold := fs.Int("dead-peer-threshold", 0, "BFD dead peer missed heartbeat threshold (default: 3)")
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return 0
@@ -135,17 +141,19 @@ func runClient(args []string) int {
 	}
 
 	cfg, err := config.LoadClient(config.ClientOptions{
-		ConfigPath: *configPath,
-		Server:     *server,
-		Dest:       *dest,
-		DestSet:    destSet,
-		TCP:        *tcp,
-		KCP:        *kcp,
-		AllowHA:    *allowHA,
-		AllowHASet: allowHASet,
-		LogLevel:   *logLevel,
-		PosHost:    posHost,
-		PosPort:    posPort,
+		ConfigPath:        *configPath,
+		Server:            *server,
+		Dest:              *dest,
+		DestSet:           destSet,
+		TCP:               *tcp,
+		KCP:               *kcp,
+		AllowHA:           *allowHA,
+		AllowHASet:        allowHASet,
+		LogLevel:          *logLevel,
+		PosHost:           posHost,
+		PosPort:           posPort,
+		HeartbeatInterval: *heartbeat,
+		DeadPeerThreshold: *deadThreshold,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "relay client: %v\n", err)

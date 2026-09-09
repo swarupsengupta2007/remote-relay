@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/remote-relay/relay/internal/auth"
+	"github.com/remote-relay/relay/internal/bfd"
 	"github.com/remote-relay/relay/internal/config"
 	"github.com/remote-relay/relay/internal/logging"
 	"github.com/remote-relay/relay/internal/proto"
@@ -367,6 +368,8 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 		keepalive:     s.cfg.KeepaliveInterval.Duration(),
 		idle:          s.cfg.IdleTimeout.Duration(),
 		switchTimeout: s.cfg.SwitchTimeout.Duration(),
+		heartbeat:     s.cfg.HeartbeatInterval.Duration(),
+		deadThreshold: s.cfg.DeadPeerThreshold,
 		log:           log,
 	}, sendLog)
 
@@ -441,7 +444,25 @@ func (s *Server) handleResume(ctx context.Context, conn transport.Conn, f proto.
 	if !s.resumeAuth(conn, msg, f.Payload) {
 		return
 	}
-	req := attachReq{conn: conn, resume: &msg, done: make(chan error, 1)}
+	isStandby := msg.Role == "standby"
+	req := attachReq{conn: conn, resume: &msg, standby: isStandby, done: make(chan error, 1)}
+	if isStandby {
+		if err := l.AttachStandby(req); err != nil {
+			var pe *proto.Error
+			if errors.As(err, &pe) {
+				writeResumeFail(conn, pe.Code, pe.Msg)
+				return
+			}
+			writeResumeFail(conn, proto.CodeExpired, "session closed")
+			return
+		}
+		select {
+		case <-req.done:
+		case <-ctx.Done():
+		}
+		return
+	}
+
 	if err := l.Offer(req); err != nil {
 		var pe *proto.Error
 		if errors.As(err, &pe) {
@@ -458,9 +479,10 @@ func (s *Server) handleResume(ctx context.Context, conn transport.Conn, f proto.
 }
 
 type attachReq struct {
-	conn   transport.Conn
-	resume *proto.Resume
-	done   chan error
+	conn    transport.Conn
+	resume  *proto.Resume
+	standby bool
+	done    chan error
 }
 
 type live struct {
@@ -477,6 +499,15 @@ type live struct {
 	releaseHelloTCP func()
 	attachCh        chan attachReq
 	deadCh          chan struct{}
+
+	standbyMu           sync.Mutex
+	standbyConn         transport.Conn
+	standbyBFD          *bfd.Session
+	standbyStop         context.CancelFunc
+	standbyPromote      chan struct{}
+	standbyPromotedDone chan struct{}
+	standbyDone         chan error
+	standbyPrefetched   []proto.Frame
 
 	mu       sync.Mutex
 	heldAt   time.Time
@@ -566,6 +597,246 @@ func (l *live) Offer(req attachReq) error {
 	}
 }
 
+func (l *live) AttachStandby(req attachReq) error {
+	select {
+	case <-l.deadCh:
+		return proto.ErrExpired
+	case <-l.sessCtx.Done():
+		return proto.ErrExpired
+	default:
+	}
+
+	l.standbyMu.Lock()
+	defer l.standbyMu.Unlock()
+
+	if l.standbyStop != nil {
+		l.standbyStop()
+		if l.standbyConn != nil {
+			_ = l.standbyConn.Close()
+		}
+		l.standbyConn = nil
+		l.standbyBFD = nil
+		l.standbyStop = nil
+		l.standbyPromote = nil
+	}
+
+	heldMs := 0
+	l.mu.Lock()
+	if !l.heldAt.IsZero() {
+		heldMs = int(time.Since(l.heldAt).Milliseconds())
+		if heldMs < 0 {
+			heldMs = 0
+		}
+	}
+	l.mu.Unlock()
+
+	if err := l.writeResumeOK(req, heldMs); err != nil {
+		_ = req.conn.Close()
+		select {
+		case req.done <- err:
+		default:
+		}
+		return err
+	}
+
+	bfdCfg := bfd.Config{
+		DesiredMinTxInterval:  l.cfg.HeartbeatInterval.Duration(),
+		RequiredMinRxInterval: l.cfg.HeartbeatInterval.Duration(),
+		DetectMultiplier:      uint8(l.cfg.DeadPeerThreshold),
+	}
+	bfdSess, err := bfd.NewSession(bfdCfg)
+	if err != nil {
+		_ = req.conn.Close()
+		select {
+		case req.done <- err:
+		default:
+		}
+		return err
+	}
+
+	standbyCtx, standbyCancel := context.WithCancel(l.sessCtx)
+	promoteCh := make(chan struct{})
+	promotedDone := make(chan struct{})
+
+	l.standbyConn = req.conn
+	l.standbyBFD = bfdSess
+	l.standbyStop = standbyCancel
+	l.standbyPromote = promoteCh
+	l.standbyPromotedDone = promotedDone
+	l.standbyDone = req.done
+
+	l.notePath(req.conn)
+	l.log.Info("standby connection attached", "transport", req.conn.Kind().String(), "peer", req.conn.RemoteAddr().String())
+
+	go l.runStandby(standbyCtx, req.conn, bfdSess, promoteCh, promotedDone, req.done)
+	return nil
+}
+
+func (l *live) runStandby(ctx context.Context, conn transport.Conn, sess *bfd.Session, promoteCh, promotedDone chan struct{}, done chan error) {
+	errc := make(chan error, 2)
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+
+	var wg sync.WaitGroup
+	var prefetchedMu sync.Mutex
+	var prefetched []proto.Frame
+
+	wg.Add(2)
+	// Standby BFD reader
+	go func() {
+		defer wg.Done()
+		for {
+			f, err := conn.ReadFrame()
+			if err != nil {
+				if runCtx.Err() != nil {
+					return
+				}
+				select {
+				case errc <- err:
+				default:
+				}
+				runCancel()
+				return
+			}
+			if f.Type == proto.TypePing {
+				pkt, perr := bfd.DecodePacket(f.Payload)
+				if perr == nil {
+					_, _ = sess.Receive(pkt)
+				}
+				continue
+			}
+
+			// Non-ping frame received on standby connection: the peer has switched to this carrier!
+			prefetchedMu.Lock()
+			prefetched = append(prefetched, f)
+			prefetchedMu.Unlock()
+
+			l.dropConn()
+			runCancel()
+			return
+		}
+	}()
+
+	// Standby BFD timer
+	go func() {
+		defer wg.Done()
+		cadence := sess.TxInterval()
+		if cadence <= 0 {
+			cadence = 750 * time.Millisecond
+		}
+		t := time.NewTicker(cadence)
+		defer t.Stop()
+
+		for {
+			select {
+			case <-runCtx.Done():
+				return
+			case now := <-t.C:
+				if sess.CheckTimeout(now) {
+					select {
+					case errc <- ErrDeadPeer:
+					default:
+					}
+					runCancel()
+					return
+				}
+				newCadence := sess.TxInterval()
+				if newCadence > 0 && newCadence != cadence {
+					cadence = newCadence
+					t.Reset(cadence)
+				}
+				pkt := sess.FormatTxPacket()
+				payload := bfd.EncodePacket(pkt)
+				if err := conn.WriteFrame(proto.Frame{Type: proto.TypePing, Payload: payload}); err != nil {
+					if runCtx.Err() != nil {
+						return
+					}
+					select {
+					case errc <- err:
+					default:
+					}
+					runCancel()
+					return
+				}
+			}
+		}
+	}()
+
+	select {
+	case <-promoteCh:
+		runCancel()
+		_ = conn.SetDeadline(time.Now())
+		wg.Wait()
+		_ = conn.SetDeadline(time.Time{})
+		conn.ResetReader()
+		l.standbyMu.Lock()
+		prefetchedMu.Lock()
+		l.standbyPrefetched = append(l.standbyPrefetched, prefetched...)
+		prefetchedMu.Unlock()
+		l.standbyMu.Unlock()
+		close(promotedDone)
+		l.log.Info("standby connection promoted; yielding to active runner")
+		return
+	case <-ctx.Done():
+		_ = conn.Close()
+		select {
+		case done <- ctx.Err():
+		default:
+		}
+	case err := <-errc:
+		_ = conn.Close()
+		l.log.Info("standby connection dropped", "err", err)
+		select {
+		case done <- err:
+		default:
+		}
+	}
+
+	l.standbyMu.Lock()
+	if l.standbyConn == conn {
+		l.standbyConn = nil
+		l.standbyBFD = nil
+		l.standbyStop = nil
+		l.standbyPromote = nil
+		l.standbyPromotedDone = nil
+		l.standbyDone = nil
+	}
+	l.standbyMu.Unlock()
+}
+
+func (l *live) takeStandbyForPromotion() (transport.Conn, *bfd.Session, []proto.Frame, chan error, bool) {
+	l.standbyMu.Lock()
+	if l.standbyConn == nil || l.standbyBFD == nil || !l.standbyBFD.IsUp() {
+		l.standbyMu.Unlock()
+		return nil, nil, nil, nil, false
+	}
+
+	conn := l.standbyConn
+	sess := l.standbyBFD
+	doneCh := l.standbyDone
+	promoteCh := l.standbyPromote
+	promotedDone := l.standbyPromotedDone
+	l.standbyConn = nil
+	l.standbyDone = nil
+	l.standbyBFD = nil
+	l.standbyStop = nil
+	l.standbyPromote = nil
+	l.standbyPromotedDone = nil
+	l.standbyMu.Unlock()
+
+	if promoteCh != nil {
+		close(promoteCh)
+		<-promotedDone
+	}
+
+	l.standbyMu.Lock()
+	prefetched := l.standbyPrefetched
+	l.standbyPrefetched = nil
+	l.standbyMu.Unlock()
+
+	return conn, sess, prefetched, doneCh, true
+}
+
 func (l *live) run(ctx context.Context, first transport.Conn) {
 	l.startIO()
 	l.notePath(first)
@@ -575,6 +846,19 @@ func (l *live) run(ctx context.Context, first transport.Conn) {
 		l.releaseHelloTCP = nil
 	}
 	for reconnectable(err) && ctx.Err() == nil && l.sessionErr() == nil {
+		if promotedConn, bfdSess, prefetched, doneCh, ok := l.takeStandbyForPromotion(); ok {
+			l.log.Info("standby connection promoted to active carrier", "transport", promotedConn.Kind().String())
+			l.notePath(promotedConn)
+			err = l.serveConnWithBFD(l.sessCtx, promotedConn, l.ack.Get(), bfdSess, prefetched)
+			if doneCh != nil {
+				select {
+				case doneCh <- err:
+				default:
+				}
+			}
+			continue
+		}
+
 		req, ok := l.holdWait(ctx)
 		if !ok {
 			return
@@ -669,9 +953,15 @@ func (l *live) heldMs() int {
 }
 
 func (l *live) writeResumeOK(req attachReq, heldMs int) error {
-	token, err := l.store.ResumeToken(l.id)
-	if err != nil {
-		return err
+	var token string
+	if req.resume != nil && req.resume.Role == "standby" {
+		token = req.resume.ResumeToken
+	} else {
+		var err error
+		token, err = l.store.ResumeToken(l.id)
+		if err != nil {
+			return err
+		}
 	}
 	pref := []string{"quic", "kcp"}
 	if req.resume != nil && len(req.resume.Transport) > 0 {
@@ -702,6 +992,7 @@ func (l *live) writeResumeOK(req attachReq, heldMs int) error {
 		},
 		Transport: selected,
 		UDP:       udp,
+		Role:      req.resume.Role,
 		Limits: proto.Limits{
 			BufferBytes:     l.sendLog.Cap(),
 			HoldTimeoutMs:   int(l.holdTimeout / time.Millisecond),
@@ -738,6 +1029,18 @@ func (l *live) cleanup(expired bool) {
 			l.srv.decIPSess(ip)
 		}
 	}
+	l.standbyMu.Lock()
+	if l.standbyStop != nil {
+		l.standbyStop()
+	}
+	if l.standbyConn != nil {
+		_ = l.standbyConn.Close()
+		l.standbyConn = nil
+	}
+	l.standbyBFD = nil
+	l.standbyStop = nil
+	l.standbyPromote = nil
+	l.standbyMu.Unlock()
 	if l.dest != nil {
 		_ = l.dest.Close()
 	}
@@ -932,4 +1235,37 @@ func bytesOrEmpty(raw json.RawMessage) []byte {
 		return []byte("{}")
 	}
 	return raw
+}
+
+func (s *Server) dropStandbyConns() {
+	s.livesMu.Lock()
+	lives := make([]*live, 0, len(s.lives))
+	for _, l := range s.lives {
+		lives = append(lives, l)
+	}
+	s.livesMu.Unlock()
+	for _, l := range lives {
+		l.standbyMu.Lock()
+		if l.standbyStop != nil {
+			l.standbyStop()
+		}
+		if l.standbyConn != nil {
+			_ = l.standbyConn.Close()
+		}
+		l.standbyMu.Unlock()
+	}
+}
+
+func (s *Server) hasStandby() bool {
+	s.livesMu.Lock()
+	defer s.livesMu.Unlock()
+	for _, l := range s.lives {
+		l.standbyMu.Lock()
+		has := l.standbyConn != nil && l.standbyBFD != nil && l.standbyBFD.IsUp()
+		l.standbyMu.Unlock()
+		if has {
+			return true
+		}
+	}
+	return false
 }

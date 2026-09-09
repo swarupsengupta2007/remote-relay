@@ -268,19 +268,28 @@ func tryUpgrade(ctx context.Context, p *pump, cfg config.Client, tcpConn transpo
 }
 
 func writeResumeOn(ctx context.Context, conn transport.Conn, cfg config.Client, sessionID, token string, downAcked uint64) (proto.ResumeOK, error) {
+	return writeResumeRole(ctx, conn, cfg, sessionID, token, downAcked, "")
+}
+
+func writeResumeRole(ctx context.Context, conn transport.Conn, cfg config.Client, sessionID, token string, downAcked uint64, role string) (proto.ResumeOK, error) {
 	var none proto.ResumeOK
 	nonce, err := proto.RandomNonce()
 	if err != nil {
 		return none, err
 	}
 	a := clientAuth(cfg)
+	trans := cfg.TransportPreference()
+	if role == "standby" {
+		trans = []string{"tcp"}
+	}
 	msg := proto.Resume{
 		V:           1,
 		SessionID:   sessionID,
 		ResumeToken: token,
-		Transport:   cfg.TransportPreference(),
+		Transport:   trans,
 		DownAcked:   downAcked,
 		ClientNonce: nonce,
+		Role:        role,
 	}
 	if a.RequiresChallenge() {
 		offer, err := a.Respond(auth.Challenge{Destination: cfg.Destination, ClientNonce: nonce})

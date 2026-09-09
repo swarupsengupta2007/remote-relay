@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/remote-relay/relay/internal/auth"
+	"github.com/remote-relay/relay/internal/bfd"
 	"github.com/remote-relay/relay/internal/config"
 	"github.com/remote-relay/relay/internal/logging"
 	"github.com/remote-relay/relay/internal/proto"
@@ -109,6 +110,8 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 		keepalive:     keepalive,
 		idle:          idle,
 		switchTimeout: st,
+		heartbeat:     cfg.HeartbeatInterval.Duration(),
+		deadThreshold: cfg.DeadPeerThreshold,
 		log:           log,
 	}, sendLog)
 	p.startIO()
@@ -139,9 +142,19 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 		}
 	}
 
+	var standbyMgr *standbyManager
+	if cfg.AllowHA {
+		standbyMgr = newStandbyManager(ctx, cfg, log, sessionID, token, p)
+		defer standbyMgr.stop()
+	}
+
+	var currentBFD *bfd.Session
+
 	for {
 		upgCh, upgCancel := startUpgrade(ctx, p, cfg, current, sessionID, token, target, udp, log)
-		err = p.serveConn(p.sessCtx, current, sendFrom)
+		bfdToUse := currentBFD
+		currentBFD = nil
+		err = p.serveConnWithBFD(p.sessCtx, current, sendFrom, bfdToUse, nil)
 		upg := takeUpgrade(upgCh, upgCancel, p)
 		if upg.conn != nil {
 			if udpHold != nil {
@@ -162,6 +175,10 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 			}
 			p.sendLog.AdvanceTo(sendFrom)
 			log.Info("path upgraded", "transport", current.Kind().String())
+			if standbyMgr != nil {
+				standbyMgr.updateToken(token)
+				standbyMgr.start()
+			}
 			continue
 		}
 		if upg.hold != nil {
@@ -173,6 +190,18 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 		}
 		if !reconnectable(err) {
 			return p.classify(err)
+		}
+
+		// In HA mode, check if warm standby channel is ready for instant zero-latency promotion
+		if standbyMgr != nil {
+			if promotedConn, bfdSess, ok := standbyMgr.takeForPromotion(); ok {
+				log.Info("standby connection promoted to active carrier", "transport", promotedConn.Kind().String())
+				current = promotedConn
+				currentBFD = bfdSess
+				token = standbyMgr.getToken()
+				sendFrom = p.ack.Get()
+				continue
+			}
 		}
 
 		deadline := time.Now().Add(maxElapsed)
@@ -194,6 +223,9 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 				continue
 			}
 			token = rok.ResumeToken
+			if standbyMgr != nil {
+				standbyMgr.updateToken(token)
+			}
 			udp = rok.UDP
 			if rok.Transport != "" {
 				target = rok.Transport
@@ -375,12 +407,16 @@ func completeClientAuth(conn transport.Conn, a auth.Authenticator, ch auth.Chall
 }
 
 func clientResume(ctx context.Context, cfg config.Client, sessionID, token string, downAcked uint64) (transport.Conn, proto.ResumeOK, error) {
+	return clientResumeRole(ctx, cfg, sessionID, token, downAcked, "")
+}
+
+func clientResumeRole(ctx context.Context, cfg config.Client, sessionID, token string, downAcked uint64, role string) (transport.Conn, proto.ResumeOK, error) {
 	var none proto.ResumeOK
 	conn, err := transport.DialTCP(ctx, cfg.Server)
 	if err != nil {
 		return nil, none, err
 	}
-	ok, err := writeResumeOn(ctx, conn, cfg, sessionID, token, downAcked)
+	ok, err := writeResumeRole(ctx, conn, cfg, sessionID, token, downAcked, role)
 	if err != nil {
 		_ = conn.Close()
 		return nil, none, err

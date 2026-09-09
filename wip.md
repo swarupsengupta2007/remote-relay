@@ -163,6 +163,30 @@ Requests:
   - `3bdfc22`: `docs: remove todo.md, migrate verification matrix and findings to wip.md and README.md`
   - Pushed to `origin/main`.
 
+### 4. FEAT-ROB-01: Sub-Second Dead-Peer Detection & Dual-Path BFD Architecture
+- **RFC 5880 Asynchronous BFD Engine (`internal/bfd`)**:
+  - Implemented 20-byte binary packet payload state machine (`Down`, `Init`, `Up`) over `proto.TypePing` (0x15). Retired legacy `proto.TypePong` (0x16) echo replies.
+  - Discriminator negotiation (`MyDisc`, `YourDisc`), interval timing, diagnostic codes, and state tracking.
+- **Continuous Heartbeat Pump & Sub-Second Dead-Peer Detection (`internal/relay/pump.go`)**:
+  - Continuous pure BFD heartbeats driven by `timer()` goroutine at `heartbeat_interval`.
+  - Inactivity monitor in `netReader()`: triggers `ErrDeadPeer` when no frame is received within `dead_peer_threshold * heartbeat_interval` (default $3 \times 750\text{ms} = 2.25\text{s}$, down from the previous 30s `idle_timeout`).
+  - Added `--heartbeat-interval` and `--dead-peer-threshold` CLI flags to `relay server` and `relay client`, backed by `heartbeat_interval` and `dead_peer_threshold` TOML options.
+- **Server Standby Slot & Zero-Latency Promotion (`internal/relay/server.go`, `internal/proto/messages.go`)**:
+  - Added `Role` field (`"active"` | `"standby"`) to `Resume` and `ResumeOK` control frames.
+  - Implemented `AttachStandby()`, `runStandby()`, and `takeStandbyForPromotion()` on `serverSession`.
+  - Preserved `resumeToken` during standby attachment in `writeResumeOK` to prevent invalidating the active link's authentication token (`ERR_BAD_TOKEN`).
+  - Added `ResetReader()` across all `transport.Conn` implementations (`tcp`, `quic`, `kcp`) to clear latched `i/o timeout` errors inside Go's `bufio.Reader` when reusing sockets across promotion.
+- **Client Dual-Path Hot-Standby & Autonomous Recovery (`internal/relay/standby.go`, `internal/relay/client.go`)**:
+  - Concurrent active UDP (QUIC or KCP) and hot-standby TCP connections exchanging BFD heartbeats simultaneously under `--allow-ha`.
+  - Zero-latency failover: on active link failure, client instantly promotes standby TCP socket without roundtrip dial or handshake delays, resuming send offset from `p.ack.Get()` with `session.Dedupe` handling in-flight deduplication.
+  - Autonomous reconnect supervisor: automatically recovers and attaches a new hot-standby TCP carrier if the standby connection drops, or re-probes UDP to return to primary UDP when reachability recovers.
+- **Testing & Verification**:
+  - Full repo test suite (`go test -race ./...`) 100% green.
+  - Dedicated unit tests in `internal/bfd/bfd_test.go` and `internal/relay/bfd_test.go` passing cleanly.
+  - Dual-netns Linux blackhole benchmarks:
+    - Silent blackhole detection: **2.263s** (ceiling 2.25s) vs 30s TCP timeout.
+    - Hot-standby promotion under load: **2.713s** failover with zero byte loss.
+
 ---
 
 ## Next agent

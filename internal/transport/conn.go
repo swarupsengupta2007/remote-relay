@@ -36,4 +36,5 @@ type Conn interface {
 	RemoteAddr() net.Addr
 	Kind() Kind
 	Close() error
+	ResetReader()
 }

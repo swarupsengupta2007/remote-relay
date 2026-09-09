@@ -669,3 +669,4 @@ func (c *writeRecordConn) LocalAddr() net.Addr         { return nil }
 func (c *writeRecordConn) RemoteAddr() net.Addr        { return nil }
 func (c *writeRecordConn) Kind() transport.Kind        { return transport.KindTCP }
 func (c *writeRecordConn) Close() error                { return nil }
+func (c *writeRecordConn) ResetReader()                {}

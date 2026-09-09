@@ -133,3 +133,7 @@ func (c *kcpConn) Close() error {
 	})
 	return nil
 }
+
+func (c *kcpConn) ResetReader() {
+	c.br.Reset(c.sess)
+}

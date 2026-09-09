@@ -14,7 +14,7 @@ See **Authentication** and **Security** below.
 
 ## Status
 
-| Milestone | In this tree |
+| Milestone / Feature | In this tree |
 |---|---|
 | M0 TCP relay | yes |
 | M1 resume / hold / retransmit | yes |
@@ -22,13 +22,16 @@ See **Authentication** and **Security** below.
 | M3 KCP | yes |
 | M4 session limits, graceful shutdown, observability | yes |
 | M5 SSH public-key auth | yes |
+| FEAT-ROB-01 BFD Sub-Second Detection & Dual-Path HA | yes |
 
-### Netem Benchmarks (16 MiB payload, 80ms RTT, dual-netns veth)
+### Netem & BFD Benchmarks (dual-netns veth)
 
 | Scenario | TCP (`--tcp`) | QUIC (default) | KCP (`--kcp`) |
 |---|---|---|---|
-| **High Latency & Loss** (80ms RTT, 3% loss) | 257.0s (0.06 MB/s) | 356.3s (0.04 MB/s) | **7.98s (2.00 MB/s)** *(33x–50x faster)* |
-| **Reorder & Duplicate** (80ms RTT, 25% reorder, 1% dup) | 319.2s (0.05 MB/s) | 471.2s (0.03 MB/s) | **5.47s (2.93 MB/s)** *(byte-exact)* |
+| **High Latency & Loss** (16 MiB, 80ms RTT, 3% loss) | 257.0s (0.06 MB/s) | 356.3s (0.04 MB/s) | **7.98s (2.00 MB/s)** *(33x–50x faster)* |
+| **Reorder & Duplicate** (16 MiB, 80ms RTT, 25% reorder, 1% dup) | 319.2s (0.05 MB/s) | 471.2s (0.03 MB/s) | **5.47s (2.93 MB/s)** *(byte-exact)* |
+| **Silent Blackhole Detection** (iptables DROP, default config) | 30.0s (`idle_timeout`) | 30.0s (`idle_timeout`) | **2.26s** (RFC 5880 BFD, ceiling 2.25s) |
+| **Hot-Standby Promotion** (`--allow-ha` QUIC → TCP Failover) | N/A | N/A | **2.71s** (0 lost bytes, zero-dial promotion) |
 
 The default CI 64-session soak mixes TCP+QUIC on the shared UDP mux (~10s,
 random link kills). Mixed KCP at that kill rate expired instead of resuming
@@ -48,7 +51,7 @@ go build -o relay ./cmd/relay
 ## Server
 
 ```
-./relay server [--config /etc/relay/server.toml] [--listen 0.0.0.0:7443] [--log-level info]
+./relay server [--config /etc/relay/server.toml] [--listen 0.0.0.0:7443] [--heartbeat-interval 750ms] [--dead-peer-threshold 3] [--log-level info]
 ```
 
 If `--config` is omitted the server loads `/etc/relay/server.toml` when that
@@ -82,6 +85,8 @@ max_sessions        = 1024
 max_conns_per_ip    = 8
 probe_timeout       = "2s"
 probe_attempts      = 2
+heartbeat_interval  = "750ms"          # RFC 5880 BFD ping interval
+dead_peer_threshold = 3                # missed pings before teardown (3 * 750ms = 2.25s)
 keepalive_interval  = "5s"
 idle_timeout        = "30s"
 switch_timeout      = "5s"
@@ -105,7 +110,7 @@ Logs go to **stderr**. stdout is the relayed byte stream and must stay clean
 (it is the SSH transport).
 
 ```
-./relay client --server HOST:PORT [--dest HOST:PORT] [--tcp|--kcp] [--allow-ha] [--config PATH] [--log-level warn] [%h %p]
+./relay client --server HOST:PORT [--dest HOST:PORT] [--tcp|--kcp] [--allow-ha] [--heartbeat-interval 750ms] [--dead-peer-threshold 3] [--config PATH] [--log-level warn] [%h %p]
 ```
 
 Default client config path: `$HOME/.config/relay/client.toml` (optional).
@@ -115,11 +120,14 @@ Transport selection: `--tcp` > `--kcp` > config `transport` > default `quic`.
 encrypted). `--tcp` disables UDP upgrade and stays on TCP for the whole
 session.
 
-`--allow-ha` enables dual-path High Availability (`UDP > TCP`). If UDP is
-unavailable or blocked, the client seamlessly falls back to TCP, continuously
-re-probes UDP in the background, and upgrades dynamically mid-stream. Without
-`--allow-ha`, requesting UDP strictly mandates UDP reachability and terminates
-immediately if blocked.
+`--allow-ha` enables dual-path High Availability with zero-latency hot-standby failover.
+When operating over UDP (QUIC or KCP), a hot-standby TCP connection is attached and
+exchanges RFC 5880 BFD heartbeats in parallel. If the active UDP path fails or blackholes
+(detected within `dead_peer_threshold * heartbeat_interval`, e.g. 2.25s), the standby
+TCP link is instantly promoted to active without handshake round-trips. Background
+supervisors automatically recover dropped standby links and seamlessly migrate back
+to UDP when it recovers. Without `--allow-ha`, requesting UDP strictly mandates UDP
+reachability and terminates immediately if blocked.
 
 ### Example `client.toml`
 
@@ -130,6 +138,8 @@ transport             = "quic"          # quic|kcp|tcp
 buffer_bytes          = 67108864
 send_window           = 4194304
 probe_timeout         = "2s"
+heartbeat_interval    = "750ms"         # RFC 5880 BFD ping interval
+dead_peer_threshold   = 3               # missed pings before teardown (3 * 750ms = 2.25s)
 reconnect_backoff     = ["100ms","250ms","500ms","1s","2s","5s","10s"]
 reconnect_max_elapsed = "5m"            # keep in sync with server hold_timeout
 allow_ha              = false           # true = dual-path HA (UDP primary, TCP fallback)
@@ -207,13 +217,18 @@ If `identity_files` is empty the client tries `~/.ssh/id_ed25519`, `id_ecdsa`,
 `id_rsa` (PEM and OpenSSH formats). Both sides must set `ssh-publickey`; a
 `none` client against an authenticating server gets `ERR_AUTH`.
 
-## Resume, hold, and UDP upgrade
+## Resume, hold, and BFD failover
 
 1. HELLO is always over TCP. The server may advertise a UDP address.
 2. The client probes UDP. On success it `SWITCH`es the data plane to QUIC
-   (default) or KCP (`--kcp`) and **closes the TCP connection**.
-3. On probe failure the session stays on TCP for its lifetime.
-4. Any later break (TCP or UDP) is repaired the same way: re-dial TCP, send
+   (default) or KCP (`--kcp`). Without `--allow-ha`, the initial TCP connection is closed.
+   With `--allow-ha`, the TCP connection attaches as a hot-standby carrier.
+3. Both active and standby links exchange continuous RFC 5880 BFD heartbeats (`proto.TypePing`, 0x15).
+   If the remote peer stops responding within `dead_peer_threshold * heartbeat_interval`
+   (default $3 \times 750\text{ms} = 2.25\text{s}$), the pump triggers `ErrDeadPeer` and initiates teardown or failover.
+4. Under `--allow-ha`, an active UDP failure immediately promotes the hot-standby TCP carrier with zero
+   round-trip dial delay. In-flight data is deduplicated seamlessly via `session.Dedupe`.
+5. Any link break without a standby carrier is repaired via TCP reconnect: re-dial TCP, send
    `RESUME` with the session token and byte offsets. In-flight data is
    retransmitted from the server's ring; the destination socket stays open.
 

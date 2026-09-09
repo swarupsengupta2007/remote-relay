@@ -85,3 +85,7 @@ func (c *tcpConn) Close() error {
 	// Do not Flush here: WriteFrame is the only writer, and Close can race with it.
 	return c.raw.Close()
 }
+
+func (c *tcpConn) ResetReader() {
+	c.br.Reset(c.raw)
+}

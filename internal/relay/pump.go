@@ -11,12 +11,14 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/remote-relay/relay/internal/bfd"
 	"github.com/remote-relay/relay/internal/proto"
 	"github.com/remote-relay/relay/internal/session"
 	"github.com/remote-relay/relay/internal/transport"
 )
 
 var (
+	ErrDeadPeer      = errors.New("dead-peer detected: bfd timeout")
 	errByeSent       = errors.New("bye sent")
 	errByeReceived   = errors.New("bye received")
 	errIdle          = errors.New("idle timeout")
@@ -43,6 +45,8 @@ type pumpConfig struct {
 	keepalive     time.Duration
 	idle          time.Duration
 	switchTimeout time.Duration
+	heartbeat     time.Duration
+	deadThreshold int
 	log           *slog.Logger
 }
 
@@ -98,12 +102,14 @@ type pump struct {
 
 	onPeerFrame func()
 
-	connMu     sync.Mutex
-	writeMu    sync.Mutex
-	conn       transport.Conn
-	connCtx    context.Context
-	connCancel context.CancelFunc
-	sendFrom   uint64
+	connMu           sync.Mutex
+	writeMu          sync.Mutex
+	conn             transport.Conn
+	connCtx          context.Context
+	connCancel       context.CancelFunc
+	sendFrom         uint64
+	bfdSession       *bfd.Session
+	prefetchedFrames []proto.Frame
 
 	outFinal   atomic.Uint64
 	outEOF     atomic.Bool
@@ -260,8 +266,26 @@ func (p *pump) dropConn() {
 }
 
 func (p *pump) serveConn(ctx context.Context, conn transport.Conn, sendFrom uint64) error {
+	return p.serveConnWithBFD(ctx, conn, sendFrom, nil, nil)
+}
+
+func (p *pump) serveConnWithBFD(ctx context.Context, conn transport.Conn, sendFrom uint64, existingBFD *bfd.Session, prefetched []proto.Frame) (err error) {
 	connCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	bfdSess := existingBFD
+	if bfdSess == nil {
+		bfdCfg := bfd.Config{
+			DesiredMinTxInterval:  p.cfg.heartbeat,
+			RequiredMinRxInterval: p.cfg.heartbeat,
+			DetectMultiplier:      uint8(p.cfg.deadThreshold),
+		}
+		var err error
+		bfdSess, err = bfd.NewSession(bfdCfg)
+		if err != nil {
+			return err
+		}
+	}
 
 	p.connMu.Lock()
 	p.conn = conn
@@ -269,6 +293,8 @@ func (p *pump) serveConn(ctx context.Context, conn transport.Conn, sendFrom uint
 	p.connCancel = cancel
 	p.sendFrom = sendFrom
 	p.io.conn = conn
+	p.bfdSession = bfdSess
+	p.prefetchedFrames = prefetched
 	p.connMu.Unlock()
 
 	p.linkUp.Store(true)
@@ -300,6 +326,8 @@ func (p *pump) serveConn(ctx context.Context, conn transport.Conn, sendFrom uint
 		if p.conn == conn {
 			p.conn = nil
 			p.connCancel = nil
+			p.bfdSession = nil
+			p.prefetchedFrames = nil
 		}
 		p.connMu.Unlock()
 	}()
@@ -323,11 +351,14 @@ func (p *pump) serveConn(ctx context.Context, conn transport.Conn, sendFrom uint
 	start(p.netReader)
 	start(p.timer)
 
-	var err error
 	select {
 	case err = <-errc:
 	case <-connCtx.Done():
-		err = connCtx.Err()
+		select {
+		case err = <-errc:
+		default:
+			err = connCtx.Err()
+		}
 	case <-p.sessCtx.Done():
 		if se := p.sessionErr(); se != nil {
 			err = se
@@ -335,6 +366,7 @@ func (p *pump) serveConn(ctx context.Context, conn transport.Conn, sendFrom uint
 			err = p.sessCtx.Err()
 		}
 	}
+	p.cfg.log.Info("serveConn ending", "rawErr", err)
 	cancel()
 	_ = conn.Close()
 	wg.Wait()
@@ -348,6 +380,9 @@ func (p *pump) serveConn(ctx context.Context, conn transport.Conn, sendFrom uint
 		return p.sessCtx.Err()
 	}
 	if err == nil || isTransportGone(err) {
+		if errors.Is(err, ErrDeadPeer) {
+			return ErrDeadPeer
+		}
 		return errTransportDown
 	}
 	return err
@@ -356,6 +391,9 @@ func (p *pump) serveConn(ctx context.Context, conn transport.Conn, sendFrom uint
 func isTransportGone(err error) bool {
 	if err == nil {
 		return false
+	}
+	if errors.Is(err, ErrDeadPeer) {
+		return true
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe) {
 		return true
@@ -842,14 +880,22 @@ func (p *pump) netReader() error {
 	expected := p.expected.Load()
 	for {
 		p.connMu.Lock()
-		c := p.conn
-		p.connMu.Unlock()
-		if c == nil {
-			return net.ErrClosed
-		}
-		f, err := c.ReadFrame()
-		if err != nil {
-			return err
+		var f proto.Frame
+		var err error
+		if len(p.prefetchedFrames) > 0 {
+			f = p.prefetchedFrames[0]
+			p.prefetchedFrames = p.prefetchedFrames[1:]
+			p.connMu.Unlock()
+		} else {
+			c := p.conn
+			p.connMu.Unlock()
+			if c == nil {
+				return net.ErrClosed
+			}
+			f, err = c.ReadFrame()
+			if err != nil {
+				return err
+			}
 		}
 		p.lastIn.Store(time.Now().UnixNano())
 		p.notePeerFrame()
@@ -916,10 +962,17 @@ func (p *pump) netReader() error {
 			}
 			p.nudge()
 		case proto.TypePing:
-			if err := p.sendCtrl(proto.Frame{Type: proto.TypePong, Payload: f.Payload}); err != nil {
-				return err
+			pkt, err := bfd.DecodePacket(f.Payload)
+			if err == nil {
+				p.connMu.Lock()
+				sess := p.bfdSession
+				p.connMu.Unlock()
+				if sess != nil {
+					_, _ = sess.Receive(pkt)
+				}
 			}
 		case proto.TypePong:
+			// Dropped as per FEAT-ROB-01
 		case proto.TypeSwitch:
 			var sw proto.Switch
 			if uerr := proto.UnmarshalPayload(f, &sw); uerr != nil {
@@ -990,27 +1043,54 @@ func (p *pump) sinkWriter() error {
 }
 
 func (p *pump) timer() error {
-	if p.cfg.keepalive <= 0 {
-		<-p.connCtx.Done()
-		return p.connCtx.Err()
+	p.connMu.Lock()
+	sess := p.bfdSession
+	p.connMu.Unlock()
+
+	cadence := p.cfg.heartbeat
+	if sess != nil {
+		cadence = sess.TxInterval()
 	}
-	t := time.NewTicker(p.cfg.keepalive)
+	if cadence <= 0 {
+		cadence = p.cfg.keepalive
+	}
+	if cadence <= 0 {
+		cadence = 750 * time.Millisecond
+	}
+
+	t := time.NewTicker(cadence)
 	defer t.Stop()
-	var nonce uint64
+
 	for {
 		select {
 		case <-p.connCtx.Done():
 			return p.connCtx.Err()
 		case now := <-t.C:
+			p.connMu.Lock()
+			currentSess := p.bfdSession
+			p.connMu.Unlock()
+
+			if currentSess != nil && currentSess.CheckTimeout(now) {
+				return ErrDeadPeer
+			}
+
 			last := time.Unix(0, p.lastIn.Load())
 			if p.cfg.idle > 0 && !p.backpressured.Load() && now.Sub(last) > p.cfg.idle {
 				p.connCancel()
 				return errIdle
 			}
-			nonce++
-			payload := proto.EncodePing(nonce, uint64(now.UnixMilli()))
-			if err := p.sendCtrl(proto.Frame{Type: proto.TypePing, Payload: payload}); err != nil {
-				return err
+
+			if currentSess != nil {
+				newCadence := currentSess.TxInterval()
+				if newCadence > 0 && newCadence != cadence {
+					cadence = newCadence
+					t.Reset(cadence)
+				}
+				pkt := currentSess.FormatTxPacket()
+				payload := bfd.EncodePacket(pkt)
+				if err := p.sendCtrl(proto.Frame{Type: proto.TypePing, Payload: payload}); err != nil {
+					return err
+				}
 			}
 		}
 	}
