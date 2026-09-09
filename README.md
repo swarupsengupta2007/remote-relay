@@ -132,6 +132,8 @@ send_window           = 4194304
 probe_timeout         = "2s"
 reconnect_backoff     = ["100ms","250ms","500ms","1s","2s","5s","10s"]
 reconnect_max_elapsed = "5m"            # keep in sync with server hold_timeout
+allow_ha              = false           # true = dual-path HA (UDP primary, TCP fallback)
+ha_probe_interval     = "10s"           # interval for background UDP probing when on TCP
 log_level             = "warn"
 log_format            = "text"
 auth_method           = "none"          # none | ssh-publickey

@@ -472,6 +472,9 @@ func checkStrictUDPProbe(ctx context.Context, cfg config.Client, conn transport.
 	}
 	defer func() { _ = mux.Close() }()
 	if err := probeUDP(ctx, mux, addr, tok, attempts, timeout); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+			return err
+		}
 		return fmt.Errorf("udp route unavailable and --allow-ha not specified: %w", err)
 	}
 	return nil

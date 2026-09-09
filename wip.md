@@ -133,23 +133,34 @@ Requests:
   - *Scenario B (80ms RTT, 25% reorder, 1% dup)*: TCP 319.20s (0.05 MB/s), QUIC 471.21s (0.03 MB/s), KCP 5.47s (2.93 MB/s, byte-exact deduplication).
 - **Quality & CI Fixes**: Fixed `reconnectable(err)` wrapped timeout handling in `pump.go`, added client backoff retry and structured resume logging in `client.go`, expanded unit tests across `cmd/relay`, `proto`, `transport`, and added GitHub Actions CI (`.github/workflows/ci.yml`).
 
-### 2. High Availability Dual-Path System (`--allow-ha`) (`relay_ha.md`)
+### 2. High Availability Dual-Path System (`--allow-ha`) (Architecture, State Machine & Dual-Netns Verification)
 - **Strict UDP Enforcement by Default**: Eliminated silent TCP fallback when UDP (QUIC or KCP) is requested without `--allow-ha`. Added `checkStrictUDPProbe` pre-flight check before streaming user data; if UDP probe fails or the server lacks UDP, the client terminates immediately with `udp route unavailable and --allow-ha not specified` without leaking user bytes over TCP.
+- **HA Architecture & State Machine (`UDP > TCP`)**:
+  - `ACTIVE_UDP`: Primary data plane carrying all frames over QUIC or KCP.
+  - If UDP link breaks or blackholes, client enters reconnect loop and falls back to TCP via `RESUME`.
+  - `ACTIVE_TCP_PROBING`: Data flows uninterrupted over TCP while a background supervisor periodically probes UDP at `ha_probe_interval` (default 10s).
+  - Once UDP probe succeeds, client quiesces TCP (`waitQuiesced`), sends `SWITCH` frame, dials UDP, resumes on UDP, and swaps connections with zero dropped or duplicate bytes back to `ACTIVE_UDP`.
 - **Configuration & CLI Flag**:
   - Added `--allow-ha` flag to `relay client`.
   - Added `allow_ha` and `ha_probe_interval` (default 10s) TOML configuration.
   - Enforced mutual exclusion: `--tcp` and `--allow-ha` together return CLI exit code 2.
-- **Dynamic HA Path Switching (`UDP > TCP`)**:
-  - When `--allow-ha` is enabled and UDP fails initially or mid-session, client seamlessly falls back to TCP via `RESUME` without dropping bytes.
-  - While operating on TCP, a background supervisor continuously probes UDP at `ha_probe_interval`.
-  - Once UDP connectivity is restored, client quiesces TCP, sends `SWITCH` frame, dials UDP, resumes on UDP, and swaps connections with zero dropped or duplicate bytes.
-- **Testing & Verification**:
-  - Added unit test suite in `internal/relay/ha_test.go` (`TestHAStrictUDPProbeFails`, `TestHAStrictServerNoUDP`, `TestHAUpgradeSeamless`, `TestHADowngradeToTCP`, `TestHAFlappingOscillate`) passing with `-race`.
-  - Dual-netns integration suite (`test_ha.py`) verified live in isolated namespaces with real OpenSSH and 32 MiB binary payloads: HA-Strict (aborted rc=255), HA-Upgrade (seamless upgrade from TCP to QUIC), HA-Downgrade (seamless downgrade from QUIC to TCP), and HA-Oscillate (4 flapping cycles between QUIC and TCP, all completing byte-exact).
+- **Testing & Verification Matrix**:
+  - Unit test suite in `internal/relay/ha_test.go` (`TestHAStrictUDPProbeFails`, `TestHAStrictServerNoUDP`, `TestHAUpgradeSeamless`, `TestHADowngradeToTCP`, `TestHAFlappingOscillate`) passing with `-race`.
+  - Dual-netns integration suite (`test_ha.py`) verified live in isolated namespaces with real OpenSSH and 32 MiB binary payloads:
+    - `HA-Unit`: `--tcp` + `--allow-ha` errors out with exit code 2.
+    - `HA-Strict`: Aborted with rc=255, zero user bytes sent over TCP.
+    - `HA-Upgrade`: Seamless upgrade from TCP to QUIC mid-transfer, byte-exact SHA-256 match.
+    - `HA-Downgrade`: Seamless downgrade from QUIC to TCP mid-transfer, byte-exact SHA-256 match.
+    - `HA-Oscillate`: 4 flapping cycles between QUIC and TCP, all completing byte-exact.
+
+### 3. CI/CD Concurrency Bug Fix (`internal/relay/upgrade.go`)
+- **Root Cause Analysis**: Under heavy concurrent CI load (`TestConcurrency64SessionsLeak`), if a session's TCP connection dropped while background UDP probing was active, `takeUpgrade` canceled the upgrade context (`upgCtx`). Previously, `tryUpgrade` treated `context.Canceled` as a strict UDP failure and called `p.fail`, poisoning the entire session with `udp route unavailable and --allow-ha not specified: context canceled`. This caused intermittent test failures in GitHub Actions runners.
+- **Fix**: Added context cancellation checks in `upgrade.go` and `client.go` to cleanly ignore canceled probe contexts without failing the pump or closing the connection. Verified with 3 consecutive clean runs of `TestConcurrency64SessionsLeak` under `-race`.
 - **Commits**:
   - `e827780`: `test: add unit tests, CI workflow, and network resilience fixes`
   - `f19b691`: `feat: implement high availability dual-path failover (--allow-ha) and strict UDP mode`
   - `f229ba2`: `docs: add features and roadmap specification (features.md)`
+  - `3bdfc22`: `docs: remove todo.md, migrate verification matrix and findings to wip.md and README.md`
   - Pushed to `origin/main`.
 
 ---

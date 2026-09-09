@@ -118,8 +118,16 @@ func tryUpgrade(ctx context.Context, p *pump, cfg config.Client, tcpConn transpo
 	if timeout <= 0 {
 		timeout = 2 * time.Second
 	}
+	if ctx.Err() != nil {
+		res.err = ctx.Err()
+		return res
+	}
 	firstErr := probeUDP(ctx, mux, addr, tok, attempts, timeout)
 	if firstErr != nil {
+		if errors.Is(firstErr, context.Canceled) || ctx.Err() != nil {
+			res.err = firstErr
+			return res
+		}
 		if !cfg.AllowHA {
 			if log != nil {
 				log.Error("udp probe failed and --allow-ha not specified", "err", firstErr)
