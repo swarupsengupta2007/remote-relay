@@ -129,30 +129,30 @@ In `--allow-ha` mode:
 
 ```
 Phase 1: BFD Protocol & Engine
-├── Task 1.1: Create internal/bfd (types, packet encoder/decoder)
-├── Task 1.2: Implement RFC 5880 state machine (session.go)
-└── Task 1.3: Add bfd_test.go with comprehensive state transition tests
+├── [x] Task 1.1: Create internal/bfd (types, packet encoder/decoder)
+├── [x] Task 1.2: Implement RFC 5880 state machine (session.go)
+└── [x] Task 1.3: Add bfd_test.go with comprehensive state transition tests
 
 Phase 2: Configuration & Pump Integration
-├── Task 2.1: Add heartbeat_interval and dead_peer_threshold to internal/config
-├── Task 2.2: Repurpose proto.TypePing and drop TypePong in internal/proto
-├── Task 2.3: Integrate BFD session into internal/relay/pump.go
-└── Task 2.4: Validate single-path dead-peer detection via unit tests
+├── [x] Task 2.1: Add heartbeat_interval and dead_peer_threshold to internal/config
+├── [x] Task 2.2: Repurpose proto.TypePing and drop TypePong in internal/proto
+├── [x] Task 2.3: Integrate BFD session into internal/relay/pump.go
+└── [x] Task 2.4: Validate single-path dead-peer detection via unit tests
 
 Phase 3: Server Standby Slot Support
-├── Task 3.1: Add standbyConn and standby BFD runner to live in server.go
-├── Task 3.2: Update handleResume/Offer to accept standby registrations
-└── Task 3.3: Implement server-side standby promotion upon active death
+├── [x] Task 3.1: Add standbyConn and standby BFD runner to live in server.go
+├── [x] Task 3.2: Update handleResume/Offer to accept standby registrations
+└── [x] Task 3.3: Implement server-side standby promotion upon active death
 
 Phase 4: Client Dual-Path Hot-Standby & Auto-Recovery
-├── Task 4.1: Modify upgrade.go to retain TCP connection as standby
-├── Task 4.2: Implement client standby supervisor and instant failover
-└── Task 4.3: Implement autonomous background reconnect for failed paths
+├── [x] Task 4.1: Modify upgrade.go to retain TCP connection as standby
+├── [x] Task 4.2: Implement client standby supervisor and instant failover
+└── [x] Task 4.3: Implement autonomous background reconnect for failed paths
 
 Phase 5: End-to-End & Dual-Netns Verification
-├── Task 5.1: Write integration tests in internal/relay/bfd_test.go
-├── Task 5.2: Run Linux dual-netns blackhole benchmarks (assert <2.25s drop detection)
-└── Task 5.3: Update documentation (README.md, features.md, wip.md)
+├── [x] Task 5.1: Write integration tests in internal/relay/bfd_test.go
+├── [x] Task 5.2: Run Linux dual-netns blackhole benchmarks (assert <2.25s drop detection)
+└── [x] Task 5.3: Update documentation (README.md, features.md, wip.md)
 ```
 
 ---

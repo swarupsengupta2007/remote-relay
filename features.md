@@ -389,12 +389,12 @@ In TCP mode, data transfer involves reading bytes from `stdin` into Go user-spac
 Phase 1: Usability & Resiliency Quick-Wins (1–2 weeks)
 ├── FEAT-UTL-01: Native OpenSSH Agent (SSH_AUTH_SOCK)
 ├── FEAT-UTL-02: Terminal Reconnection HUD (stderr)
-└── FEAT-ROB-01: Sub-Second Dead-Peer Detection (Fast Heartbeats) [COMPLETED]
+└── FEAT-ROB-01: Sub-Second Dead-Peer Detection (Fast Heartbeats) [COMPLETED] (.feat-impl/FEAT-ROB-01.md)
 
 Phase 2: Enterprise Operations & Security (2–4 weeks)
 ├── FEAT-OBS-01: Prometheus Metrics Endpoint
 ├── FEAT-SEC-03: Per-User RBAC & SIGHUP Reload
-├── FEAT-SEC-01: Encrypted Handshake Control Plane
+├── FEAT-SEC-01: Encrypted Handshake Control Plane [COMPLETED] (.feat-impl/FEAT-SEC-01.md)
 └── FEAT-ROB-03: Dual-Stack Happy Eyeballs v2
 
 Phase 3: Expanded Utility & High Availability (4–6 weeks)
