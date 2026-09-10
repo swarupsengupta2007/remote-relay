@@ -23,15 +23,11 @@ type tcpConn struct {
 }
 
 func DialTCP(ctx context.Context, addr string) (Conn, error) {
-	d := net.Dialer{
-		Timeout:   dialTimeout,
-		KeepAlive: tcpKeepAlive,
-	}
-	c, err := d.DialContext(ctx, "tcp", addr)
-	if err != nil {
-		return nil, err
-	}
-	return WrapTCP(c)
+	return DialHappyEyeballsTCP(ctx, addr, DefaultConnectionAttemptDelay)
+}
+
+func DialTCPWithDelay(ctx context.Context, addr string, delay time.Duration) (Conn, error) {
+	return DialHappyEyeballsTCP(ctx, addr, delay)
 }
 
 func ListenTCP(addr string) (net.Listener, error) {

@@ -29,6 +29,13 @@ func probeUDP(ctx context.Context, mux *transport.UDPMux, addr net.Addr, tok [16
 	return transport.Probe(ctx, mux, addr, tok, attempts, timeout)
 }
 
+func probeUDPDualStack(ctx context.Context, hostPort string, tok [16]byte, attempts int, timeout time.Duration, delay time.Duration) (*transport.UDPMux, net.Addr, error) {
+	if testDropUDPProbe.Load() {
+		return nil, nil, errors.New("udp probe timeout")
+	}
+	return transport.ProbeDualStack(ctx, hostPort, tok, attempts, timeout, delay)
+}
+
 type upgradeResult struct {
 	conn transport.Conn
 	rok  proto.ResumeOK
@@ -87,30 +94,6 @@ func tryUpgrade(ctx context.Context, p *pump, cfg config.Client, tcpConn transpo
 		}
 		return res
 	}
-	addr, err := net.ResolveUDPAddr("udp", udp.Addr)
-	if err != nil {
-		res.err = err
-		if !cfg.AllowHA {
-			p.fail(err)
-			_ = tcpConn.Close()
-		}
-		return res
-	}
-	mux, err := transport.ListenUDPMux(transport.UDPBindAll(addr))
-	if err != nil {
-		res.err = err
-		if !cfg.AllowHA {
-			p.fail(err)
-			_ = tcpConn.Close()
-		}
-		return res
-	}
-	cleanup := true
-	defer func() {
-		if cleanup && mux != nil {
-			_ = mux.Close()
-		}
-	}()
 
 	attempts := udp.ProbeAttempts
 	timeout := time.Duration(udp.ProbeTimeoutMs) * time.Millisecond
@@ -120,11 +103,27 @@ func tryUpgrade(ctx context.Context, p *pump, cfg config.Client, tcpConn transpo
 	if timeout <= 0 {
 		timeout = 2 * time.Second
 	}
+	happyDelay := cfg.HappyEyeballsDelay.Duration()
+	if happyDelay <= 0 {
+		happyDelay = transport.DefaultConnectionAttemptDelay
+	}
+
+	var mux *transport.UDPMux
+	var addr net.Addr
+	cleanup := true
+	defer func() {
+		if cleanup && mux != nil {
+			_ = mux.Close()
+		}
+	}()
+
 	if ctx.Err() != nil {
 		res.err = ctx.Err()
 		return res
 	}
-	firstErr := probeUDP(ctx, mux, addr, tok, attempts, timeout)
+
+	var firstErr error
+	mux, addr, firstErr = probeUDPDualStack(ctx, udp.Addr, tok, attempts, timeout, happyDelay)
 	if firstErr != nil {
 		if errors.Is(firstErr, context.Canceled) || ctx.Err() != nil {
 			res.err = firstErr
@@ -162,9 +161,15 @@ func tryUpgrade(ctx context.Context, p *pump, cfg config.Client, tcpConn transpo
 				res.err = p.sessCtx.Err()
 				return res
 			case <-ticker.C:
-				if err := probeUDP(ctx, mux, addr, tok, attempts, timeout); err != nil {
+				if mux != nil {
+					_ = mux.Close()
+					mux = nil
+				}
+				var pErr error
+				mux, addr, pErr = probeUDPDualStack(ctx, udp.Addr, tok, attempts, timeout, happyDelay)
+				if pErr != nil {
 					if log != nil {
-						log.Debug("ha udp probe attempt failed", "err", err)
+						log.Debug("ha udp probe attempt failed", "err", pErr)
 					}
 					continue
 				}
@@ -219,11 +224,9 @@ func tryUpgrade(ctx context.Context, p *pump, cfg config.Client, tcpConn transpo
 				res.err = err
 				return res
 			}
-			_ = mux.Close()
-			mux, err = transport.ListenUDPMux(transport.UDPBindAll(addr))
-			if err != nil {
-				res.err = err
-				return res
+			if mux != nil {
+				_ = mux.Close()
+				mux = nil
 			}
 			firstErr = err
 			continue
@@ -329,10 +332,11 @@ func writeResumeRole(ctx context.Context, conn transport.Conn, cfg config.Client
 	}
 	if a.RequiresChallenge() {
 		offer, err := a.Respond(auth.Challenge{Destination: cfg.Destination, ClientNonce: nonce})
-		if err != nil {
+		if err == nil {
+			msg.Auth = offer
+		} else if token == "" {
 			return none, err
 		}
-		msg.Auth = offer
 	}
 	fr, err := proto.MarshalFrame(proto.TypeResume, msg)
 	if err != nil {

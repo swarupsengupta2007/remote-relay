@@ -20,7 +20,7 @@ Each proposal includes:
 |:---|:---|:---:|:---:|:---:|:---|
 | [**FEAT-ROB-01**](.feat-impl/FEAT-ROB-01.md) | Sub-Second Dead-Peer Detection & Dual-Path BFD | Tier 1: Robustness | **P1** | Complete | RFC 5880 BFD engine, sub-second drop detection & instant hot-standby failover |
 | **FEAT-ROB-02** | Zero-Downtime Server Restart & Socket Handover | Tier 1: Robustness | **P2** | High | Upgrades server without dropping active SSH sessions |
-| **FEAT-ROB-03** | Dual-Stack Happy Eyeballs v2 (RFC 8305) | Tier 1: Robustness | **P2** | Medium | Instant connection racing across IPv4/IPv6 networks |
+| [**FEAT-ROB-03**](.feat-impl/FEAT-ROB-03.md) | Dual-Stack Happy Eyeballs v2 (RFC 8305) | Tier 1: Robustness | **P2** | Complete | Instant connection racing across IPv4/IPv6 networks |
 | **FEAT-ROB-04** | Tiered Disk-Spill Storage for Ring Buffers | Tier 1: Robustness | **P3** | High | Prevents buffer exhaustion during prolonged outages |
 | **FEAT-UTL-01** | Native OpenSSH Agent (`SSH_AUTH_SOCK`) Support | Tier 2: Utility | **P1** | Low | Passphrase-protected keys & FIDO2/YubiKey support |
 | **FEAT-UTL-02** | Terminal Reconnection HUD & Desktop Notifications | Tier 2: Utility | **P1** | Low | Clear visual feedback and status during link drops |
@@ -84,7 +84,7 @@ As documented in [`README.md`](file:///root/remote-relay/README.md), session hol
 
 ### FEAT-ROB-03: Dual-Stack Happy Eyeballs v2 (RFC 8305)
 * **Priority**: `P2` (Medium)
-* **Status**: Proposed
+* **Status**: Complete ([`.feat-impl/FEAT-ROB-03.md`](.feat-impl/FEAT-ROB-03.md))
 * **Target Package**: `internal/relay`, `internal/transport`
 
 #### 1. Problem Statement
@@ -358,9 +358,9 @@ In TCP mode, data transfer involves reading bytes from `stdin` into Go user-spac
 
 ---
 
-### FEAT-PERF-03: Fast 3-RTT Token-Authorized Resumption in Encrypted AEAD Plane
+### [FEAT-PERF-03](.feat-impl/FEAT-PERF-03.md): Fast 3-RTT Token-Authorized Resumption in Encrypted AEAD Plane
 * **Priority**: `P1` (High)
-* **Status**: Proposed
+* **Status**: Implemented (Complete)
 * **Target Package**: `internal/relay`, `internal/proto`, `internal/auth`, `internal/session`
 
 #### 1. Problem Statement
@@ -381,7 +381,7 @@ However, with the completion of [**FEAT-SEC-01**](.feat-impl/FEAT-SEC-01.md), ev
 #### 3. Benefits & Verification
 - **Saves 1 Full RTT & 2 Frames**: Resumptions complete in 3 RTTs (~240ms on 80ms WAN links), eliminating 2 frame transmissions and reducing loss exposure by 25%.
 - **Unblocks FEAT-UTL-01**: Hardware security keys (YubiKey / FIDO2) require user interaction only during initial session establishment; background hot-standby loops and flaky reconnections proceed silently.
-- **Verification**: Run dual-netns simulation asserting 3-RTT completion (~240ms under 80ms RTT) and zero signature delegations on resume.
+- **Verification**: Verified via `scripts/test_perf_resume.py` and `internal/relay/auth_test.go` asserting 3-RTT completion (~240ms under 80ms RTT), zero signature delegations on resume, and seamless cryptographic fallback on invalid tokens.
 
 ---
 
@@ -416,7 +416,7 @@ However, with the completion of [**FEAT-SEC-01**](.feat-impl/FEAT-SEC-01.md), ev
 ```
 Phase 1: Usability & Resiliency Quick-Wins (1–2 weeks)
 ├── FEAT-UTL-01: Native OpenSSH Agent (SSH_AUTH_SOCK)
-├── FEAT-PERF-03: Fast 3-RTT Token-Authorized Resumption (AEAD Plane)
+├── FEAT-PERF-03: Fast 3-RTT Token-Authorized Resumption (AEAD Plane) [COMPLETED] (.feat-impl/FEAT-PERF-03.md)
 ├── FEAT-UTL-02: Terminal Reconnection HUD (stderr)
 └── FEAT-ROB-01: Sub-Second Dead-Peer Detection (Fast Heartbeats) [COMPLETED] (.feat-impl/FEAT-ROB-01.md)
 
@@ -424,7 +424,7 @@ Phase 2: Enterprise Operations & Security (2–4 weeks)
 ├── FEAT-OBS-01: Prometheus Metrics Endpoint
 ├── FEAT-SEC-03: Per-User RBAC & SIGHUP Reload
 ├── FEAT-SEC-01: Encrypted Handshake Control Plane [COMPLETED] (.feat-impl/FEAT-SEC-01.md)
-└── FEAT-ROB-03: Dual-Stack Happy Eyeballs v2
+└── FEAT-ROB-03: Dual-Stack Happy Eyeballs v2 [COMPLETED] (.feat-impl/FEAT-ROB-03.md)
 
 Phase 3: Expanded Utility & High Availability (4–6 weeks)
 ├── FEAT-ROB-02: Zero-Downtime Server Restarts (SCM_RIGHTS)

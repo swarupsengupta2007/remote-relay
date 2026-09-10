@@ -13,7 +13,6 @@ import (
 	"io"
 	"log/slog"
 	"math/big"
-	"net"
 	"sync"
 	"time"
 
@@ -291,7 +290,7 @@ func clientAuth(cfg config.Client) auth.Authenticator {
 
 func clientHello(ctx context.Context, cfg config.Client) (transport.Conn, proto.HelloOK, error) {
 	var none proto.HelloOK
-	conn, err := transport.DialTCP(ctx, cfg.Server)
+	conn, err := transport.DialTCPWithDelay(ctx, cfg.Server, cfg.HappyEyeballsDelay.Duration())
 	if err != nil {
 		return nil, none, fmt.Errorf("dial server: %w", err)
 	}
@@ -458,7 +457,7 @@ func clientResume(ctx context.Context, cfg config.Client, sessionID, token strin
 
 func clientResumeRole(ctx context.Context, cfg config.Client, sessionID, token string, downAcked uint64, role string) (transport.Conn, proto.ResumeOK, error) {
 	var none proto.ResumeOK
-	conn, err := transport.DialTCP(ctx, cfg.Server)
+	conn, err := transport.DialTCPWithDelay(ctx, cfg.Server, cfg.HappyEyeballsDelay.Duration())
 	if err != nil {
 		return nil, none, err
 	}
@@ -544,16 +543,15 @@ func checkStrictUDPProbe(ctx context.Context, cfg config.Client, conn transport.
 	if !ok {
 		return proto.NewError(proto.CodeProto, "bad probe token")
 	}
-	addr, err := net.ResolveUDPAddr("udp", udp.Addr)
-	if err != nil {
-		return err
+	happyDelay := cfg.HappyEyeballsDelay.Duration()
+	if happyDelay <= 0 {
+		happyDelay = transport.DefaultConnectionAttemptDelay
 	}
-	mux, err := transport.ListenUDPMux(transport.UDPBindAll(addr))
-	if err != nil {
-		return err
+	mux, _, err := probeUDPDualStack(ctx, udp.Addr, tok, attempts, timeout, happyDelay)
+	if mux != nil {
+		_ = mux.Close()
 	}
-	defer func() { _ = mux.Close() }()
-	if err := probeUDP(ctx, mux, addr, tok, attempts, timeout); err != nil {
+	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
 			return err
 		}

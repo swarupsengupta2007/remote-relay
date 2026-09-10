@@ -104,6 +104,7 @@ func runClient(args []string) int {
 	knownHosts := fs.String("known-hosts", "", "path to client known_hosts file")
 	fingerprint := fs.String("server-fingerprint", "", "pinned SHA256 server host key fingerprint (SHA256:...)")
 	strictChecking := fs.String("strict-host-key-checking", "", "strict host key checking: yes|no|ask")
+	happyDelay := fs.Duration("happy-eyeballs-delay", 0, "RFC 8305 connection attempt delay across dual-stack addresses (default: 250ms)")
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return 0
@@ -162,6 +163,7 @@ func runClient(args []string) int {
 		KnownHosts:            *knownHosts,
 		ServerFingerprint:     *fingerprint,
 		StrictHostKeyChecking: *strictChecking,
+		HappyEyeballsDelay:    *happyDelay,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "relay client: %v\n", err)

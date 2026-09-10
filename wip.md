@@ -230,6 +230,78 @@ Implementation & Verification Summary:
 
 ---
 
+## Antigravity — FEAT-PERF-03: Fast 3-RTT Token-Authorized Resumption in Encrypted AEAD Plane
+
+Date: 2026-09-10.
+Implementation & Verification Summary:
+
+### 1. Architectural Implementation
+- **Fast 3-RTT Resumption with Transparent Fallback (`internal/relay/server.go`)**:
+  - Resumption requests inside the forward-secret ChaCha20-Poly1305 AEAD tunnel are verified via `store.VerifyToken(sessionID, resumeToken)`.
+  - **Fast-Path**: If the bearer token is valid, `s.resumeAuth` is completely bypassed. The server accepts the attach request immediately and responds directly with `TypeResumeOK` in **3 RTTs** (saving 1 full RTT and 2 frame turns).
+  - **Transparent Fallback**: If token verification fails (stale generation, invalid token, or corrupted token) but the session has an authorized public key (`BoundFP` / `RawPubKey`), the server transparently falls back to issuing an `AUTH_OK` challenge for cryptographic recovery rather than dropping the session.
+  - If challenge authentication succeeds, a brand-new token is generated via `store.ForceResumeToken` and returned in `TypeResumeOK`, cleanly resynchronizing the client.
+- **Session Store Token Lifecycle (`internal/session/store.go`)**:
+  - Implemented `ForceResumeToken(id)`: unconditionally purges cached unconfirmed token and rotates to a brand-new 256-bit cryptographic token.
+- **Opportunistic Client Authentication (`internal/relay/upgrade.go`)**:
+  - `writeResumeRole` opportunistically loads `msg.Auth` without blocking resumption if private keys or SSH agents are locked, provided a valid `resumeToken` is present.
+  - Transparently handles server fallback by completing `completeClientAuth` if `TypeAuthOK` is received.
+
+### 2. Verification & Testing
+- **Unit & Integration Tests (`internal/relay/auth_test.go`, `internal/session/store_test.go`)**:
+  - `TestForceResumeToken`: PASS.
+  - `TestResumeTokenAloneOrWrongKeyERRAuth`: PASS (verifies fast-path token-alone resume without client private keys, fallback rejection on wrong key with `FailDelay`, fallback recovery on good key, and subsequent fast resume).
+  - `TestResumeFastToken3RTTDirect`: PASS.
+  - Full test suite `go test -v ./...` 100% PASS with zero failures.
+- **Live Dual-Netns Simulation Benchmark (`scripts/test_perf_resume.py`)**:
+  - `PERF-01-Netem-RTT`: PASS (measured 80ms RTT with `tc netem delay 40ms`).
+  - `PERF-02-E2E-SSH`: PASS (full OpenSSH session through relay control plane).
+  - `PERF-03-3RTT-Fast-Resume-Suite`: PASS (3-RTT token-authorized resume and fallback verified in 80ms WAN netns).
+- **Regression Verification**:
+  - `scripts/test_sec_netns.py`: PASS (6/6 tests passing).
+
+---
+
+## Antigravity — FEAT-ROB-03: Dual-Stack Happy Eyeballs v2 (RFC 8305)
+
+Date: 2026-09-11.
+Implementation & Verification Summary:
+
+### 1. Architectural Implementation
+- **RFC 8305 Dual-Stack DNS Resolution (`internal/transport/happy.go`)**:
+  - Concurrent `A` (IPv4) and `AAAA` (IPv6) resolution via `IPResolver` (`net.Resolver`).
+  - Standard RFC 8305 §3 `ResolutionDelay` (50ms) to ensure IPv6 has priority when responses are close.
+  - RFC 8305 §5 address interleaving starting with IPv6: `[IPv6[0], IPv4[0], IPv6[1], IPv4[1], ...]`.
+  - IP literals (`127.0.0.1`, `::1`) bypass DNS and connect immediately.
+- **Staggered TCP Connection Racing (`internal/transport/happy.go`, `internal/transport/tcp.go`)**:
+  - Implemented `DialHappyEyeballsTCP` with configurable `ConnectionAttemptDelay` (default 250ms).
+  - Staggered connection attempts across candidates: IPv6 starts first; after 250ms (or early error on `advanceCh`), IPv4 dials concurrently.
+  - Transport-level winning criterion: first socket to complete TCP 3-way handshake (`SYN-ACK`) wins immediately, aborts competing dials, and closes loser sockets.
+  - Returns `errors.Join` aggregating errors across all candidate endpoints on complete failure.
+  - Integrated into `DialTCP` and `DialTCPWithDelay`.
+- **Dual-Stack UDP Probe Racing (`internal/transport/happy.go`, `internal/relay/upgrade.go`, `internal/relay/client.go`)**:
+  - Implemented `ProbeDualStack`: creates family-specific `UDPMux` sockets (`[::]:0` for IPv6 and `0.0.0.0:0` for IPv4).
+  - Races probes with 250ms stagger; the first candidate to receive a valid `PROBE_OK` wins.
+  - Retains the winning `UDPMux` and winning candidate address for QUIC/KCP dial; closes the losing `UDPMux` immediately.
+  - Integrated into `tryUpgrade` and `checkStrictUDPProbe`.
+- **Configuration & CLI (`internal/config`, `cmd/relay`)**:
+  - Added `happy_eyeballs_delay` (default 250ms) to client TOML configuration.
+  - Added `--happy-eyeballs-delay` CLI flag to `relay client`.
+
+### 2. Verification & Testing
+- **Unit & Race Detection Suite**:
+  - `go test -race ./...` 100% PASS across all packages.
+  - Dedicated Happy Eyeballs transport test suite in `internal/transport/happy_test.go` PASS (`TestResolveDualStackInterleaving`, `TestResolveDualStackResolutionDelay`, `TestDialHappyEyeballsTCPIPv6Wins`, `TestDialHappyEyeballsTCPIPv6BlackholeFallback`, `TestDialHappyEyeballsTCPEarlyErrorAdvance`, `TestDialHappyEyeballsTCPAllFailJoinedError`, `TestProbeDualStackHappyEyeballs`).
+  - Dedicated relay integration suite in `internal/relay/happy_test.go` PASS (`TestRelayHappyEyeballsClientConnectAndTransfer`, `TestRelayHappyEyeballsHAStandbyCarrier`).
+- **Live Dual-Netns Verification Suite (`scripts/test_happy_eyeballs.py`)**:
+  - `HE-01-Dual-Stack-Fast-V6`: PASS (IPv6 preferred winner confirmed in server logs with `fc00::2`, byte-exact 5 MiB transfer).
+  - `HE-02-IPv6-Blackhole-Fast-Fallback`: PASS (IPv6 TCP dropped via `ip6tables`; client seamlessly fell back to IPv4 in <300ms, byte-exact 5 MiB transfer).
+  - `HE-03-IPv4-Blackhole-V6-Direct`: PASS (IPv4 TCP dropped; client connected via IPv6 directly without delay, byte-exact 5 MiB transfer).
+  - `HE-04-UDP-Probe-Racing-V6-Drop`: PASS (IPv6 UDP dropped; client raced probes, upgraded to IPv4 QUIC, byte-exact 5 MiB transfer).
+  - Clean teardown verified (zero host route/firewall pollution, zero lingering netns).
+
+---
+
 ## Next agent
 
 Append a new `## <Agent>` heading below this line. Write what you changed,

@@ -108,6 +108,7 @@ type Client struct {
 	KnownHosts            string   `toml:"known_hosts"`
 	ServerFingerprint     string   `toml:"server_fingerprint"`
 	StrictHostKeyChecking string   `toml:"strict_host_key_checking"`
+	HappyEyeballsDelay    Duration `toml:"happy_eyeballs_delay"`
 }
 
 func DefaultServer() Server {
@@ -163,6 +164,7 @@ func DefaultClient() Client {
 		KnownHosts:            "",
 		ServerFingerprint:     "",
 		StrictHostKeyChecking: "ask",
+		HappyEyeballsDelay:    Duration(250 * time.Millisecond),
 	}
 }
 
@@ -192,6 +194,7 @@ type ClientOptions struct {
 	KnownHosts            string
 	ServerFingerprint     string
 	StrictHostKeyChecking string
+	HappyEyeballsDelay    time.Duration
 }
 
 func LoadServer(opts ServerOptions) (Server, error) {
@@ -276,6 +279,9 @@ func LoadClient(opts ClientOptions) (Client, error) {
 	}
 	if opts.StrictHostKeyChecking != "" {
 		cfg.StrictHostKeyChecking = opts.StrictHostKeyChecking
+	}
+	if opts.HappyEyeballsDelay > 0 {
+		cfg.HappyEyeballsDelay = Duration(opts.HappyEyeballsDelay)
 	}
 	if err := cfg.Validate(); err != nil {
 		return Client{}, err
@@ -388,6 +394,9 @@ func (c Client) Validate() error {
 	}
 	if c.DeadPeerThreshold <= 0 {
 		return fmt.Errorf("dead_peer_threshold must be positive")
+	}
+	if c.HappyEyeballsDelay <= 0 {
+		return fmt.Errorf("happy_eyeballs_delay must be positive")
 	}
 	return nil
 }
