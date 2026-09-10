@@ -527,15 +527,7 @@ func (s *Server) handleResume(ctx context.Context, conn transport.Conn, f proto.
 		writeResumeFail(conn, proto.CodeVersion, "unsupported version")
 		return
 	}
-	if err := s.store.VerifyToken(msg.SessionID, msg.ResumeToken); err != nil {
-		code, m := proto.CodeInternal, err.Error()
-		var pe *proto.Error
-		if errors.As(err, &pe) {
-			code, m = pe.Code, pe.Msg
-		}
-		writeResumeFail(conn, code, m)
-		return
-	}
+
 	s.livesMu.Lock()
 	l := s.lives[msg.SessionID]
 	s.livesMu.Unlock()
@@ -547,11 +539,32 @@ func (s *Server) handleResume(ctx context.Context, conn transport.Conn, f proto.
 		}
 		return
 	}
-	if !s.resumeAuth(conn, msg, f.Payload) {
-		return
+
+	fallback := false
+	if err := s.store.VerifyToken(msg.SessionID, msg.ResumeToken); err != nil {
+		sess := s.store.Get(msg.SessionID)
+		if s.auth.RequiresChallenge() && sess != nil && (sess.Fingerprint != "" || len(sess.PublicKey) > 0) {
+			fallback = true
+		} else {
+			code, m := proto.CodeBadToken, "bad resume token"
+			var pe *proto.Error
+			if errors.As(err, &pe) {
+				code, m = pe.Code, pe.Msg
+			}
+			writeResumeFail(conn, code, m)
+			return
+		}
 	}
+
+	if fallback {
+		l.log.Info("resume token invalid or missing; initiating cryptographic fallback", "sessionId", msg.SessionID)
+		if !s.resumeAuth(conn, msg, f.Payload) {
+			return
+		}
+	}
+
 	isStandby := msg.Role == "standby"
-	req := attachReq{conn: conn, resume: &msg, standby: isStandby, done: make(chan error, 1)}
+	req := attachReq{conn: conn, resume: &msg, standby: isStandby, fallback: fallback, done: make(chan error, 1)}
 	if isStandby {
 		if err := l.AttachStandby(req); err != nil {
 			var pe *proto.Error
@@ -585,10 +598,11 @@ func (s *Server) handleResume(ctx context.Context, conn transport.Conn, f proto.
 }
 
 type attachReq struct {
-	conn    transport.Conn
-	resume  *proto.Resume
-	standby bool
-	done    chan error
+	conn     transport.Conn
+	resume   *proto.Resume
+	standby  bool
+	fallback bool
+	done     chan error
 }
 
 type live struct {
@@ -1063,7 +1077,13 @@ func (l *live) heldMs() int {
 
 func (l *live) writeResumeOK(req attachReq, heldMs int) error {
 	var token string
-	if req.resume != nil && req.resume.Role == "standby" {
+	if req.fallback {
+		var err error
+		token, err = l.store.ForceResumeToken(l.id)
+		if err != nil {
+			return err
+		}
+	} else if req.resume != nil && req.resume.Role == "standby" {
 		token = req.resume.ResumeToken
 	} else {
 		var err error

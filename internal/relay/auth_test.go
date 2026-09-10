@@ -377,18 +377,84 @@ func TestResumeTokenAloneOrWrongKeyERRAuth(t *testing.T) {
 	}
 	_ = conn.Close()
 
-	start := time.Now()
-	fail := rawResumeAuthFail(t, ctx, addr, hello.SessionID, hello.ResumeToken, dest, "")
-	if fail.Code != proto.CodeAuth {
-		t.Fatalf("token alone: got %s want %s", fail.Code, proto.CodeAuth)
+	// 1. FEAT-PERF-03 Fast 3-RTT: Token alone with zero client private key material
+	// MUST succeed directly with RESUME_OK without triggering challenge.
+	rok := rawResumeAuthOK(t, ctx, addr, hello.SessionID, hello.ResumeToken, dest, "")
+	if rok.SessionID != hello.SessionID {
+		t.Fatalf("token alone resume: got session %s want %s", rok.SessionID, hello.SessionID)
 	}
-	if time.Since(start) < authFailDelay {
-		t.Fatalf("token-alone failure too fast")
+	if rok.ResumeToken == "" || rok.ResumeToken == hello.ResumeToken {
+		t.Fatalf("token was not rotated on resume: got %s", rok.ResumeToken)
 	}
 
-	fail = rawResumeAuthFail(t, ctx, addr, hello.SessionID, hello.ResumeToken, dest, otherPriv)
+	// 2. Fallback Path: Invalid token with wrong key triggers fallback and FAILS with ERR_AUTH.
+	badToken := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0xbb}, 32))
+	start := time.Now()
+	fail := rawResumeAuthFail(t, ctx, addr, hello.SessionID, badToken, dest, otherPriv)
 	if fail.Code != proto.CodeAuth {
-		t.Fatalf("wrong key: got %s want %s", fail.Code, proto.CodeAuth)
+		t.Fatalf("wrong key fallback: got %s want %s", fail.Code, proto.CodeAuth)
+	}
+	if time.Since(start) < authFailDelay {
+		t.Fatalf("fallback failure too fast")
+	}
+
+	// 3. Fallback Recovery: Invalid token with good key triggers fallback and SUCCEEDS with re-seeded token.
+	recovered := rawResumeAuthOK(t, ctx, addr, hello.SessionID, badToken, dest, priv)
+	if recovered.ResumeToken == "" || recovered.ResumeToken == badToken {
+		t.Fatalf("recovered token invalid: %s", recovered.ResumeToken)
+	}
+
+	// 4. Fast-path resume using the freshly recovered token alone.
+	rok2 := rawResumeAuthOK(t, ctx, addr, hello.SessionID, recovered.ResumeToken, dest, "")
+	if rok2.SessionID != hello.SessionID {
+		t.Fatalf("second resume session mismatch: got %s", rok2.SessionID)
+	}
+}
+
+func TestResumeFastToken3RTTDirect(t *testing.T) {
+	dest := startHoldDest(t)
+	dir := t.TempDir()
+	priv, pubLine := writeEd25519Key(t, dir, "good")
+	ak := filepath.Join(dir, "authorized_keys")
+	if err := os.WriteFile(ak, []byte(pubLine+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	scfg := config.DefaultServer()
+	scfg.ListenTCP = "127.0.0.1:0"
+	scfg.DefaultDestination = dest
+	scfg.AllowDestinations = []string{dest, "*"}
+	scfg.Transports = []string{"tcp"}
+	scfg.HoldTimeout = config.Duration(10 * time.Second)
+	scfg.AuthMethod = auth.MethodPublicKey
+	scfg.AuthorizedKeys = ak
+	_, addr, _ := startRelayCfg(t, scfg)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	conn, hello, err := rawHelloAuth(ctx, addr, dest, priv, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+
+	// Connect using clientResume directly and verify it completes without error
+	cliCfg := config.DefaultClient()
+	cliCfg.Server = addr
+	cliCfg.Transport = "tcp"
+	cliCfg.StrictHostKeyChecking = "no"
+	cliCfg.IdentityFiles = []string{priv}
+
+	rconn, rok, err := clientResume(ctx, cliCfg, hello.SessionID, hello.ResumeToken, 0)
+	if err != nil {
+		t.Fatalf("clientResume failed: %v", err)
+	}
+	defer rconn.Close()
+	if rok.SessionID != hello.SessionID {
+		t.Fatalf("session id mismatch: got %s", rok.SessionID)
+	}
+	if rok.ResumeToken == "" || rok.ResumeToken == hello.ResumeToken {
+		t.Fatalf("token rotation expected, got %s", rok.ResumeToken)
 	}
 }
 
@@ -566,7 +632,7 @@ func rawHelloAuth(ctx context.Context, addr, dest, identity, user string) (trans
 	return clientHello(ctx, cfg)
 }
 
-func rawResumeAuthFail(t *testing.T, ctx context.Context, addr, sessionID, token, dest, identity string) proto.Fail {
+func rawResumeAuth(t *testing.T, ctx context.Context, addr, sessionID, token, dest, identity string) (proto.Type, proto.ResumeOK, proto.Fail) {
 	t.Helper()
 	conn, err := transport.DialTCP(ctx, addr)
 	if err != nil {
@@ -646,14 +712,34 @@ func rawResumeAuthFail(t *testing.T, ctx context.Context, addr, sessionID, token
 			t.Fatal(err)
 		}
 	}
-	if reply.Type != proto.TypeResumeFail && reply.Type != proto.TypeErr {
-		t.Fatalf("got %s want ERR", reply.Type)
+	if reply.Type == proto.TypeResumeOK {
+		var ok proto.ResumeOK
+		if err := proto.UnmarshalPayload(reply, &ok); err != nil {
+			t.Fatal(err)
+		}
+		return reply.Type, ok, proto.Fail{}
 	}
 	var fail proto.Fail
-	if err := proto.UnmarshalPayload(reply, &fail); err != nil {
-		t.Fatal(err)
+	_ = proto.UnmarshalPayload(reply, &fail)
+	return reply.Type, proto.ResumeOK{}, fail
+}
+
+func rawResumeAuthFail(t *testing.T, ctx context.Context, addr, sessionID, token, dest, identity string) proto.Fail {
+	t.Helper()
+	typ, _, fail := rawResumeAuth(t, ctx, addr, sessionID, token, dest, identity)
+	if typ != proto.TypeResumeFail && typ != proto.TypeErr {
+		t.Fatalf("got %s want ERR", typ)
 	}
 	return fail
+}
+
+func rawResumeAuthOK(t *testing.T, ctx context.Context, addr, sessionID, token, dest, identity string) proto.ResumeOK {
+	t.Helper()
+	typ, ok, fail := rawResumeAuth(t, ctx, addr, sessionID, token, dest, identity)
+	if typ != proto.TypeResumeOK {
+		t.Fatalf("got %s (code=%s msg=%s) want RESUME_OK", typ, fail.Code, fail.Msg)
+	}
+	return ok
 }
 
 type writeRecordConn struct {

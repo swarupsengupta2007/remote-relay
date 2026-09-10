@@ -217,6 +217,32 @@ func (s *Store) RotateToken(id string) (string, error) {
 	return s.ResumeToken(id)
 }
 
+// ForceResumeToken unconditionally clears any unconfirmed token cache and rotates
+// to a brand-new generation token. Used during cryptographic fallback recovery.
+func (s *Store) ForceResumeToken(id string) (string, error) {
+	plain, hash, err := randomToken()
+	if err != nil {
+		return "", err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, ok := s.byID[id]
+	if !ok {
+		return "", proto.ErrUnknownSession
+	}
+	sess.currentPlain = ""
+	if sess.hasPrev {
+		delete(s.byHash, sess.PrevHash)
+	}
+	sess.PrevHash = sess.TokenHash
+	sess.hasPrev = true
+	s.byHash[sess.PrevHash] = id
+	sess.TokenHash = hash
+	s.byHash[hash] = id
+	sess.currentPlain = plain
+	return plain, nil
+}
+
 // ConfirmToken drops the previous-generation hash once the new token is live.
 func (s *Store) ConfirmToken(id string) {
 	s.mu.Lock()

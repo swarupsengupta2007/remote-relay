@@ -92,3 +92,29 @@ func TestExpireTombstone(t *testing.T) {
 		t.Fatalf("got %v want unknown", err)
 	}
 }
+
+func TestForceResumeToken(t *testing.T) {
+	st := NewStore(8)
+	sess, token, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Add(sess); err != nil {
+		t.Fatal(err)
+	}
+	unconfirmed, err := st.ResumeToken(sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// ForceResumeToken should bypass cached unconfirmed token
+	forced, err := st.ForceResumeToken(sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if forced == unconfirmed || forced == token {
+		t.Fatalf("forced token must be brand new, got %v", forced)
+	}
+	if err := st.VerifyToken(sess.ID, forced); err != nil {
+		t.Fatalf("forced token should verify: %v", err)
+	}
+}
