@@ -9,13 +9,16 @@ Each proposal includes:
 - **Technical Architecture & Implementation Specification**.
 - **Expected Impact & Validation Strategy**.
 
+> [!NOTE]
+> Detailed technical specifications, task breakdowns, and verification matrices for implemented features are archived in the [`.feat-impl/`](.feat-impl) directory (e.g. [`FEAT-ROB-01.md`](.feat-impl/FEAT-ROB-01.md), [`FEAT-SEC-01.md`](.feat-impl/FEAT-SEC-01.md)).
+
 ---
 
 ## Executive Summary & Priority Matrix
 
 | Feature ID | Feature Name | Tier | Priority | Complexity | Target Impact |
 |:---|:---|:---:|:---:|:---:|:---|
-| **FEAT-ROB-01** | Sub-Second Dead-Peer Detection & Dual-Path BFD | Tier 1: Robustness | **P1** | Complete | RFC 5880 BFD engine, sub-second drop detection & instant hot-standby failover |
+| [**FEAT-ROB-01**](.feat-impl/FEAT-ROB-01.md) | Sub-Second Dead-Peer Detection & Dual-Path BFD | Tier 1: Robustness | **P1** | Complete | RFC 5880 BFD engine, sub-second drop detection & instant hot-standby failover |
 | **FEAT-ROB-02** | Zero-Downtime Server Restart & Socket Handover | Tier 1: Robustness | **P2** | High | Upgrades server without dropping active SSH sessions |
 | **FEAT-ROB-03** | Dual-Stack Happy Eyeballs v2 (RFC 8305) | Tier 1: Robustness | **P2** | Medium | Instant connection racing across IPv4/IPv6 networks |
 | **FEAT-ROB-04** | Tiered Disk-Spill Storage for Ring Buffers | Tier 1: Robustness | **P3** | High | Prevents buffer exhaustion during prolonged outages |
@@ -23,7 +26,7 @@ Each proposal includes:
 | **FEAT-UTL-02** | Terminal Reconnection HUD & Desktop Notifications | Tier 2: Utility | **P1** | Low | Clear visual feedback and status during link drops |
 | **FEAT-UTL-03** | SOCKS5 Dynamic Forwarding Mode (`relay socks`) | Tier 2: Utility | **P2** | Medium | Expands relay beyond SSH to generic browser/DB proxy |
 | **FEAT-UTL-04** | Reverse Relay & NAT Gateway Mode (Inverted Tunnel) | Tier 2: Utility | **P2** | High | Reaches home labs and private VPCs behind NAT |
-| **FEAT-SEC-01** | Encrypted Handshake Control Plane (X25519 / ChaCha20-Poly1305) | Tier 3: Security | **P1** | Complete | SSH-style X25519 ECDH + Ed25519 host keys + ChaCha20-Poly1305 control encryption |
+| [**FEAT-SEC-01**](.feat-impl/FEAT-SEC-01.md) | Encrypted Handshake Control Plane (X25519 / ChaCha20-Poly1305) | Tier 3: Security | **P1** | Complete | SSH-style X25519 ECDH + Ed25519 host keys + ChaCha20-Poly1305 control encryption |
 | **FEAT-SEC-02** | WebSocket & HTTPS Port 443 Fallback Transport | Tier 3: Security | **P3** | High | Bypasses restrictive enterprise firewalls & DPI |
 | **FEAT-SEC-03** | Per-User RBAC & Live `SIGHUP` Configuration Reload | Tier 3: Security | **P2** | Medium | Hot updates to `authorized_keys` & destination ACLs |
 | **FEAT-PERF-01**| Linux Kernel Zero-Copy Stream Splicing (`splice(2)`) | Tier 4: Performance | **P3** | Medium | Halves CPU & memory bus overhead on multi-gigabit links |
@@ -34,7 +37,7 @@ Each proposal includes:
 
 ## Tier 1: Core Robustness & Network Fault Tolerance
 
-### FEAT-ROB-01: Sub-Second Dead-Peer Detection & Dual-Path BFD Architecture
+### [FEAT-ROB-01](.feat-impl/FEAT-ROB-01.md): Sub-Second Dead-Peer Detection & Dual-Path BFD Architecture
 * **Priority**: `P1` (High)
 * **Status**: Implemented (Complete)
 * **Target Package**: `internal/bfd`, `internal/relay`, `internal/transport`, `internal/proto`, `cmd/relay`
@@ -232,7 +235,7 @@ The current architecture assumes the server has a public IP address and the dest
 
 ## Tier 3: Security & Network Traversal Hardening
 
-### FEAT-SEC-01: Encrypted Handshake Control Plane (X25519 & ChaCha20-Poly1305)
+### [FEAT-SEC-01](.feat-impl/FEAT-SEC-01.md): Encrypted Handshake Control Plane (X25519 & ChaCha20-Poly1305)
 * **Priority**: `P1` (High)
 * **Status**: Implemented (Complete)
 * **Target Package**: `internal/crypto/kex`, `internal/proto`, `internal/config`, `internal/relay`, `cmd/relay`
