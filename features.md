@@ -31,6 +31,7 @@ Each proposal includes:
 | **FEAT-SEC-03** | Per-User RBAC & Live `SIGHUP` Configuration Reload | Tier 3: Security | **P2** | Medium | Hot updates to `authorized_keys` & destination ACLs |
 | **FEAT-PERF-01**| Linux Kernel Zero-Copy Stream Splicing (`splice(2)`) | Tier 4: Performance | **P3** | Medium | Halves CPU & memory bus overhead on multi-gigabit links |
 | **FEAT-PERF-02**| Adaptive KCP Dynamic ARQ & Congestion Tuning | Tier 4: Performance | **P3** | Medium | Dynamic packet retransmission on fluctuating mobile links |
+| **FEAT-PERF-03**| Fast 3-RTT Token-Authorized Resumption in AEAD Plane | Tier 4: Performance | **P1** | Low | Cuts 1 RTT per resume, eliminates flaky link RTO stalls & enables silent standby |
 | **FEAT-OBS-01** | Prometheus Metrics Endpoint & OpenTelemetry Tracing | Tier 4: Observability| **P2** | Low | Production-grade SLA alerting & Grafana monitoring |
 
 ---
@@ -357,6 +358,33 @@ In TCP mode, data transfer involves reading bytes from `stdin` into Go user-spac
 
 ---
 
+### FEAT-PERF-03: Fast 3-RTT Token-Authorized Resumption in Encrypted AEAD Plane
+* **Priority**: `P1` (High)
+* **Status**: Proposed
+* **Target Package**: `internal/relay`, `internal/proto`, `internal/auth`, `internal/session`
+
+#### 1. Problem Statement
+In the original Milestone 5 design, reconnection forced a complete public key challenge-response exchange (`RESUME` $\to$ `AUTH_OK` $\to$ `AUTH` $\to$ `RESUME_OK`) to prevent session hijacking because the control plane was sent in cleartext JSON.
+
+However, with the completion of [**FEAT-SEC-01**](.feat-impl/FEAT-SEC-01.md), every reconnection begins with ephemeral X25519 ECDH and Ed25519 host key verification, wrapping all subsequent frames in a ChaCha20-Poly1305 AEAD cipher. Retaining the full public key challenge-response inside this encrypted tunnel imposes severe performance penalties:
+1. **Serialization Overhead (4 RTTs / 8 Frame Turns)**: Every reconnection takes 4 sequential network turns before data streams (TCP SYN $\to$ KEX $\to$ RESUME/AUTH_OK $\to$ AUTH/RESUME_OK). On an 80ms RTT WAN link, empirical dual-netns benchmarks show an unconditional **+82ms (+34%) baseline penalty** (323ms vs 241ms).
+2. **TCP RTO Amplification on Flaky Links**: Under loss, a dropped frame during the 8-turn sequence forces TCP Retransmission Timeouts (RTOs). Dual-netns simulations at 5% packet loss demonstrated severe stalls up to **7,008ms** (mean 1,166ms vs 284ms for token-only).
+3. **Hardware Token & Standby Stalls ([FEAT-UTL-01](#feat-utl-01-native-openssh-agent-ssh_auth_sock-integration))**: YubiKey / FIDO2 security keys (`sk-ssh-ed25519@openssh.com`) and keys with confirmation (`ssh-add -c`) require physical touch or confirmation prompts. In `--allow-ha` dual-path mode, background standby reconnects continuously trigger intrusive prompts or exceed the 5-second dial timeout.
+
+#### 2. Technical Specification
+- **2-Tier Authentication & Decoupled Resumption**:
+  - **Initial Connection (`HELLO`)**: Enforces full multi-factor authentication (X25519 KEX + Ed25519 host key check + SSH public key signature). The server records the bound key fingerprint and issues a 32-byte cryptographically secure random `resumeToken`.
+  - **Resumption (`RESUME`)**: Once the ephemeral X25519 + ChaCha20-Poly1305 tunnel is established and the server host key is verified against `known_hosts`, the client sends `TypeEncrypted[RESUME]` with `sessionID` and `resumeToken`.
+  - **Single-Turn Verification**: The server verifies `store.VerifyToken(sessionID, token)`. Because the channel is forward-secret and MITM-protected, the rotating 256-bit token provides valid bearer authentication. The server skips `TypeAuthOK` challenge and responds immediately with `TypeEncrypted[RESUME_OK]`, rotating the token for the next generation.
+  - **Fallback Recovery**: If the `resumeToken` is expired, mismatched, or corrupted, the server falls back to issuing an `AUTH_OK` challenge for full cryptographic recovery rather than dropping the session.
+
+#### 3. Benefits & Verification
+- **Saves 1 Full RTT & 2 Frames**: Resumptions complete in 3 RTTs (~240ms on 80ms WAN links), eliminating 2 frame transmissions and reducing loss exposure by 25%.
+- **Unblocks FEAT-UTL-01**: Hardware security keys (YubiKey / FIDO2) require user interaction only during initial session establishment; background hot-standby loops and flaky reconnections proceed silently.
+- **Verification**: Run dual-netns simulation asserting 3-RTT completion (~240ms under 80ms RTT) and zero signature delegations on resume.
+
+---
+
 ### FEAT-OBS-01: Prometheus Metrics Exporter & OpenTelemetry Tracing
 * **Priority**: `P2` (Medium)
 * **Status**: Proposed
@@ -388,6 +416,7 @@ In TCP mode, data transfer involves reading bytes from `stdin` into Go user-spac
 ```
 Phase 1: Usability & Resiliency Quick-Wins (1–2 weeks)
 ├── FEAT-UTL-01: Native OpenSSH Agent (SSH_AUTH_SOCK)
+├── FEAT-PERF-03: Fast 3-RTT Token-Authorized Resumption (AEAD Plane)
 ├── FEAT-UTL-02: Terminal Reconnection HUD (stderr)
 └── FEAT-ROB-01: Sub-Second Dead-Peer Detection (Fast Heartbeats) [COMPLETED] (.feat-impl/FEAT-ROB-01.md)
 
