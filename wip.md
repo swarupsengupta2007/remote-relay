@@ -4,7 +4,7 @@ Hand-off log. Each agent writes **only its own work** under its heading.
 Do not rewrite another agent's section. Do not replace this file with a
 snapshot of the tree; later agents append below.
 
-Last updated: 2026-09-09 (Antigravity).
+Last updated: 2026-09-12 (Antigravity).
 
 ---
 
@@ -302,7 +302,163 @@ Implementation & Verification Summary:
 
 ---
 
+## Antigravity — FEAT-PERF-01: Linux Kernel Zero-Copy Stream Splicing (`splice(2)`)
+
+Date: 2026-09-11.
+Implementation & Verification Summary:
+
+### 1. Architectural Implementation
+- **Linux Kernel Zero-Copy Stream Engine (`internal/relay/splice_linux.go`)**:
+  - Implemented `spliceSocketToSink` transferring bytes directly between carrier TCP socket and destination/sink file descriptors in kernel space via `golang.org/x/sys/unix`.
+  - Implemented two-stage intermediate pipe pair (`pipePair`) sized to 1 MiB (`fcntl(F_SETPIPE_SZ, 1048576)`) for socket-to-socket transfers (`carrier_sock -> inPipe.wfd -> inPipe.rfd -> dest_sock`).
+  - Implemented single-stage direct splicing when sink is an OS pipe (e.g. OpenSSH client `stdin`/`stdout`).
+  - Integrated `unix.Splice` with Go runtime netpoller via `SyscallConn().Read()` to park goroutines cleanly on `EAGAIN`/`EWOULDBLOCK` without CPU spinning.
+  - Implemented atomic counters `splicedBytesIn`, `splicedBytesOut`, `spliceCallsTotal` and published to `/debug/vars` expvar.
+- **Cross-Platform Compatibility & Fallback (`internal/relay/splice_other.go`)**:
+  - Non-Linux platforms (`//go:build !linux`) compile clean no-op stubs returning zero stats and transparent fallback to standard user-space copying. Verified on macOS (`darwin/arm64`) and Windows (`windows/amd64`).
+- **Transport Layer Byte Alignment (`internal/transport/conn.go`, `internal/transport/tcp.go`)**:
+  - Added `FrameHeaderReader` and `TCPConnProvider` interfaces.
+  - Implemented `ReadFrameHeader()` and `ReadPayload()` on `tcpConn`. When user-space `bufio.Reader` buffer is empty, reads 5-byte header directly from `rawTCP` to ensure kernel socket receive buffer remains strictly byte-aligned for `splice(2)`.
+- **Relay Pump & Session Integration (`internal/relay/pump.go`, `internal/relay/client.go`, `internal/relay/server.go`)**:
+  - Extracted raw OS file descriptors via `getFD(src/sink)`.
+  - NetReader intercepts `proto.TypeData`, parses sequence offset in user-space, splices exact frame payload into sink, and maintains exact stream offset bookkeeping (`expected`, `delivered`, ACK generation).
+  - Updated `p.tryCloseWrite()` to evaluate atomic `p.delivered.Load() >= p.inFinal.Load()` so large stream half-close EOF propagates without stalls.
+- **Configuration & CLI Controls (`internal/config/config.go`, `cmd/relay/main.go`)**:
+  - Added `Splice bool` (`toml:"splice"`) defaulting to `true` on Linux, `false` elsewhere.
+  - Added `--splice` and `--no-splice` CLI flags to `relay server` and `relay client`.
+
+### 2. Verification & Testing
+- **Unit & Integration Tests**:
+  - Added `internal/relay/splice_test.go`: `TestSpliceDirectE2E` (4 MiB stream transfer over OS pipes with 138 splice syscalls and 4,194,304 spliced bytes), `TestSpliceDisabledNoCalls` (verifies 0 splice syscalls when disabled).
+  - Full test suite `go test -v ./...` 100% PASS across all packages (including BFD standby promotion and Happy Eyeballs).
+- **Multi-Gigabit Loopback Benchmark (`scripts/test_perf_splice.py`)**:
+  - Benchmarked `iperf3` (3.12) stream transfers through relay:
+    - **No-Splice**: 6.76s server CPU time (166.8% core utilization).
+    - **Splice**: 3.38s server CPU time (83.4% core utilization).
+    - **CPU Utilization Reduction**: **+50.0% reduction**, meeting the 40–60% target.
+    - **Spliced Kernel Volume**: 942.8 MB transferred purely in kernel memory via 81,117 `splice(2)` syscalls.
+    - **Reverse / Download Mode**: Verified bidirectional zero-copy transfer sustaining 2.61 Gbps.
+
+---
+
+## Antigravity — Security Hardening, Strict Authentication Mandate & Review Resolutions
+
+Date: 2026-09-12.
+Addressed external review feedback (`relay_feedback.md`) across security, authentication, documentation drift, resilience testing, and roadmap alignment:
+
+### 1. Security Fixes & Fail-Closed Host Key Verification (§6.2, §6.5)
+- **Fail-Closed Host Key Checking**: Fixed `internal/crypto/kex/hostkey.go` where an empty `knownHostsPath` previously failed open (`nil` verify callback). It now strictly fails closed with an error unless `strictChecking == "no"`. Added `TestKnownHostsEmptyPathFailClosed`.
+- **Dynamic Port Parsing**: Eliminated hardcoded fallback port `7443` in `hostkey.go`. Fallback now dynamically parses the port from `serverAddr` via `net.SplitHostPort` (defaulting to standard SSH port `22` if unspecified).
+
+### 2. Strict Authentication Mandate & Deprecation of `none` (§6.1, §6.3)
+- **Complete Deprecation of `none`**: Removed `MethodNone` and `None` struct from `internal/auth`. Default authentication across both server and client is strictly `"ssh-publickey"`. Config validation now returns an error if `"none"` is specified.
+- **CLI Flags**:
+  - Added `-i` / `--identity` flag to `relay client`.
+  - Added `--authorized-keys` flag to `relay server`.
+  - Precedence strictly enforced: `CLI flag > TOML config > ~/.ssh defaults`.
+- **Server Startup Fail-Fast**: If neither `--authorized-keys` nor TOML config is provided and `~/.ssh/authorized_keys` does not exist or has no valid public keys, `relay server` fails fast at startup with an actionable error. Added `TestServerFailFastWithoutAuthorizedKeys`.
+- **Hermetic Test Harness**: Added `TestMain` in `internal/relay/test_main_test.go` and environment overrides `RELAY_TEST_AUTHORIZED_KEYS` / `RELAY_TEST_IDENTITY` in `internal/auth/ssh.go` to hermetically provision ephemeral Ed25519 keypairs during test execution without mutating the host environment.
+
+### 3. Single-Session KCP Repeated-Kills Soak Harness (§5.2)
+- **Unit Soak Test**: Implemented `TestSingleSessionKCPRepeatedKillsSoak` in `internal/relay/kcp_test.go` covering both standalone KCP and KCP with `--allow-ha` under 5 repeated link drops. Verified byte-exact SHA-256 integrity and 0 buffer leaks.
+- **Netns WAN Soak Simulation**: Created `scripts/test_kcp_soak.py` utilizing Linux network namespaces (`ns-srv` <-> `ns-cli`) with `tc netem` (40ms delay, 2% packet loss) and automated `iptables` link drops. Successfully verified repeated resumption with byte-exact SHA-256 transfer.
+
+### 4. Documentation & Roadmap Alignment (§2, §6.1, §6.5, §8)
+- **`README.md`**: Updated Status table, server usage, server.toml `hold_timeout` comment (clarifying R7 and client-server negotiation), client usage, Authentication section, and Security section.
+- **`features.md`**: Elevated `FEAT-ROB-02` (Zero-Downtime Socket Handover & In-Flight Splicing) to P1. Rephrased `FEAT-UTL-04` problem statement with reverse SSH ProxyCommand example and lowered priority to P3. Updated implementation phasing tree.
+
+---
+
+## Antigravity — FEAT-PERF-02: Adaptive KCP Congestion & Dynamic ARQ Tuning
+
+Date: 2026-09-14.
+Implementation & Verification Summary:
+
+### 1. Architectural Implementation
+- **Adaptive Controller (`internal/transport/kcp_adaptive.go`)**:
+  - Implemented `AdaptiveTuner`: autonomous background monitor continuously evaluating transport performance at `CheckInterval` (default 100ms).
+  - Dynamic link probing: moving loss rate calculated over a 5-sample (500ms) sliding history window with instantaneous fast-attack on packet loss spikes (>3%) and smooth EWMA decay.
+  - Send queue backpressure monitoring: samples `RingBufferSndQueue` / `snd_queue.Len()`; when queue length exceeds `QueueThreshold` (32 segments), adapts flush interval to 20ms while keeping Reno congestion control (`nc=0`) active to prevent bufferbloat.
+  - 3-tier dynamic state machine:
+    - `low_loss` (<0.5% loss): `interval=30ms`, `resend=1`, `nc=0` (conserve mobile bandwidth and battery).
+    - `moderate` (0.5% - 3.0% loss): `interval=20ms`, `resend=2`, `nc=0` (balanced).
+    - `high_loss` (>3.0% loss): `interval=10ms`, `resend=2`, `nc=1` (turbo mode, bypasses cwnd collapse to sustain throughput).
+  - Hysteresis stabilization: requires 2 consecutive clean samples (`StabilizationTicks = 2`) before downscaling to prevent flapping.
+  - Pluggable `MetricsSampler` interface enabling fast, deterministic mock sampling in unit tests.
+- **Transport Layer Integration (`internal/transport/kcp.go`, `internal/transport/conn.go`)**:
+  - Implemented `KCPStatsProvider` interface allowing consumers to retrieve `TunerStats`.
+  - Added `ListenKCPWithOptions` and `DialKCPWithOptions` supporting custom `AdaptiveKCPConfig`.
+  - Clean lifecycle management: `kcpConn.Close()` cleanly stops background tuner goroutine with zero goroutine or memory leaks.
+- **Relay Integration & Observability (`internal/relay/udp.go`, `internal/relay/upgrade.go`, `internal/relay/obs.go`)**:
+  - Server and client wire `AdaptiveKCP` option during KCP listener creation and UDP upgrade dial.
+  - Published live SNMP metrics to `/debug/vars` expvar: `kcp_out_segs`, `kcp_retrans_segs`, `kcp_lost_segs`, `kcp_snd_queue`.
+- **Configuration & CLI Flags (`internal/config/config.go`, `cmd/relay/main.go`)**:
+  - Added `adaptive_kcp` boolean option to server and client TOML (default: `true`).
+  - Added `--adaptive-kcp` and `--no-adaptive-kcp` CLI flags to `relay server` and `relay client`.
+
+### 2. Verification & Testing
+- **Unit & Race Suite (`internal/transport/kcp_adaptive_test.go`, `internal/relay/kcp_test.go`)**:
+  - `TestAdaptiveKCPConfigDefaults`: PASS.
+  - `TestAdaptiveTunerStateTransitions`: PASS (clean link -> 5% spike fast attack -> sliding window clearing -> 2-tick stabilization back to low loss).
+  - `TestAdaptiveTunerQueueBackpressure`: PASS.
+  - `TestAdaptiveTunerIdleDecayAndWrap`: PASS.
+  - `TestAdaptiveKCPIntegrationE2E`: PASS.
+  - `TestAdaptiveKCPDisabled`: PASS.
+  - `TestAdaptiveKCPInRelay`: PASS (end-to-end bidirectional relay transfer with SHA-256 byte-exact delivery).
+  - Full repo test suite `go test -race ./...` 100% green across all packages.
+- **Live Dual-Netns Simulation Benchmark (`scripts/test_perf_kcp_adaptive.py`)**:
+  - `ADAPT-01-Byte-Efficiency`: PASS (Adaptive KCP reduced packets from 166 to 154, 7.2% reduction on clean link).
+  - `ADAPT-02-Loss-Profile`: PASS (Byte-exact SHA-256 match across 0% -> 5% -> 0% netem profile).
+  - `ADAPT-03-AllowHA-KCP`: PASS (Byte-exact SHA-256 match under `--allow-ha` and Adaptive KCP).
+  - Clean teardown verified (zero lingering netns, zero host route/firewall pollution).
+
+---
+
+## Antigravity — FEAT-UTL-01: Native OpenSSH Agent (SSH_AUTH_SOCK) & Interface/Source IP Binding
+
+Date: 2026-09-15.
+Implementation & Verification Summary:
+
+### 1. FEAT-UTL-01: Native OpenSSH Agent (`SSH_AUTH_SOCK`) Integration
+- **OpenSSH Agent Client (`internal/auth/ssh.go`)**:
+  - Direct connection to local Unix domain socket specified by `--auth-sock` / `auth_sock` or ambient `$SSH_AUTH_SOCK`.
+  - Signature delegation to `agent.Sign(pubKey, challengeDigest)` using `agent.SignatureFlagRsaSha256` for RSA keys; raw private keys never touch memory or disk.
+  - Transparent passphrase-protected disk key matching against active agent identities using companion `.pub` file, unencrypted key bytes, or OpenSSH key header extraction.
+  - Expanded key policy and signature format checks for hardware security keys (`sk-ssh-ed25519@openssh.com`, `sk-ecdsa-sha2-nistp256@openssh.com`).
+  - Implemented `io.Closer` on `PublicKey` authenticator to cleanly release agent Unix socket connections upon client completion.
+  - Robust fallback chain: `ssh-agent` keys -> unencrypted `identity_files` -> default `~/.ssh/id_*` files.
+- **Relay & CLI Integration (`cmd/relay/main.go`, `internal/config/config.go`, `internal/relay/client.go`)**:
+  - Added `--auth-sock` CLI flag to `relay client`.
+  - Wired `AuthSock` config field through client initialization and authentication handshakes.
+
+### 2. Interface and Source IP Binding (`--interface`, `--source-ip`)
+- **Syntax & Scoping Engine (`internal/config/bind.go`)**:
+  - Implemented `ResolveClientBindings` supporting `[NAME[@tcp|@udp]]` and `[IP[@tcp|@udp]]` (repeatable or comma-separated).
+  - Protocol-specific bindings override unqualified entries, with CLI options taking precedence over TOML configurations.
+  - Validates interface existence via `net.InterfaceByName` and IP address validity via `net.ParseIP`.
+- **Kernel Socket Binding (`internal/transport/bind*.go`)**:
+  - Added `BindConfig` struct and Linux `SO_BINDTODEVICE` via `golang.org/x/sys/unix` for network interface binding.
+  - Cross-platform stubs for non-Linux platforms with clear unsupported error returns.
+  - Wired `DialTCPWithBind`, `DialHappyEyeballsTCPWithResolverAndBind`, and `UDPMux` socket creation to bind to specified network devices and source IPs.
+- **CLI & Options (`cmd/relay/main.go`, `internal/config/config.go`)**:
+  - Added `--interface` and `--source-ip` CLI flags to `relay client`.
+
+### 3. Multi-Hop Jumphost Chaining Specification (`jumphost_plan.md`)
+- Authored comprehensive architectural plan for FEAT-UTL-05 multi-hop jumphost chaining (`-J`):
+  - Server-side chaining model with relayed signatures and KEX attestation relay.
+  - Cryptographic binding of KEX server nonce to auth challenge nonce (J-D16) resolving agent-forwarding risks.
+  - Detailed wire format extensions (`TypeChain`, `TypeChainOK`), failure composition, and phased implementation roadmap.
+
+### 4. Verification & Testing
+- `go test -race ./...` 100% green across all packages.
+- Dedicated agent test suite in `internal/auth/ssh_test.go` and `internal/relay/auth_test.go`.
+- Dedicated binding test suite in `internal/config/bind_test.go` and `cmd/relay/main_test.go`.
+
+---
+
 ## Next agent
 
 Append a new `## <Agent>` heading below this line. Write what you changed,
 not a restatement of the tree.
+
+

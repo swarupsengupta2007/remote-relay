@@ -29,11 +29,11 @@ func probeUDP(ctx context.Context, mux *transport.UDPMux, addr net.Addr, tok [16
 	return transport.Probe(ctx, mux, addr, tok, attempts, timeout)
 }
 
-func probeUDPDualStack(ctx context.Context, hostPort string, tok [16]byte, attempts int, timeout time.Duration, delay time.Duration) (*transport.UDPMux, net.Addr, error) {
+func probeUDPDualStack(ctx context.Context, hostPort string, tok [16]byte, attempts int, timeout time.Duration, delay time.Duration, bind transport.BindConfig) (*transport.UDPMux, net.Addr, error) {
 	if testDropUDPProbe.Load() {
 		return nil, nil, errors.New("udp probe timeout")
 	}
-	return transport.ProbeDualStack(ctx, hostPort, tok, attempts, timeout, delay)
+	return transport.ProbeDualStackWithBind(ctx, hostPort, tok, attempts, timeout, delay, bind)
 }
 
 type upgradeResult struct {
@@ -122,8 +122,13 @@ func tryUpgrade(ctx context.Context, p *pump, cfg config.Client, tcpConn transpo
 		return res
 	}
 
+	udpBind := transport.BindConfig{
+		Interface: cfg.UDPInterface,
+		SourceIP:  net.ParseIP(cfg.UDPSourceIP),
+	}
+
 	var firstErr error
-	mux, addr, firstErr = probeUDPDualStack(ctx, udp.Addr, tok, attempts, timeout, happyDelay)
+	mux, addr, firstErr = probeUDPDualStack(ctx, udp.Addr, tok, attempts, timeout, happyDelay, udpBind)
 	if firstErr != nil {
 		if errors.Is(firstErr, context.Canceled) || ctx.Err() != nil {
 			res.err = firstErr
@@ -166,7 +171,7 @@ func tryUpgrade(ctx context.Context, p *pump, cfg config.Client, tcpConn transpo
 					mux = nil
 				}
 				var pErr error
-				mux, addr, pErr = probeUDPDualStack(ctx, udp.Addr, tok, attempts, timeout, happyDelay)
+				mux, addr, pErr = probeUDPDualStack(ctx, udp.Addr, tok, attempts, timeout, happyDelay, udpBind)
 				if pErr != nil {
 					if log != nil {
 						log.Debug("ha udp probe attempt failed", "err", pErr)
@@ -209,7 +214,9 @@ func tryUpgrade(ctx context.Context, p *pump, cfg config.Client, tcpConn transpo
 
 		var uconn transport.Conn
 		if target == "kcp" {
-			uconn, err = transport.DialKCP(ctx, mux.KCP(), addr)
+			kcpCfg := transport.DefaultAdaptiveKCPConfig()
+			kcpCfg.Enabled = cfg.AdaptiveKCP
+			uconn, err = transport.DialKCPWithOptions(ctx, mux.KCP(), addr, kcpCfg)
 		} else {
 			qconf := transport.NewQUICConfig(p.cfg.idle, p.cfg.keepalive, p.cfg.window)
 			uconn, err = transport.DialQUIC(ctx, mux.QUIC(), addr, qconf)
@@ -255,7 +262,11 @@ func tryUpgrade(ctx context.Context, p *pump, cfg config.Client, tcpConn transpo
 				return res
 			}
 			_ = mux.Close()
-			mux, err = transport.ListenUDPMux(transport.UDPBindAll(addr))
+			bindAddr := transport.UDPBindAll(addr)
+			if udpBind.SourceIP != nil {
+				bindAddr = net.JoinHostPort(udpBind.SourceIP.String(), "0")
+			}
+			mux, err = transport.ListenUDPMuxWithBind(bindAddr, udpBind)
 			if err != nil {
 				res.err = err
 				return res
@@ -317,6 +328,9 @@ func writeResumeRole(ctx context.Context, conn transport.Conn, cfg config.Client
 		return none, err
 	}
 	a := clientAuth(cfg)
+	if c, ok := a.(io.Closer); ok {
+		defer c.Close()
+	}
 	trans := cfg.TransportPreference()
 	if role == "standby" {
 		trans = []string{"tcp"}

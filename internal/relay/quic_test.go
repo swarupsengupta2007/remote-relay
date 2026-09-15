@@ -35,6 +35,7 @@ func startRelayQUIC(t *testing.T, dest string) (*Server, string, context.CancelF
 
 func defaultQUICClient(server, dest string) config.Client {
 	ccfg := config.DefaultClient()
+	ccfg.StrictHostKeyChecking = "no"
 	ccfg.Server = server
 	ccfg.Destination = dest
 	ccfg.Transport = "quic"

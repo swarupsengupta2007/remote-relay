@@ -1,72 +1,23 @@
 package auth
 
 import (
-	"encoding/json"
 	"testing"
 )
 
-func TestNoneAcceptsEmptyAuth(t *testing.T) {
-	n := None{}
-	if n.Name() != "none" {
-		t.Fatalf("Name()=%q", n.Name())
+func TestNewAlwaysReturnsPublicKey(t *testing.T) {
+	a := New(Config{})
+	if a.Name() != MethodPublicKey {
+		t.Fatalf("expected Name=%q, got %q", MethodPublicKey, a.Name())
 	}
-	for _, raw := range []json.RawMessage{
-		nil,
-		{},
-		[]byte(""),
-		[]byte("null"),
-		[]byte("{}"),
-		[]byte(" {} "),
-	} {
-		id, err := n.Verify(Challenge{}, raw)
-		if err != nil {
-			t.Fatalf("raw=%q: %v", raw, err)
-		}
-		if id.Method != "none" {
-			t.Fatalf("identity %+v", id)
-		}
+	if !a.RequiresChallenge() {
+		t.Fatal("expected RequiresChallenge=true")
 	}
-	resp, err := n.Respond(Challenge{})
-	if err != nil {
-		t.Fatal(err)
+	if a.FailDelay() != DefaultFailDelay {
+		t.Fatalf("expected FailDelay=%v, got %v", DefaultFailDelay, a.FailDelay())
 	}
-	if string(resp) != "{}" {
-		t.Fatalf("Respond=%s", resp)
-	}
-}
 
-func TestNoneRejectsNonEmpty(t *testing.T) {
-	_, err := None{}.Verify(Challenge{}, json.RawMessage(`{"method":"ssh-publickey"}`))
-	if err == nil {
-		t.Fatal("expected error")
-	}
-}
-
-func TestNoneNoChallenge(t *testing.T) {
-	n := None{}
-	if n.RequiresChallenge() {
-		t.Fatal("none must not require a challenge")
-	}
-	if n.FailDelay() != 0 {
-		t.Fatalf("delay=%s", n.FailDelay())
-	}
-	sig, err := n.Sign(Challenge{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(sig) != "{}" {
-		t.Fatalf("Sign=%s", sig)
-	}
-}
-
-func TestNewSelectsMethod(t *testing.T) {
-	if New(Config{Method: "none"}).Name() != MethodNone {
-		t.Fatal("none")
-	}
-	if New(Config{}).Name() != MethodNone {
-		t.Fatal("default none")
-	}
-	if New(Config{Method: "ssh-publickey"}).Name() != MethodPublicKey {
-		t.Fatal("ssh-publickey")
+	a2 := New(Config{Method: "ssh-publickey"})
+	if a2.Name() != MethodPublicKey {
+		t.Fatalf("expected Name=%q, got %q", MethodPublicKey, a2.Name())
 	}
 }

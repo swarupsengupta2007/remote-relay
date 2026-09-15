@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/remote-relay/relay/internal/config"
+	"github.com/remote-relay/relay/internal/crypto/kex"
 	"github.com/remote-relay/relay/internal/logging"
 	"github.com/remote-relay/relay/internal/proto"
 	"github.com/remote-relay/relay/internal/transport"
@@ -371,6 +372,83 @@ func TestSecStrictHostKeyCheckingModes(t *testing.T) {
 			t.Fatalf("expected success with StrictHostKeyChecking=no, got: %v", err)
 		}
 		_ = conn.Close()
+	}
+
+	// 6. Mode "ask" without interactive terminal fails
+	{
+		cliCfg := config.DefaultClient()
+		cliCfg.Server = srvAddr
+		cliCfg.Destination = dest
+		cliCfg.Transport = "tcp"
+		cliCfg.KnownHosts = filepath.Join(tmpDir, "ask_known_hosts")
+		cliCfg.StrictHostKeyChecking = "ask"
+		cliCfg.LogLevel = "error"
+
+		ctx, cancelCtx := context.WithTimeout(context.Background(), 3*time.Second)
+		conn, _, err := clientHello(ctx, cliCfg)
+		cancelCtx()
+		if err == nil {
+			if conn != nil {
+				_ = conn.Close()
+			}
+			t.Fatal("expected failure with StrictHostKeyChecking=ask in non-interactive environment, got success")
+		}
+	}
+
+	// 7. Mode "ask" with user answering "no" fails
+	{
+		oldReader, oldWriter := kex.PromptReader, kex.PromptWriter
+		kex.PromptReader = strings.NewReader("no\n")
+		var out bytes.Buffer
+		kex.PromptWriter = &out
+		cliCfg := config.DefaultClient()
+		cliCfg.Server = srvAddr
+		cliCfg.Destination = dest
+		cliCfg.Transport = "tcp"
+		cliCfg.KnownHosts = filepath.Join(tmpDir, "ask_known_hosts")
+		cliCfg.StrictHostKeyChecking = "ask"
+		cliCfg.LogLevel = "error"
+
+		ctx, cancelCtx := context.WithTimeout(context.Background(), 3*time.Second)
+		conn, _, err := clientHello(ctx, cliCfg)
+		cancelCtx()
+		kex.PromptReader, kex.PromptWriter = oldReader, oldWriter
+		if err == nil {
+			if conn != nil {
+				_ = conn.Close()
+			}
+			t.Fatal("expected failure with StrictHostKeyChecking=ask when user rejects, got success")
+		}
+	}
+
+	// 8. Mode "ask" with user answering "yes" succeeds and records key
+	{
+		askKH := filepath.Join(tmpDir, "ask_known_hosts")
+		oldReader, oldWriter := kex.PromptReader, kex.PromptWriter
+		kex.PromptReader = strings.NewReader("yes\n")
+		var out bytes.Buffer
+		kex.PromptWriter = &out
+		cliCfg := config.DefaultClient()
+		cliCfg.Server = srvAddr
+		cliCfg.Destination = dest
+		cliCfg.Transport = "tcp"
+		cliCfg.KnownHosts = askKH
+		cliCfg.StrictHostKeyChecking = "ask"
+		cliCfg.LogLevel = "error"
+
+		ctx, cancelCtx := context.WithTimeout(context.Background(), 3*time.Second)
+		conn, _, err := clientHello(ctx, cliCfg)
+		cancelCtx()
+		kex.PromptReader, kex.PromptWriter = oldReader, oldWriter
+		if err != nil {
+			t.Fatalf("expected success with StrictHostKeyChecking=ask when user accepts, got: %v", err)
+		}
+		_ = conn.Close()
+
+		data, err := os.ReadFile(askKH)
+		if err != nil || len(data) == 0 {
+			t.Fatalf("expected known_hosts to be written after ask confirmation, got err=%v len=%d", err, len(data))
+		}
 	}
 }
 

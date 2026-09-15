@@ -13,6 +13,7 @@ import (
 	"io"
 	"log/slog"
 	"math/big"
+	"net"
 	"sync"
 	"time"
 
@@ -100,6 +101,8 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 		conn:      conn,
 		src:       src,
 		sink:      bw,
+		rawSrc:    stdin,
+		rawSink:   stdout,
 		flushSink: bw.Flush,
 		closeSrc:  func() error { stopSrc(); return nil },
 		outDir:    proto.DirUp,
@@ -114,6 +117,7 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 		heartbeat:     cfg.HeartbeatInterval.Duration(),
 		deadThreshold: cfg.DeadPeerThreshold,
 		log:           log,
+		splice:        cfg.Splice,
 	}, sendLog)
 	p.startIO()
 	defer p.shutdown()
@@ -248,9 +252,17 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 				_ = nconn.Close()
 				return fmt.Errorf("udp route unavailable and --allow-ha not specified: server does not provide udp transport")
 			}
-			if err := checkStrictUDPProbe(ctx, cfg, nconn, udp); err != nil {
+			if perr := checkStrictUDPProbe(ctx, cfg, nconn, udp); perr != nil {
 				_ = nconn.Close()
-				return err
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				err = perr
+				if serr := sleepBackoff(ctx, schedule, attempt, deadline); serr != nil {
+					break
+				}
+				attempt++
+				continue
 			}
 			current = nconn
 			sendFrom = rok.UpAcked
@@ -285,12 +297,17 @@ func clientAuth(cfg config.Client) auth.Authenticator {
 		Method:        cfg.AuthMethod,
 		User:          cfg.AuthUser,
 		IdentityFiles: cfg.IdentityFiles,
+		AuthSock:      cfg.AuthSock,
 	})
 }
 
 func clientHello(ctx context.Context, cfg config.Client) (transport.Conn, proto.HelloOK, error) {
 	var none proto.HelloOK
-	conn, err := transport.DialTCPWithDelay(ctx, cfg.Server, cfg.HappyEyeballsDelay.Duration())
+	tcpBind := transport.BindConfig{
+		Interface: cfg.TCPInterface,
+		SourceIP:  net.ParseIP(cfg.TCPSourceIP),
+	}
+	conn, err := transport.DialTCPWithDelayAndBind(ctx, cfg.Server, cfg.HappyEyeballsDelay.Duration(), tcpBind)
 	if err != nil {
 		return nil, none, fmt.Errorf("dial server: %w", err)
 	}
@@ -338,6 +355,9 @@ func clientHello(ctx context.Context, cfg config.Client) (transport.Conn, proto.
 
 	// 3. Send encrypted HELLO, complete auth, read encrypted HELLO_OK
 	a := clientAuth(cfg)
+	if c, ok := a.(io.Closer); ok {
+		defer c.Close()
+	}
 	nonce, err := proto.RandomNonce()
 	if err != nil {
 		_ = cipherConn.Close()
@@ -457,7 +477,11 @@ func clientResume(ctx context.Context, cfg config.Client, sessionID, token strin
 
 func clientResumeRole(ctx context.Context, cfg config.Client, sessionID, token string, downAcked uint64, role string) (transport.Conn, proto.ResumeOK, error) {
 	var none proto.ResumeOK
-	conn, err := transport.DialTCPWithDelay(ctx, cfg.Server, cfg.HappyEyeballsDelay.Duration())
+	tcpBind := transport.BindConfig{
+		Interface: cfg.TCPInterface,
+		SourceIP:  net.ParseIP(cfg.TCPSourceIP),
+	}
+	conn, err := transport.DialTCPWithDelayAndBind(ctx, cfg.Server, cfg.HappyEyeballsDelay.Duration(), tcpBind)
 	if err != nil {
 		return nil, none, err
 	}
@@ -547,13 +571,17 @@ func checkStrictUDPProbe(ctx context.Context, cfg config.Client, conn transport.
 	if happyDelay <= 0 {
 		happyDelay = transport.DefaultConnectionAttemptDelay
 	}
-	mux, _, err := probeUDPDualStack(ctx, udp.Addr, tok, attempts, timeout, happyDelay)
+	udpBind := transport.BindConfig{
+		Interface: cfg.UDPInterface,
+		SourceIP:  net.ParseIP(cfg.UDPSourceIP),
+	}
+	mux, _, err := probeUDPDualStack(ctx, udp.Addr, tok, attempts, timeout, happyDelay, udpBind)
 	if mux != nil {
 		_ = mux.Close()
 	}
 	if err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
-			return err
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
 		return fmt.Errorf("udp route unavailable and --allow-ha not specified: %w", err)
 	}

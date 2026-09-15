@@ -7,8 +7,10 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
+	"github.com/remote-relay/relay/internal/auth"
 	"github.com/remote-relay/relay/internal/config"
 	"github.com/remote-relay/relay/internal/logging"
 	"github.com/remote-relay/relay/internal/relay"
@@ -45,8 +47,8 @@ func run(args []string) int {
 func usage() {
 	fmt.Fprintf(os.Stderr, `usage: relay <server|client|version> [flags]
 
-  relay server [--config PATH] [--listen HOST:PORT] [--host-key PATH] [--log-level LVL]
-  relay client --server HOST:PORT [--dest HOST:PORT] [--tcp|--kcp] [--allow-ha] [--server-fingerprint FP] [--known-hosts PATH] [--config PATH] [--log-level LVL] [%%h %%p]
+  relay server [--config PATH] [--listen HOST:PORT] [--host-key PATH] [--splice|--no-splice] [--adaptive-kcp|--no-adaptive-kcp] [--log-level LVL]
+  relay client --server HOST:PORT [--dest HOST:PORT] [--tcp|--kcp] [--allow-ha] [--splice|--no-splice] [--adaptive-kcp|--no-adaptive-kcp] [--interface NAME[@proto]] [--source-ip IP[@proto]] [--auth-sock PATH] [--server-fingerprint FP] [--known-hosts PATH] [--config PATH] [--log-level LVL] [%%h %%p]
   relay version
 `)
 }
@@ -60,11 +62,32 @@ func runServer(args []string) int {
 	heartbeat := fs.Duration("heartbeat-interval", 0, "BFD heartbeat interval (default: 750ms)")
 	deadThreshold := fs.Int("dead-peer-threshold", 0, "BFD dead peer missed heartbeat threshold (default: 3)")
 	hostKey := fs.String("host-key", "", "path to server Ed25519 host key")
+	authorizedKeys := fs.String("authorized-keys", "", "path to authorized_keys file")
+	splice := fs.Bool("splice", false, "enable Linux kernel zero-copy stream splicing (splice(2))")
+	noSplice := fs.Bool("no-splice", false, "disable Linux kernel zero-copy stream splicing")
+	adaptiveKCP := fs.Bool("adaptive-kcp", false, "enable dynamic adaptive ARQ and congestion tuning for KCP")
+	noAdaptiveKCP := fs.Bool("no-adaptive-kcp", false, "disable dynamic adaptive ARQ and congestion tuning for KCP")
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return 0
 		}
 		return 2
+	}
+	var spliceOpt *bool
+	if *noSplice {
+		f := false
+		spliceOpt = &f
+	} else if *splice {
+		t := true
+		spliceOpt = &t
+	}
+	var adaptiveKCPOpt *bool
+	if *noAdaptiveKCP {
+		f := false
+		adaptiveKCPOpt = &f
+	} else if *adaptiveKCP {
+		t := true
+		adaptiveKCPOpt = &t
 	}
 	cfg, err := config.LoadServer(config.ServerOptions{
 		ConfigPath:        *configPath,
@@ -73,10 +96,22 @@ func runServer(args []string) int {
 		HeartbeatInterval: *heartbeat,
 		DeadPeerThreshold: *deadThreshold,
 		HostKey:           *hostKey,
+		AuthorizedKeys:    *authorizedKeys,
+		Splice:            spliceOpt,
+		AdaptiveKCP:       adaptiveKCPOpt,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "relay server: %v\n", err)
 		return 1
+	}
+	// Fail fast if flag and TOML config are absent and default ~/.ssh/authorized_keys is missing/invalid
+	if *authorizedKeys == "" && cfg.AuthorizedKeys == "" {
+		defAK := auth.DefaultAuthorizedKeys()
+		if !auth.HasValidAuthorizedKeys(defAK) {
+			fmt.Fprintf(os.Stderr, "relay server: no authorized_keys specified via --authorized-keys or TOML, and default %q is missing or has no valid keys; failing fast\n", defAK)
+			return 1
+		}
+		cfg.AuthorizedKeys = defAK
 	}
 	log := logging.New(os.Stderr, cfg.LogLevel, cfg.LogFormat)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -87,6 +122,17 @@ func runServer(args []string) int {
 		return 1
 	}
 	return 0
+}
+
+type stringSliceFlag []string
+
+func (s *stringSliceFlag) String() string {
+	return strings.Join(*s, ",")
+}
+
+func (s *stringSliceFlag) Set(val string) error {
+	*s = append(*s, val)
+	return nil
 }
 
 func runClient(args []string) int {
@@ -103,13 +149,42 @@ func runClient(args []string) int {
 	deadThreshold := fs.Int("dead-peer-threshold", 0, "BFD dead peer missed heartbeat threshold (default: 3)")
 	knownHosts := fs.String("known-hosts", "", "path to client known_hosts file")
 	fingerprint := fs.String("server-fingerprint", "", "pinned SHA256 server host key fingerprint (SHA256:...)")
-	strictChecking := fs.String("strict-host-key-checking", "", "strict host key checking: yes|no|ask")
+	strictChecking := fs.String("strict-host-key-checking", "", "strict host key checking: yes|no|ask|accept-new")
 	happyDelay := fs.Duration("happy-eyeballs-delay", 0, "RFC 8305 connection attempt delay across dual-stack addresses (default: 250ms)")
+	identity := fs.String("identity", "", "path to client private key identity file")
+	fs.StringVar(identity, "i", "", "path to client private key identity file (shorthand)")
+	authSock := fs.String("auth-sock", "", "path to ssh-agent Unix socket (overrides $SSH_AUTH_SOCK)")
+	var interfaces stringSliceFlag
+	var sourceIPs stringSliceFlag
+	fs.Var(&interfaces, "interface", "bind to network interface [NAME[@tcp|@udp]] (repeatable or comma-separated)")
+	fs.Var(&sourceIPs, "source-ip", "bind to source IP address [IP[@tcp|@udp]] (repeatable or comma-separated)")
+	splice := fs.Bool("splice", false, "enable Linux kernel zero-copy stream splicing (splice(2))")
+	noSplice := fs.Bool("no-splice", false, "disable Linux kernel zero-copy stream splicing")
+	adaptiveKCP := fs.Bool("adaptive-kcp", false, "enable dynamic adaptive ARQ and congestion tuning for KCP")
+	noAdaptiveKCP := fs.Bool("no-adaptive-kcp", false, "disable dynamic adaptive ARQ and congestion tuning for KCP")
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return 0
 		}
 		return 2
+	}
+
+	var spliceOpt *bool
+	if *noSplice {
+		f := false
+		spliceOpt = &f
+	} else if *splice {
+		t := true
+		spliceOpt = &t
+	}
+
+	var adaptiveKCPOpt *bool
+	if *noAdaptiveKCP {
+		f := false
+		adaptiveKCPOpt = &f
+	} else if *adaptiveKCP {
+		t := true
+		adaptiveKCPOpt = &t
 	}
 
 	destSet := false
@@ -164,6 +239,12 @@ func runClient(args []string) int {
 		ServerFingerprint:     *fingerprint,
 		StrictHostKeyChecking: *strictChecking,
 		HappyEyeballsDelay:    *happyDelay,
+		Identity:              *identity,
+		AuthSock:              *authSock,
+		Splice:                spliceOpt,
+		AdaptiveKCP:           adaptiveKCPOpt,
+		Interfaces:            interfaces,
+		SourceIPs:             sourceIPs,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "relay client: %v\n", err)

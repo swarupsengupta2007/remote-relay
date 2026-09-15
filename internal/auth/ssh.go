@@ -6,8 +6,12 @@ import (
 	"crypto/rsa"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -16,6 +20,7 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/agent"
 )
 
 const minRSABits = 2048
@@ -36,8 +41,9 @@ type authMsg struct {
 type PublicKey struct {
 	cfg Config
 
-	mu      sync.Mutex
-	signers []ssh.Signer
+	mu        sync.Mutex
+	signers   []ssh.Signer
+	agentConn io.Closer
 }
 
 func NewPublicKey(cfg Config) *PublicKey {
@@ -45,6 +51,17 @@ func NewPublicKey(cfg Config) *PublicKey {
 		cfg.IdentityFiles = append([]string(nil), cfg.IdentityFiles...)
 	}
 	return &PublicKey{cfg: cfg}
+}
+
+func (p *PublicKey) Close() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.agentConn != nil {
+		err := p.agentConn.Close()
+		p.agentConn = nil
+		return err
+	}
+	return nil
 }
 
 func (p *PublicKey) Name() string { return MethodPublicKey }
@@ -63,7 +80,18 @@ func (p *PublicKey) Respond(ch Challenge) (json.RawMessage, error) {
 	if err != nil {
 		return nil, err
 	}
-	pub := signers[0].PublicKey()
+	var pub ssh.PublicKey
+	if ch.BoundFP != "" {
+		for _, s := range signers {
+			if fingerprintEqual(ssh.FingerprintSHA256(s.PublicKey()), ch.BoundFP) {
+				pub = s.PublicKey()
+				break
+			}
+		}
+	}
+	if pub == nil {
+		pub = signers[0].PublicKey()
+	}
 	offer := Offer{
 		Method:      MethodPublicKey,
 		User:        p.user(),
@@ -84,6 +112,17 @@ func (p *PublicKey) Sign(ch Challenge) (json.RawMessage, error) {
 		want = pub
 	}
 	signer, err := p.signerFor(want)
+	if err != nil && ch.BoundFP != "" {
+		p.mu.Lock()
+		for _, s := range p.signers {
+			if fingerprintEqual(ssh.FingerprintSHA256(s.PublicKey()), ch.BoundFP) {
+				signer = s
+				err = nil
+				break
+			}
+		}
+		p.mu.Unlock()
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -200,14 +239,100 @@ func (p *PublicKey) getSigners() ([]ssh.Signer, error) {
 	return signers, nil
 }
 
-func (p *PublicKey) loadSigners() ([]ssh.Signer, error) {
-	files := p.cfg.IdentityFiles
-	if len(files) == 0 {
-		files = DefaultIdentityFiles()
+func (p *PublicKey) connectAgent() (agent.Agent, io.Closer) {
+	if p.cfg.Agent != nil {
+		return p.cfg.Agent, nil
 	}
+	sock := p.cfg.AuthSock
+	if sock == "" {
+		sock = defaultAuthSock()
+	}
+	if sock == "" || sock == "none" {
+		return nil, nil
+	}
+	conn, err := net.Dial("unix", sock)
+	if err != nil {
+		return nil, nil
+	}
+	return agent.NewClient(conn), conn
+}
+
+func defaultAuthSock() string {
+	if s := os.Getenv("RELAY_TEST_AUTH_SOCK"); s != "" {
+		return s
+	}
+	if os.Getenv("RELAY_TEST_IDENTITY") != "" {
+		return ""
+	}
+	return os.Getenv("SSH_AUTH_SOCK")
+}
+
+func (p *PublicKey) loadSigners() ([]ssh.Signer, error) {
+	var agentSigners []ssh.Signer
+	ag, closer := p.connectAgent()
+	if closer != nil {
+		p.agentConn = closer
+	}
+	if ag != nil {
+		if rawSigners, err := ag.Signers(); err == nil {
+			for _, s := range rawSigners {
+				if err := checkKeyPolicy(s.PublicKey()); err == nil {
+					agentSigners = append(agentSigners, s)
+				}
+			}
+		}
+	}
+
 	var out []ssh.Signer
-	for _, f := range files {
-		b, err := os.ReadFile(expandHome(f))
+
+	// Case 1: Specific identity files requested
+	if len(p.cfg.IdentityFiles) > 0 {
+		for _, f := range p.cfg.IdentityFiles {
+			exp := expandHome(f)
+			// A. Check if matching signer exists in ssh-agent
+			pub := extractPublicKey(exp)
+			var matched ssh.Signer
+			if pub != nil {
+				want := pub.Marshal()
+				for _, as := range agentSigners {
+					got := as.PublicKey().Marshal()
+					if len(got) == len(want) && subtle.ConstantTimeCompare(got, want) == 1 {
+						matched = as
+						break
+					}
+				}
+			}
+			if matched != nil {
+				out = append(out, matched)
+				continue
+			}
+
+			// B. Fall back to unencrypted file on disk
+			b, err := os.ReadFile(exp)
+			if err == nil {
+				signer, err := ssh.ParsePrivateKey(b)
+				if err == nil && checkKeyPolicy(signer.PublicKey()) == nil {
+					out = append(out, signer)
+					continue
+				}
+			}
+		}
+		if len(out) == 0 {
+			return nil, fmt.Errorf("auth: no usable identity found for specified identity_files (specify valid unencrypted key or load in ssh-agent)")
+		}
+		return out, nil
+	}
+
+	// Case 2: No specific identity files: Fallback Chain
+	// 1. Try active ssh-agent keys
+	if len(agentSigners) > 0 {
+		out = append(out, agentSigners...)
+	}
+
+	// 2. Fall back to unencrypted default files on disk
+	for _, f := range DefaultIdentityFiles() {
+		exp := expandHome(f)
+		b, err := os.ReadFile(exp)
 		if err != nil {
 			continue
 		}
@@ -218,10 +343,13 @@ func (p *PublicKey) loadSigners() ([]ssh.Signer, error) {
 		if err := checkKeyPolicy(signer.PublicKey()); err != nil {
 			continue
 		}
-		out = append(out, signer)
+		if !containsSigner(out, signer.PublicKey()) {
+			out = append(out, signer)
+		}
 	}
+
 	if len(out) == 0 {
-		return nil, fmt.Errorf("auth: no usable identity file")
+		return nil, fmt.Errorf("auth: no usable identity found in ssh-agent or identity files (specify --identity/-i, add a key to ssh-agent, or configure ~/.ssh/id_ed25519)")
 	}
 	return out, nil
 }
@@ -247,6 +375,9 @@ func (p *PublicKey) signerFor(pub ssh.PublicKey) (ssh.Signer, error) {
 var errAuth = fmt.Errorf("auth failed")
 
 func DefaultAuthorizedKeys() string {
+	if p := os.Getenv("RELAY_TEST_AUTHORIZED_KEYS"); p != "" {
+		return p
+	}
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
 		return ""
@@ -255,6 +386,9 @@ func DefaultAuthorizedKeys() string {
 }
 
 func DefaultIdentityFiles() []string {
+	if p := os.Getenv("RELAY_TEST_IDENTITY"); p != "" {
+		return []string{p}
+	}
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
 		return nil
@@ -301,7 +435,8 @@ func parseOfferKey(raw json.RawMessage) (ssh.PublicKey, string, error) {
 	return pub, offer.User, nil
 }
 
-func loadAuthorizedKeys(path string) ([]ssh.PublicKey, error) {
+// LoadAuthorizedKeys reads and parses all OpenSSH public keys from path.
+func LoadAuthorizedKeys(path string) ([]ssh.PublicKey, error) {
 	if path == "" {
 		return nil, errAuth
 	}
@@ -324,14 +459,113 @@ func loadAuthorizedKeys(path string) ([]ssh.PublicKey, error) {
 	return keys, nil
 }
 
+// HasValidAuthorizedKeys returns true if path exists and contains at least one valid public key.
+func HasValidAuthorizedKeys(path string) bool {
+	keys, err := LoadAuthorizedKeys(path)
+	return err == nil && len(keys) > 0
+}
+
+func loadAuthorizedKeys(path string) ([]ssh.PublicKey, error) {
+	return LoadAuthorizedKeys(path)
+}
+
+func containsSigner(signers []ssh.Signer, pub ssh.PublicKey) bool {
+	want := pub.Marshal()
+	for _, s := range signers {
+		got := s.PublicKey().Marshal()
+		if len(got) == len(want) && subtle.ConstantTimeCompare(got, want) == 1 {
+			return true
+		}
+	}
+	return false
+}
+
+func extractPublicKey(path string) ssh.PublicKey {
+	if pubBytes, err := os.ReadFile(path + ".pub"); err == nil {
+		if pub, _, _, _, err := ssh.ParseAuthorizedKey(pubBytes); err == nil {
+			return pub
+		}
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	if signer, err := ssh.ParsePrivateKey(data); err == nil {
+		return signer.PublicKey()
+	}
+	if pub, _, _, _, err := ssh.ParseAuthorizedKey(data); err == nil {
+		return pub
+	}
+	if pub, err := extractOpenSSHPublicKey(data); err == nil {
+		return pub
+	}
+	return nil
+}
+
+func extractOpenSSHPublicKey(data []byte) (ssh.PublicKey, error) {
+	block, _ := pem.Decode(data)
+	if block == nil || block.Type != "OPENSSH PRIVATE KEY" {
+		return nil, fmt.Errorf("not openssh private key")
+	}
+	b := block.Bytes
+	prefix := append([]byte("openssh-key-v1"), 0x00)
+	if !bytes.HasPrefix(b, prefix) {
+		return nil, fmt.Errorf("bad openssh key header")
+	}
+	b = b[len(prefix):]
+	readString := func() ([]byte, bool) {
+		if len(b) < 4 {
+			return nil, false
+		}
+		l := binary.BigEndian.Uint32(b)
+		b = b[4:]
+		if uint32(len(b)) < l {
+			return nil, false
+		}
+		s := b[:l]
+		b = b[l:]
+		return s, true
+	}
+	if _, ok := readString(); !ok {
+		return nil, fmt.Errorf("bad cipher")
+	}
+	if _, ok := readString(); !ok {
+		return nil, fmt.Errorf("bad kdf")
+	}
+	if _, ok := readString(); !ok {
+		return nil, fmt.Errorf("bad kdfopts")
+	}
+	if len(b) < 4 {
+		return nil, fmt.Errorf("bad num keys")
+	}
+	nkeys := binary.BigEndian.Uint32(b)
+	b = b[4:]
+	if nkeys == 0 {
+		return nil, fmt.Errorf("zero keys")
+	}
+	pubBytes, ok := readString()
+	if !ok {
+		return nil, fmt.Errorf("bad pub bytes")
+	}
+	return ssh.ParsePublicKey(pubBytes)
+}
+
 func checkKeyPolicy(pub ssh.PublicKey) error {
 	switch pub.Type() {
-	case ssh.KeyAlgoED25519, ssh.KeyAlgoECDSA256, ssh.KeyAlgoECDSA384, ssh.KeyAlgoECDSA521:
+	case ssh.KeyAlgoED25519, ssh.KeyAlgoSKED25519, ssh.KeyAlgoSKECDSA256,
+		ssh.KeyAlgoECDSA256, ssh.KeyAlgoECDSA384, ssh.KeyAlgoECDSA521:
 		return nil
 	case ssh.KeyAlgoRSA:
 		cp, ok := pub.(ssh.CryptoPublicKey)
 		if !ok {
-			return errAuth
+			parsed, err := ssh.ParsePublicKey(pub.Marshal())
+			if err != nil {
+				return errAuth
+			}
+			cp, ok = parsed.(ssh.CryptoPublicKey)
+			if !ok {
+				return errAuth
+			}
 		}
 		rsaPub, ok := cp.CryptoPublicKey().(*rsa.PublicKey)
 		if !ok || rsaPub.N.BitLen() < minRSABits {
@@ -347,6 +581,10 @@ func allowedSigFormat(format string, pub ssh.PublicKey) bool {
 	switch format {
 	case ssh.KeyAlgoED25519:
 		return pub.Type() == ssh.KeyAlgoED25519
+	case ssh.KeyAlgoSKED25519:
+		return pub.Type() == ssh.KeyAlgoSKED25519
+	case ssh.KeyAlgoSKECDSA256:
+		return pub.Type() == ssh.KeyAlgoSKECDSA256
 	case ssh.KeyAlgoECDSA256, ssh.KeyAlgoECDSA384, ssh.KeyAlgoECDSA521:
 		return pub.Type() == format
 	case ssh.KeyAlgoRSASHA256, ssh.KeyAlgoRSASHA512:

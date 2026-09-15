@@ -169,11 +169,16 @@ type TCPDialFunc func(ctx context.Context, network, addr string) (net.Conn, erro
 
 // DialHappyEyeballsTCP dials a remote TCP host:port implementing RFC 8305 Happy Eyeballs v2.
 func DialHappyEyeballsTCP(ctx context.Context, addr string, delay time.Duration) (Conn, error) {
-	return DialHappyEyeballsTCPWithResolver(ctx, addr, delay, nil, nil)
+	return DialHappyEyeballsTCPWithResolverAndBind(ctx, addr, delay, nil, nil, BindConfig{})
 }
 
 // DialHappyEyeballsTCPWithResolver dials with an explicit IPResolver and optional dial function for testing.
 func DialHappyEyeballsTCPWithResolver(ctx context.Context, addr string, delay time.Duration, resolver IPResolver, dialFn TCPDialFunc) (Conn, error) {
+	return DialHappyEyeballsTCPWithResolverAndBind(ctx, addr, delay, resolver, dialFn, BindConfig{})
+}
+
+// DialHappyEyeballsTCPWithResolverAndBind dials with an explicit IPResolver, dial function, and BindConfig.
+func DialHappyEyeballsTCPWithResolverAndBind(ctx context.Context, addr string, delay time.Duration, resolver IPResolver, dialFn TCPDialFunc, bind BindConfig) (Conn, error) {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, err
@@ -182,6 +187,26 @@ func DialHappyEyeballsTCPWithResolver(ctx context.Context, addr string, delay ti
 	ips, err := ResolveDualStack(ctx, resolver, host)
 	if err != nil {
 		return nil, fmt.Errorf("resolve %s: %w", host, err)
+	}
+
+	if bind.SourceIP != nil {
+		var filtered []net.IP
+		isV4 := bind.SourceIP.To4() != nil
+		for _, ip := range ips {
+			if isV4 && ip.To4() != nil {
+				filtered = append(filtered, ip)
+			} else if !isV4 && ip.To4() == nil {
+				filtered = append(filtered, ip)
+			}
+		}
+		if len(filtered) == 0 {
+			fam := "IPv4"
+			if !isV4 {
+				fam = "IPv6"
+			}
+			return nil, fmt.Errorf("no %s addresses found for %s matching %s source IP %s", fam, host, fam, bind.SourceIP)
+		}
+		ips = filtered
 	}
 
 	if delay <= 0 {
@@ -193,6 +218,12 @@ func DialHappyEyeballsTCPWithResolver(ctx context.Context, addr string, delay ti
 			d := net.Dialer{
 				Timeout:   dialTimeout,
 				KeepAlive: tcpKeepAlive,
+			}
+			if bind.SourceIP != nil {
+				d.LocalAddr = &net.TCPAddr{IP: bind.SourceIP}
+			}
+			if bind.Interface != "" {
+				d.Control = BindToDeviceControl(bind.Interface)
 			}
 			return d.DialContext(cctx, network, candAddr)
 		}
@@ -285,11 +316,19 @@ type ProbeFunc func(ctx context.Context, mux *UDPMux, addr net.Addr, token [16]b
 // with RFC 8305 staggered connection attempt racing. The winning UDPMux and remote address
 // are retained and returned; losing sockets are cleanly closed.
 func ProbeDualStack(ctx context.Context, hostPort string, token [16]byte, attempts int, timeout time.Duration, delay time.Duration) (*UDPMux, net.Addr, error) {
-	return ProbeDualStackWithResolver(ctx, hostPort, token, attempts, timeout, delay, nil, nil)
+	return ProbeDualStackWithResolverAndBind(ctx, hostPort, token, attempts, timeout, delay, nil, nil, BindConfig{})
+}
+
+func ProbeDualStackWithBind(ctx context.Context, hostPort string, token [16]byte, attempts int, timeout time.Duration, delay time.Duration, bind BindConfig) (*UDPMux, net.Addr, error) {
+	return ProbeDualStackWithResolverAndBind(ctx, hostPort, token, attempts, timeout, delay, nil, nil, bind)
 }
 
 // ProbeDualStackWithResolver probes candidate UDP endpoints with an explicit IPResolver and optional ProbeFunc for testing.
 func ProbeDualStackWithResolver(ctx context.Context, hostPort string, token [16]byte, attempts int, timeout time.Duration, delay time.Duration, resolver IPResolver, probeFn ProbeFunc) (*UDPMux, net.Addr, error) {
+	return ProbeDualStackWithResolverAndBind(ctx, hostPort, token, attempts, timeout, delay, resolver, probeFn, BindConfig{})
+}
+
+func ProbeDualStackWithResolverAndBind(ctx context.Context, hostPort string, token [16]byte, attempts int, timeout time.Duration, delay time.Duration, resolver IPResolver, probeFn ProbeFunc, bind BindConfig) (*UDPMux, net.Addr, error) {
 	host, portStr, err := net.SplitHostPort(hostPort)
 	if err != nil {
 		return nil, nil, err
@@ -302,6 +341,26 @@ func ProbeDualStackWithResolver(ctx context.Context, hostPort string, token [16]
 	ips, err := ResolveDualStack(ctx, resolver, host)
 	if err != nil {
 		return nil, nil, fmt.Errorf("resolve %s: %w", host, err)
+	}
+
+	if bind.SourceIP != nil {
+		var filtered []net.IP
+		isV4 := bind.SourceIP.To4() != nil
+		for _, ip := range ips {
+			if isV4 && ip.To4() != nil {
+				filtered = append(filtered, ip)
+			} else if !isV4 && ip.To4() == nil {
+				filtered = append(filtered, ip)
+			}
+		}
+		if len(filtered) == 0 {
+			fam := "IPv4"
+			if !isV4 {
+				fam = "IPv6"
+			}
+			return nil, nil, fmt.Errorf("no %s addresses found for %s matching %s source IP %s", fam, host, fam, bind.SourceIP)
+		}
+		ips = filtered
 	}
 
 	if delay <= 0 {
@@ -323,11 +382,15 @@ func ProbeDualStackWithResolver(ctx context.Context, hostPort string, token [16]
 	}
 
 	if len(candAddrs) == 1 {
-		mux, err := ListenUDPMux(UDPBindAll(candAddrs[0]))
+		bindAddr := UDPBindAll(candAddrs[0])
+		if bind.SourceIP != nil {
+			bindAddr = net.JoinHostPort(bind.SourceIP.String(), "0")
+		}
+		mux, err := ListenUDPMuxWithBind(bindAddr, bind)
 		if err != nil {
 			return nil, nil, err
 		}
-		if err := Probe(ctx, mux, candAddrs[0], token, attempts, timeout); err != nil {
+		if err := probeFn(ctx, mux, candAddrs[0], token, attempts, timeout); err != nil {
 			_ = mux.Close()
 			return nil, nil, err
 		}
@@ -347,12 +410,20 @@ func ProbeDualStackWithResolver(ctx context.Context, hostPort string, token [16]
 		defer muxLock.Unlock()
 		if addr.IP.To4() != nil {
 			if muxV4 == nil && errV4 == nil {
-				muxV4, errV4 = ListenUDPMux("0.0.0.0:0")
+				bindAddr := "0.0.0.0:0"
+				if bind.SourceIP != nil {
+					bindAddr = net.JoinHostPort(bind.SourceIP.String(), "0")
+				}
+				muxV4, errV4 = ListenUDPMuxWithBind(bindAddr, bind)
 			}
 			return muxV4, errV4
 		}
 		if muxV6 == nil && errV6 == nil {
-			muxV6, errV6 = ListenUDPMux("[::]:0")
+			bindAddr := "[::]:0"
+			if bind.SourceIP != nil {
+				bindAddr = net.JoinHostPort(bind.SourceIP.String(), "0")
+			}
+			muxV6, errV6 = ListenUDPMuxWithBind(bindAddr, bind)
 		}
 		return muxV6, errV6
 	}

@@ -45,10 +45,31 @@ type UDPMux struct {
 }
 
 func ListenUDPMux(addr string) (*UDPMux, error) {
+	return ListenUDPMuxWithBind(addr, BindConfig{})
+}
+
+func ListenUDPMuxWithBind(addr string, bind BindConfig) (*UDPMux, error) {
 	if addr == "" {
 		addr = "0.0.0.0:7443"
 	}
-	pc, err := net.ListenPacket("udp", addr)
+	if bind.SourceIP != nil {
+		_, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			port = "0"
+		}
+		addr = net.JoinHostPort(bind.SourceIP.String(), port)
+	}
+
+	var pc net.PacketConn
+	var err error
+	if bind.Interface != "" {
+		lc := net.ListenConfig{
+			Control: BindToDeviceControl(bind.Interface),
+		}
+		pc, err = lc.ListenPacket(context.Background(), "udp", addr)
+	} else {
+		pc, err = net.ListenPacket("udp", addr)
+	}
 	if err != nil {
 		return nil, err
 	}

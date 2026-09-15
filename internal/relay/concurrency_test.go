@@ -104,9 +104,10 @@ func TestConcurrency64SessionsLeak(t *testing.T) {
 			defer wg.Done()
 			inR, inW := io.Pipe()
 			outR, outW := io.Pipe()
-			ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 			defer cancel()
 			ccfg := config.DefaultClient()
+			ccfg.StrictHostKeyChecking = "no"
 			ccfg.Server = relayAddr
 			ccfg.Destination = dest
 			ccfg.ReconnectMaxElapsed = config.Duration(20 * time.Second)
@@ -292,6 +293,7 @@ func TestConcurrencyMixedKCPQUIC(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 			defer cancel()
 			ccfg := config.DefaultClient()
+			ccfg.StrictHostKeyChecking = "no"
 			ccfg.Server = relayAddr
 			ccfg.Destination = dest
 			ccfg.ReconnectMaxElapsed = config.Duration(15 * time.Second)

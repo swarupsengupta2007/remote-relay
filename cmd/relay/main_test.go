@@ -246,4 +246,160 @@ log_level = "info"
 	if cfg.KnownHosts != "/tmp/custom_known_hosts" || cfg.ServerFingerprint != "SHA256:abc123" || cfg.StrictHostKeyChecking != "yes" {
 		t.Fatalf("unexpected security options: %+v", cfg)
 	}
+
+	// 9. Identity flag override
+	cfg, err = config.LoadClient(config.ClientOptions{
+		ConfigPath: confPath,
+		Identity:   "/tmp/my_test_key",
+	})
+	if err != nil {
+		t.Fatalf("load config with identity: %v", err)
+	}
+	if len(cfg.IdentityFiles) != 1 || cfg.IdentityFiles[0] != "/tmp/my_test_key" {
+		t.Fatalf("expected IdentityFiles to contain /tmp/my_test_key, got %+v", cfg.IdentityFiles)
+	}
+}
+
+func TestServerFailFastWithoutAuthorizedKeys(t *testing.T) {
+	t.Setenv("HOME", t.TempDir()) // Ensure default ~/.ssh/authorized_keys does not exist
+
+	// 1. Without flag or TOML, server must fail fast (exit code 1)
+	code := run([]string{"server", "--listen", "127.0.0.1:0"})
+	if code != 1 {
+		t.Fatalf("expected server to fail fast with code 1, got %d", code)
+	}
+
+	// 2. With --authorized-keys flag provided, server does not fail fast on missing flag
+	// It accepts the flag path without complaining
+	dir := t.TempDir()
+	ak := filepath.Join(dir, "authorized_keys")
+	_ = os.WriteFile(ak, []byte("# empty\n"), 0o600)
+	opts := config.ServerOptions{
+		AuthorizedKeys: ak,
+	}
+	cfg, err := config.LoadServer(opts)
+	if err != nil {
+		t.Fatalf("expected LoadServer to succeed with flag, got %v", err)
+	}
+	if cfg.AuthorizedKeys != ak {
+		t.Fatalf("expected AuthorizedKeys=%s, got %s", ak, cfg.AuthorizedKeys)
+	}
+}
+
+func TestAdaptiveKCPCLIFlags(t *testing.T) {
+	dir := t.TempDir()
+	confPath := filepath.Join(dir, "client.toml")
+	_ = os.WriteFile(confPath, []byte("server = \"127.0.0.1:7443\"\n"), 0o600)
+
+	tr := true
+	fl := false
+
+	// Client flag --adaptive-kcp
+	cfg, err := config.LoadClient(config.ClientOptions{
+		ConfigPath:  confPath,
+		AdaptiveKCP: &tr,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.AdaptiveKCP {
+		t.Fatalf("expected AdaptiveKCP=true, got %v", cfg.AdaptiveKCP)
+	}
+
+	// Client flag --no-adaptive-kcp
+	cfg, err = config.LoadClient(config.ClientOptions{
+		ConfigPath:  confPath,
+		AdaptiveKCP: &fl,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AdaptiveKCP {
+		t.Fatalf("expected AdaptiveKCP=false, got %v", cfg.AdaptiveKCP)
+	}
+
+	// Server options
+	scfg, err := config.LoadServer(config.ServerOptions{
+		AdaptiveKCP: &tr,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !scfg.AdaptiveKCP {
+		t.Fatalf("expected Server AdaptiveKCP=true, got %v", scfg.AdaptiveKCP)
+	}
+
+	scfg, err = config.LoadServer(config.ServerOptions{
+		AdaptiveKCP: &fl,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scfg.AdaptiveKCP {
+		t.Fatalf("expected Server AdaptiveKCP=false, got %v", scfg.AdaptiveKCP)
+	}
+}
+
+func TestInterfaceAndSourceIPCLIFlags(t *testing.T) {
+	var code int
+
+	// 1. Invalid interface fails fast with exit code 1
+	_, stderr := captureOutput(func() {
+		code = run([]string{"client", "--server", "127.0.0.1:7443", "--interface", "nonexistent_dev_42"})
+	})
+	if code != 1 {
+		t.Fatalf("expected code 1, got %d (stderr: %s)", code, stderr)
+	}
+	if !strings.Contains(stderr, "interface \"nonexistent_dev_42\" not found") {
+		t.Fatalf("expected not found error, got %s", stderr)
+	}
+
+	// 2. Invalid source IP fails fast with exit code 1
+	_, stderr = captureOutput(func() {
+		code = run([]string{"client", "--server", "127.0.0.1:7443", "--source-ip", "999.999.999.999"})
+	})
+	if code != 1 {
+		t.Fatalf("expected code 1, got %d (stderr: %s)", code, stderr)
+	}
+	if !strings.Contains(stderr, "invalid source ip") {
+		t.Fatalf("expected invalid source ip error, got %s", stderr)
+	}
+
+	// 3. Duplicate flag for same leg fails with exit code 1
+	_, stderr = captureOutput(func() {
+		code = run([]string{"client", "--server", "127.0.0.1:7443", "--interface", "lo@tcp", "--interface", "lo@tcp"})
+	})
+	if code != 1 {
+		t.Fatalf("expected code 1, got %d (stderr: %s)", code, stderr)
+	}
+	if !strings.Contains(stderr, "conflicting/duplicate interface for tcp") {
+		t.Fatalf("expected duplicate interface error, got %s", stderr)
+	}
+
+	// 4. Unknown protocol suffix fails with exit code 1
+	_, stderr = captureOutput(func() {
+		code = run([]string{"client", "--server", "127.0.0.1:7443", "--interface", "lo@sctp"})
+	})
+	if code != 1 {
+		t.Fatalf("expected code 1, got %d (stderr: %s)", code, stderr)
+	}
+	if !strings.Contains(stderr, "unknown protocol \"sctp\"") {
+		t.Fatalf("expected unknown protocol error, got %s", stderr)
+	}
+
+	// 5. Valid CLI flags parsed through LoadClient
+	cfg, err := config.LoadClient(config.ClientOptions{
+		Server:     "127.0.0.1:7443",
+		Interfaces: []string{"lo@tcp", "lo@udp"},
+		SourceIPs:  []string{"127.0.0.1@tcp", "127.0.0.2@udp"},
+	})
+	if err != nil {
+		t.Fatalf("LoadClient: %v", err)
+	}
+	if cfg.TCPInterface != "lo" || cfg.UDPInterface != "lo" {
+		t.Fatalf("expected lo/lo, got %s/%s", cfg.TCPInterface, cfg.UDPInterface)
+	}
+	if cfg.TCPSourceIP != "127.0.0.1" || cfg.UDPSourceIP != "127.0.0.2" {
+		t.Fatalf("expected 127.0.0.1/127.0.0.2, got %s/%s", cfg.TCPSourceIP, cfg.UDPSourceIP)
+	}
 }

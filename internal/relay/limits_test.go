@@ -21,6 +21,7 @@ func startHeldClients(t *testing.T, n int, server, dest string) {
 		outR, outW := io.Pipe()
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		ccfg := config.DefaultClient()
+		ccfg.StrictHostKeyChecking = "no"
 		ccfg.Server = server
 		ccfg.Destination = dest
 		ccfg.Transport = "tcp"
@@ -61,6 +62,7 @@ func TestMaxSessionsRefusesHELLO(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel()
 	ccfg := config.DefaultClient()
+	ccfg.StrictHostKeyChecking = "no"
 	ccfg.Server = addr
 	ccfg.Destination = dest
 	ccfg.Transport = "tcp"
@@ -90,6 +92,7 @@ func TestMaxConnsPerIPRefusesNinth(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel()
 	ccfg := config.DefaultClient()
+	ccfg.StrictHostKeyChecking = "no"
 	ccfg.Server = addr
 	ccfg.Destination = dest
 	ccfg.Transport = "tcp"
@@ -136,6 +139,7 @@ func TestMaxConnsPerIPResumeThenNinthHELLO(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel()
 	ccfg := config.DefaultClient()
+	ccfg.StrictHostKeyChecking = "no"
 	ccfg.Server = addr
 	ccfg.Destination = dest
 	ccfg.Transport = "tcp"

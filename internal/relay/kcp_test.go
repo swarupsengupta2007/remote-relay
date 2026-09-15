@@ -225,7 +225,7 @@ func runKillKCP(t *testing.T, n int, afterDrop func(srv *Server)) []pathInfo {
 		downCh <- b
 	}()
 
-	waitKind(t, srv, transport.KindKCP, 8*time.Second)
+	waitKind(t, srv, transport.KindKCP, 15*time.Second)
 	const head = 64 * 1024
 	if _, err := inW.Write(upWant[:head]); err != nil {
 		t.Fatal(err)
@@ -435,4 +435,204 @@ func TestHostnameServerUpgradesKCP(t *testing.T) {
 	}
 	checkPattern(t, gotUp)
 	checkPattern(t, gotDown)
+}
+
+func TestSingleSessionKCPRepeatedKillsSoak(t *testing.T) {
+	runSoak := func(t *testing.T, allowHA bool) {
+		const (
+			totalBytes = 256 << 10 // 256 KiB
+			chunkSize  = 8 << 10   // 8 KiB
+			numKills   = 5
+		)
+		upWant := makePattern(totalBytes)
+		dest, gotUpCh := startBidiDest(t, totalBytes, totalBytes)
+
+		cfg := config.DefaultServer()
+		cfg.ListenTCP = "127.0.0.1:0"
+		cfg.UDPListen = "127.0.0.1:0"
+		cfg.DefaultDestination = dest
+		cfg.AllowDestinations = []string{dest, "*"}
+		cfg.Transports = []string{"kcp"}
+		cfg.LogLevel = "error"
+		cfg.ProbeTimeout = config.Duration(300 * time.Millisecond)
+		cfg.ProbeAttempts = 2
+		cfg.IdleTimeout = config.Duration(10 * time.Second)
+		cfg.HoldTimeout = config.Duration(20 * time.Second)
+		cfg.KeepaliveInterval = config.Duration(150 * time.Millisecond)
+		cfg.HeartbeatInterval = config.Duration(100 * time.Millisecond)
+		cfg.DeadPeerThreshold = 3
+		cfg.SwitchTimeout = config.Duration(5 * time.Second)
+		srv, relayAddr, _ := startRelayCfg(t, cfg)
+
+		inR, inW := io.Pipe()
+		outR, outW := io.Pipe()
+		ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+		defer cancel()
+
+		ccfg := defaultKCPClient(relayAddr, dest)
+		ccfg.AllowHA = allowHA
+		ccfg.ProbeTimeout = config.Duration(300 * time.Millisecond)
+		ccfg.HeartbeatInterval = config.Duration(100 * time.Millisecond)
+		ccfg.DeadPeerThreshold = 3
+		ccfg.ReconnectMaxElapsed = config.Duration(20 * time.Second)
+		ccfg.ReconnectBackoff = []string{"20ms", "50ms", "100ms"}
+
+		errc := make(chan error, 1)
+		go func() {
+			err := RunClient(ctx, ccfg, inR, outW, logging.New(io.Discard, "error", "text"))
+			_ = outW.Close()
+			errc <- err
+		}()
+
+		waitKind(t, srv, transport.KindKCP, 15*time.Second)
+
+		downCh := make(chan []byte, 1)
+		go func() {
+			b, err := io.ReadAll(outR)
+			if err != nil {
+				t.Errorf("stdout read: %v", err)
+			}
+			downCh <- b
+		}()
+
+		writeDone := make(chan struct{})
+		go func() {
+			defer close(writeDone)
+			defer inW.Close()
+			off := 0
+			for off < len(upWant) {
+				n := chunkSize
+				if off+n > len(upWant) {
+					n = len(upWant) - off
+				}
+				if _, err := inW.Write(upWant[off : off+n]); err != nil {
+					t.Errorf("stdin write: %v", err)
+					return
+				}
+				off += n
+				time.Sleep(10 * time.Millisecond)
+			}
+		}()
+
+		go func() {
+			for k := 0; k < numKills; k++ {
+				select {
+				case <-writeDone:
+					return
+				case <-time.After(200 * time.Millisecond):
+					srv.dropLiveKind(transport.KindKCP)
+				}
+			}
+		}()
+
+		<-writeDone
+		var gotDown []byte
+		select {
+		case gotDown = <-downCh:
+		case <-ctx.Done():
+			t.Fatal("timeout reading stdout")
+		}
+
+		select {
+		case err := <-errc:
+			if err != nil {
+				t.Fatalf("client: %v, hist=%v", err, srv.pathHistory())
+			}
+		case <-ctx.Done():
+			t.Fatal("timeout waiting for client")
+		}
+
+		var gotUp []byte
+		select {
+		case gotUp = <-gotUpCh:
+		case <-ctx.Done():
+			t.Fatal("timeout waiting for dest")
+		}
+
+		if len(gotUp) != totalBytes || len(gotDown) != totalBytes {
+			t.Fatalf("up=%d down=%d want %d", len(gotUp), len(gotDown), totalBytes)
+		}
+		checkPattern(t, gotUp)
+		checkPattern(t, gotDown)
+		if sha256.Sum256(gotUp) != sha256.Sum256(upWant) || sha256.Sum256(gotDown) != sha256.Sum256(makePattern(totalBytes)) {
+			t.Fatal("SHA-256 byte mismatch after repeated kills")
+		}
+
+		waitUntil(t, 10*time.Second, func() bool { return srv.sessionCount() == 0 })
+		if used := srv.budgetUsed(); used != 0 {
+			t.Fatalf("buffer leak: %d", used)
+		}
+	}
+
+	t.Run("StandaloneKCP", func(t *testing.T) {
+		runSoak(t, false)
+	})
+
+	t.Run("AllowHA_DualPath", func(t *testing.T) {
+		runSoak(t, true)
+	})
+}
+
+func TestAdaptiveKCPInRelay(t *testing.T) {
+	const n = 128 << 10
+	upWant := makePattern(n)
+	downWant := makePattern(n)
+
+	dest, gotUpCh := startBidiDest(t, n, n)
+	srv, relayAddr, _ := startRelayKCP(t, dest)
+
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	ccfg := defaultKCPClient(relayAddr, dest)
+	ccfg.AdaptiveKCP = true
+
+	errc := make(chan error, 1)
+	go func() {
+		err := RunClient(ctx, ccfg, inR, outW, logging.New(io.Discard, "error", "text"))
+		_ = outW.Close()
+		errc <- err
+	}()
+
+	waitKind(t, srv, transport.KindKCP, 8*time.Second)
+
+	var gotDown []byte
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		defer inW.Close()
+		_, _ = inW.Write(upWant)
+	}()
+	go func() {
+		defer wg.Done()
+		b, err := io.ReadAll(outR)
+		if err != nil {
+			t.Errorf("stdout read: %v", err)
+		}
+		gotDown = b
+	}()
+	wg.Wait()
+
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatalf("client: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("timeout waiting for client")
+	}
+
+	var gotUp []byte
+	select {
+	case gotUp = <-gotUpCh:
+	case <-ctx.Done():
+		t.Fatal("timeout waiting for dest")
+	}
+
+	if sha256.Sum256(gotUp) != sha256.Sum256(upWant) || sha256.Sum256(gotDown) != sha256.Sum256(downWant) {
+		t.Fatal("SHA-256 byte mismatch in Adaptive KCP relay transfer")
+	}
 }

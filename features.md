@@ -19,19 +19,19 @@ Each proposal includes:
 | Feature ID | Feature Name | Tier | Priority | Complexity | Target Impact |
 |:---|:---|:---:|:---:|:---:|:---|
 | [**FEAT-ROB-01**](.feat-impl/FEAT-ROB-01.md) | Sub-Second Dead-Peer Detection & Dual-Path BFD | Tier 1: Robustness | **P1** | Complete | RFC 5880 BFD engine, sub-second drop detection & instant hot-standby failover |
-| **FEAT-ROB-02** | Zero-Downtime Server Restart & Socket Handover | Tier 1: Robustness | **P2** | High | Upgrades server without dropping active SSH sessions |
+| **FEAT-ROB-02** | Zero-Downtime Server Restart & Socket Handover | Tier 1: Robustness | **P1** | High | Upgrades server without dropping active SSH sessions |
 | [**FEAT-ROB-03**](.feat-impl/FEAT-ROB-03.md) | Dual-Stack Happy Eyeballs v2 (RFC 8305) | Tier 1: Robustness | **P2** | Complete | Instant connection racing across IPv4/IPv6 networks |
 | **FEAT-ROB-04** | Tiered Disk-Spill Storage for Ring Buffers | Tier 1: Robustness | **P3** | High | Prevents buffer exhaustion during prolonged outages |
-| **FEAT-UTL-01** | Native OpenSSH Agent (`SSH_AUTH_SOCK`) Support | Tier 2: Utility | **P1** | Low | Passphrase-protected keys & FIDO2/YubiKey support |
+| [**FEAT-UTL-01**](.feat-impl/FEAT-UTL-01.md) | Native OpenSSH Agent (`SSH_AUTH_SOCK`) Support | Tier 2: Utility | **P1** | Complete | Passphrase-protected keys & FIDO2/YubiKey support |
 | **FEAT-UTL-02** | Terminal Reconnection HUD & Desktop Notifications | Tier 2: Utility | **P1** | Low | Clear visual feedback and status during link drops |
 | **FEAT-UTL-03** | SOCKS5 Dynamic Forwarding Mode (`relay socks`) | Tier 2: Utility | **P2** | Medium | Expands relay beyond SSH to generic browser/DB proxy |
 | **FEAT-UTL-04** | Reverse Relay & NAT Gateway Mode (Inverted Tunnel) | Tier 2: Utility | **P2** | High | Reaches home labs and private VPCs behind NAT |
 | [**FEAT-SEC-01**](.feat-impl/FEAT-SEC-01.md) | Encrypted Handshake Control Plane (X25519 / ChaCha20-Poly1305) | Tier 3: Security | **P1** | Complete | SSH-style X25519 ECDH + Ed25519 host keys + ChaCha20-Poly1305 control encryption |
 | **FEAT-SEC-02** | WebSocket & HTTPS Port 443 Fallback Transport | Tier 3: Security | **P3** | High | Bypasses restrictive enterprise firewalls & DPI |
 | **FEAT-SEC-03** | Per-User RBAC & Live `SIGHUP` Configuration Reload | Tier 3: Security | **P2** | Medium | Hot updates to `authorized_keys` & destination ACLs |
-| **FEAT-PERF-01**| Linux Kernel Zero-Copy Stream Splicing (`splice(2)`) | Tier 4: Performance | **P3** | Medium | Halves CPU & memory bus overhead on multi-gigabit links |
-| **FEAT-PERF-02**| Adaptive KCP Dynamic ARQ & Congestion Tuning | Tier 4: Performance | **P3** | Medium | Dynamic packet retransmission on fluctuating mobile links |
-| **FEAT-PERF-03**| Fast 3-RTT Token-Authorized Resumption in AEAD Plane | Tier 4: Performance | **P1** | Low | Cuts 1 RTT per resume, eliminates flaky link RTO stalls & enables silent standby |
+| [**FEAT-PERF-01**](.feat-impl/FEAT-PERF-01.md)| Linux Kernel Zero-Copy Stream Splicing (`splice(2)`) | Tier 4: Performance | **P3** | Complete | Halves CPU & memory bus overhead on multi-gigabit links |
+| [**FEAT-PERF-02**](.feat-impl/FEAT-PERF-02.md)| Adaptive KCP Dynamic ARQ & Congestion Tuning | Tier 4: Performance | **P3** | Complete | Dynamic packet retransmission on fluctuating mobile links |
+| [**FEAT-PERF-03**](.feat-impl/FEAT-PERF-03.md)| Fast 3-RTT Token-Authorized Resumption in AEAD Plane | Tier 4: Performance | **P1** | Complete | Cuts 1 RTT per resume, eliminates flaky link RTO stalls & enables silent standby |
 | **FEAT-OBS-01** | Prometheus Metrics Endpoint & OpenTelemetry Tracing | Tier 4: Observability| **P2** | Low | Production-grade SLA alerting & Grafana monitoring |
 
 ---
@@ -44,7 +44,7 @@ Each proposal includes:
 * **Target Package**: `internal/bfd`, `internal/relay`, `internal/transport`, `internal/proto`, `cmd/relay`
 
 #### 1. Problem Statement
-In [`client.go`](file:///root/remote-relay/internal/relay/client.go), the client originally relied on [`cfg.IdleTimeout`](file:///root/remote-relay/internal/config/config.go) (default `30s`) and OS TCP keepalives to detect connection termination. If a mobile device changed cell towers, switched from Wi-Fi to cellular, or put a laptop into sleep mode, packets were silently dropped (blackholed). The user’s terminal froze for 30 to 60 seconds before the client recognized the outage and entered the reconnect loop.
+WAN links drop unpredictably due to Wi-Fi roaming, cell-tower handoffs, and intermediate router timeouts. While the relay transparently resumes broken links upon detection, TCP transport idle timeouts take 30–60+ seconds to identify a broken link. During this blackhole period, developer SSH commands hang unresponsive.
 
 #### 2. Technical Implementation
 - **RFC 5880 Asynchronous BFD Engine (`internal/bfd`)**: Implemented 20-byte binary packet payload state machine (`Down`, `Init`, `Up`) over `proto.TypePing` (0x15). Unsolicited `proto.TypePong` echo dropped.
@@ -59,7 +59,7 @@ In [`client.go`](file:///root/remote-relay/internal/relay/client.go), the client
 ---
 
 ### FEAT-ROB-02: Zero-Downtime Server Restarts & Socket Handover (`LISTEN_FDS` / `SCM_RIGHTS`)
-* **Priority**: `P2` (Medium)
+* **Priority**: `P1` (High)
 * **Status**: Proposed
 * **Target Package**: `internal/relay`, `cmd/relay`, `internal/session`
 
@@ -127,10 +127,10 @@ Session ring buffers in [`session.Ring`](file:///root/remote-relay/internal/sess
 
 ## Tier 2: Practical Utility & Developer Workflows
 
-### FEAT-UTL-01: Native OpenSSH Agent (`SSH_AUTH_SOCK`) Integration
+### [FEAT-UTL-01](.feat-impl/FEAT-UTL-01.md): Native OpenSSH Agent (`SSH_AUTH_SOCK`) Integration
 * **Priority**: `P1` (High)
-* **Status**: Proposed
-* **Target Package**: `internal/auth`
+* **Status**: Complete ([`.feat-impl/FEAT-UTL-01.md`](.feat-impl/FEAT-UTL-01.md))
+* **Target Package**: `internal/auth`, `internal/config`, `cmd/relay`, `internal/relay`
 
 #### 1. Problem Statement
 The current SSH public key authenticator in [`ssh.go`](file:///root/remote-relay/internal/auth/ssh.go) directly parses unencrypted private keys from disk files (`identity_files = ["~/.ssh/id_ed25519"]`). It cannot use:
@@ -212,7 +212,16 @@ Because stdout is reserved exclusively for the raw SSH byte stream, the client p
 * **Target Package**: `cmd/relay`, `internal/relay`
 
 #### 1. Problem Statement
-The current architecture assumes the server has a public IP address and the destination is reachable from the server. If the target machine is located behind NAT, CGNAT, or firewall (such as a home lab server, IoT appliance, or private cloud instance), external access requires third-party tools (e.g. `frp`, `cloudflared`, `bore`).
+The current architecture assumes the server has a public IP address and the destination is reachable from the server. If the target machine is located behind NAT, CGNAT, or firewall (such as a home lab server, IoT appliance, or private cloud instance), external access typically requires reverse forwarding.
+
+> **Clarification**: When the NATed node can dial outbound to a public jump host, standard OpenSSH reverse forwarding already solves NAT traversal using `remote-relay client` and `server` today without requiring `FEAT-UTL-04`:
+> ```bash
+> # On the NATed machine:
+> ssh -R 127.0.0.1:44022:127.0.0.1:22 user@jump.example \
+>     -o ProxyCommand="relay client --server jump.example:7443 --kcp -i ~/.ssh/id_ed25519"
+> ```
+> The relay transparently carries the opaque SSH session across NAT with full KCP resilience, BFD dead-peer detection, and hot-standby failover. OpenSSH on the jump host owns the port listener and enforces `authorized_keys` `permitlisten=` restrictions.
+> `FEAT-UTL-04` specifically provides a dedicated agent/client rendezvous protocol (`relay agent` / `--target`) for environments where operators do not want OpenSSH reverse listeners or multi-session forward ports on the relay host.
 
 #### 2. Technical Specification
 - **Agent Subcommand (`relay agent`)**:
@@ -250,7 +259,7 @@ As noted in [`design.md` §10.1](file:///root/remote-relay/design.md#L500-L511),
   - Server identity authenticated via Ed25519 host key signature over the complete cryptographic exchange transcript hash $H$.
 - **Host Key Management & Fingerprint Verification**:
   - Auto-generated or file-based OpenSSH Ed25519 server host keys (`--host-key`).
-  - OpenSSH-format `known_hosts` verification (`~/.config/relay/known_hosts`, `--known-hosts`) with Trust On First Use (TOFU), MITM change detection, and strict checking policies (`--strict-host-key-checking=yes|no|accept-new`).
+  - OpenSSH-format `known_hosts` verification (`~/.config/relay/known_hosts`, `--known-hosts`) with Trust On First Use (TOFU), MITM change detection, and strict checking policies (`--strict-host-key-checking=yes|no|ask|accept-new`).
   - Explicit fingerprint pinning via `--server-fingerprint SHA256:...`.
 - **ChaCha20-Poly1305 AEAD Symmetric Framing (`TypeEncrypted` 0x0D)**:
   - ChaCha20-Poly1305 authenticated encryption with strictly increasing 64-bit sequence counters (`CipherConn`).
@@ -318,43 +327,50 @@ Strict enterprise firewalls, corporate proxies, and public Wi-Fi portals (e.g. h
 
 ## Tier 4: Performance & Enterprise Observability
 
-### FEAT-PERF-01: Linux Kernel Zero-Copy Stream Splicing (`splice(2)`)
+### [FEAT-PERF-01](.feat-impl/FEAT-PERF-01.md): Linux Kernel Zero-Copy Stream Splicing (`splice(2)`)
 * **Priority**: `P3` (Low)
-* **Status**: Proposed
-* **Target Package**: `internal/relay`
+* **Status**: Implemented (Complete)
+* **Target Package**: `internal/relay`, `internal/transport`, `internal/config`, `cmd/relay`
 
 #### 1. Problem Statement
-In TCP mode, data transfer involves reading bytes from `stdin` into Go user-space buffers and writing them to the network socket (and vice versa for `stdout`). This user/kernel context switching and memory copying imposes CPU cache pressure and bottlenecks throughput on multi-gigabit links.
+In TCP mode, data transfer previously involved reading bytes from the carrier network socket into Go user-space buffers and writing them to destination sockets or pipes. This user/kernel context switching and double memory copying imposed CPU cache pressure and memory bus bottlenecks on multi-gigabit links.
 
-#### 2. Technical Specification
+#### 2. Technical Implementation
 - **Direct Pipe Splicing**:
-  - On Linux (`GOOS=linux`), utilize the `splice(2)` system call via `golang.org/x/sys/unix`.
-  - Directly splice descriptor pipes: `splice(stdin_fd -> pipe -> socket_fd)` and `splice(socket_fd -> pipe -> stdout_fd)`.
-  - Maintain offset bookkeeping by intercepting the spliced byte counts.
+  - On Linux (`GOOS=linux`), utilize `splice(2)` via `golang.org/x/sys/unix` for kernel-level zero-copy data movement.
+  - Implemented two-stage intermediate kernel pipe bridging (`socket_fd -> pipe -> dest_fd`) and single-stage pipe splicing (`socket_fd -> stdout_pipe`).
+  - Integrated with Go netpoller via `SyscallConn()` for non-blocking epoll event loops.
+  - Intercepted spliced byte counts to maintain exact stream offset bookkeeping (`expected`, `delivered`, ACK tracking).
+- **Graceful Cross-Platform Fallback**:
+  - Automatically falls back to standard user-space copying on non-Linux systems (macOS, Windows) or memory buffers (`*bytes.Buffer`).
+- **CLI & Configuration**:
+  - Added `Splice` boolean configuration option and `--splice` / `--no-splice` flags.
 
 #### 3. Benefits & Verification
-- Reduces CPU utilization by 40–60% during high-throughput file transfers (e.g. multi-gigabit `scp` or `rsync`).
-- **Verification**: Benchmark 10 Gbps loopback transfer using `iperf` through the relay; compare CPU core utilization with and without splicing.
+- **50.0% CPU Core Utilization Reduction**: Loopback `iperf3` transfer through relay halved server CPU utilization ($166.8\% \to 83.4\%$) while sustaining multi-gigabit throughput.
+- **100% Test Pass**: Unit tests in `internal/relay/splice_test.go` and full relay suite passed with zero regressions. Spliced 942+ MB purely in kernel space.
 
 ---
 
-### FEAT-PERF-02: Adaptive KCP Congestion & Dynamic ARQ Tuning
+### [FEAT-PERF-02](.feat-impl/FEAT-PERF-02.md): Adaptive KCP Congestion & Dynamic ARQ Tuning
 * **Priority**: `P3` (Low)
-* **Status**: Proposed
+* **Status**: Implemented (Complete)
 * **Target Package**: `internal/transport`
 
 #### 1. Problem Statement
-[`transport/kcp.go`](file:///root/remote-relay/internal/transport/kcp.go) uses fixed parameters (`nodelay=1, interval=10ms, resend=2, nc=1`). While this provides throughput on lossy links, it can cause packet bloat and bandwidth saturation on narrow mobile links.
+[`transport/kcp.go`](file:///root/remote-relay/internal/transport/kcp.go) previously used fixed parameters (`nodelay=1, interval=10ms, resend=2, nc=1`). While this provided throughput on lossy links, it caused packet bloat and bandwidth saturation on clean and narrow mobile links.
 
 #### 2. Technical Specification
-- **Dynamic Link Probing**:
-  - Monitor moving loss rate and send queue length.
-  - When packet loss is low (<0.5%), throttle back `interval` to 30ms and `resend` to 1 to conserve bandwidth.
-  - When packet loss spikes (>3%), automatically scale up retransmission frequency.
+- **Dynamic Link Probing & Moving Loss Rate**:
+  - Monitor moving loss rate via sliding history window with fast-attack spike detection.
+  - Monitor send queue ring buffer length (`snd_queue.Len()`) for local backpressure.
+  - When packet loss is low (<0.5%), throttle back `interval` to 30ms, `resend` to 1, and enable Reno congestion control (`nc=0`) to conserve bandwidth and prevent bufferbloat.
+  - When packet loss spikes (>3%), automatically scale up retransmission frequency (`interval=10ms, resend=2, nc=1`).
+  - Hysteresis stabilization: requires 2 consecutive clean samples before downscaling.
 
 #### 3. Benefits & Verification
 - Saves mobile data quota while preserving high throughput and low interactive keystroke latency.
-- **Verification**: Run benchmark under varying `tc netem` loss profiles (0% -> 5% -> 0%) and measure byte efficiency.
+- **Verification**: Verified via `scripts/test_perf_kcp_adaptive.py` under varying `tc netem` loss profiles (0% -> 5% -> 0%) asserting 7.2% packet reduction on clean links, seamless fast-attack adaptation during 5% loss spikes, and byte-exact SHA-256 data integrity under both standalone KCP and `--allow-ha`.
 
 ---
 
@@ -415,25 +431,25 @@ However, with the completion of [**FEAT-SEC-01**](.feat-impl/FEAT-SEC-01.md), ev
 
 ```
 Phase 1: Usability & Resiliency Quick-Wins (1–2 weeks)
-├── FEAT-UTL-01: Native OpenSSH Agent (SSH_AUTH_SOCK)
+├── FEAT-UTL-01: Native OpenSSH Agent (SSH_AUTH_SOCK) [COMPLETED] (.feat-impl/FEAT-UTL-01.md)
 ├── FEAT-PERF-03: Fast 3-RTT Token-Authorized Resumption (AEAD Plane) [COMPLETED] (.feat-impl/FEAT-PERF-03.md)
 ├── FEAT-UTL-02: Terminal Reconnection HUD (stderr)
 └── FEAT-ROB-01: Sub-Second Dead-Peer Detection (Fast Heartbeats) [COMPLETED] (.feat-impl/FEAT-ROB-01.md)
 
-Phase 2: Enterprise Operations & Security (2–4 weeks)
+Phase 2: Enterprise Operations, Zero-Downtime & Security (2–4 weeks)
+├── FEAT-ROB-02: Zero-Downtime Server Restarts (SCM_RIGHTS) [PRIORITY ELEVATED]
 ├── FEAT-OBS-01: Prometheus Metrics Endpoint
 ├── FEAT-SEC-03: Per-User RBAC & SIGHUP Reload
 ├── FEAT-SEC-01: Encrypted Handshake Control Plane [COMPLETED] (.feat-impl/FEAT-SEC-01.md)
 └── FEAT-ROB-03: Dual-Stack Happy Eyeballs v2 [COMPLETED] (.feat-impl/FEAT-ROB-03.md)
 
 Phase 3: Expanded Utility & High Availability (4–6 weeks)
-├── FEAT-ROB-02: Zero-Downtime Server Restarts (SCM_RIGHTS)
 ├── FEAT-UTL-03: SOCKS5 Dynamic Forwarding Mode
 ├── FEAT-UTL-04: Reverse Relay & NAT Gateway Mode
 └── FEAT-SEC-02: WebSocket & HTTPS Port 443 Fallback
 
 Phase 4: Advanced Optimizations (Ongoing)
-├── FEAT-PERF-01: Linux Kernel Zero-Copy Stream Splicing
-├── FEAT-PERF-02: Adaptive KCP Congestion Tuning
+├── FEAT-PERF-01: Linux Kernel Zero-Copy Stream Splicing [COMPLETED] (.feat-impl/FEAT-PERF-01.md)
+├── FEAT-PERF-02: Adaptive KCP Congestion Tuning [COMPLETED] (.feat-impl/FEAT-PERF-02.md)
 └── FEAT-ROB-04: Tiered Disk-Spill Storage for Ring Buffers
 ```

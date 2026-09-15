@@ -37,17 +37,22 @@ func TuneKCP(sess *kcp.UDPSession) {
 // KCPListener is one kcp.Listener bound to a PacketConn (mux tag 0x01).
 // ServeConn keeps ownConn=false so Close does not take the shared socket.
 type KCPListener struct {
-	ln *kcp.Listener
+	ln  *kcp.Listener
+	cfg AdaptiveKCPConfig
 }
 
 func ListenKCP(pc net.PacketConn) (*KCPListener, error) {
+	return ListenKCPWithOptions(pc, DefaultAdaptiveKCPConfig())
+}
+
+func ListenKCPWithOptions(pc net.PacketConn, cfg AdaptiveKCPConfig) (*KCPListener, error) {
 	ln, err := kcp.ServeConn(nil, 0, 0, pc)
 	if err != nil {
 		return nil, err
 	}
 	_ = ln.SetReadBuffer(kcpSocketBuf)
 	_ = ln.SetWriteBuffer(kcpSocketBuf)
-	return &KCPListener{ln: ln}, nil
+	return &KCPListener{ln: ln, cfg: cfg}, nil
 }
 
 func (l *KCPListener) Accept() (Conn, error) {
@@ -55,7 +60,7 @@ func (l *KCPListener) Accept() (Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return wrapKCP(sess), nil
+	return wrapKCPWithConfig(sess, l.cfg), nil
 }
 
 func (l *KCPListener) Close() error {
@@ -76,6 +81,11 @@ func (l *KCPListener) Addr() net.Addr {
 // NewConn2 is the PacketConn form of DialWithOptions(remote, nil, 0, 0);
 // conv is chosen by kcp-go, not forced.
 func DialKCP(ctx context.Context, pc net.PacketConn, addr net.Addr) (Conn, error) {
+	return DialKCPWithOptions(ctx, pc, addr, DefaultAdaptiveKCPConfig())
+}
+
+// DialKCPWithOptions opens a KCP conversation with custom adaptive ARQ configuration.
+func DialKCPWithOptions(ctx context.Context, pc net.PacketConn, addr net.Addr, cfg AdaptiveKCPConfig) (Conn, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -83,7 +93,7 @@ func DialKCP(ctx context.Context, pc net.PacketConn, addr net.Addr) (Conn, error
 	if err != nil {
 		return nil, err
 	}
-	return wrapKCP(sess), nil
+	return wrapKCPWithConfig(sess, cfg), nil
 }
 
 type kcpConn struct {
@@ -91,14 +101,25 @@ type kcpConn struct {
 	br        *bufio.Reader
 	bw        *bufio.Writer
 	closeOnce sync.Once
+	tuner     *AdaptiveTuner
 }
 
 func wrapKCP(sess *kcp.UDPSession) Conn {
+	return wrapKCPWithConfig(sess, DefaultAdaptiveKCPConfig())
+}
+
+func wrapKCPWithConfig(sess *kcp.UDPSession, cfg AdaptiveKCPConfig) Conn {
 	TuneKCP(sess)
+	var tuner *AdaptiveTuner
+	if cfg.Enabled && sess != nil {
+		tuner = NewAdaptiveTuner(sess, cfg)
+		tuner.Start()
+	}
 	return &kcpConn{
-		sess: sess,
-		br:   bufio.NewReaderSize(sess, kcpBufSize),
-		bw:   bufio.NewWriterSize(sess, kcpBufSize),
+		sess:  sess,
+		br:    bufio.NewReaderSize(sess, kcpBufSize),
+		bw:    bufio.NewWriterSize(sess, kcpBufSize),
+		tuner: tuner,
 	}
 }
 
@@ -125,6 +146,9 @@ func (c *kcpConn) Close() error {
 	// Do not Flush here: WriteFrame is the only writer, and Close can race with it.
 	// Wake readers immediately; delay sess.Close so a just-written BYE can be ACKed.
 	c.closeOnce.Do(func() {
+		if c.tuner != nil {
+			c.tuner.Stop()
+		}
 		_ = c.sess.SetDeadline(time.Now())
 		go func() {
 			time.Sleep(100 * time.Millisecond)
@@ -136,4 +160,19 @@ func (c *kcpConn) Close() error {
 
 func (c *kcpConn) ResetReader() {
 	c.br.Reset(c.sess)
+}
+
+func (c *kcpConn) AdaptiveKCPStats() (TunerStats, bool) {
+	if c.tuner != nil {
+		return c.tuner.Stats(), true
+	}
+	return TunerStats{}, false
+}
+
+func (c *kcpConn) UDPSession() *kcp.UDPSession {
+	return c.sess
+}
+
+func (c *kcpConn) Tuner() *AdaptiveTuner {
+	return c.tuner
 }

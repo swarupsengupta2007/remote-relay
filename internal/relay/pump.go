@@ -2,6 +2,7 @@ package relay
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"log/slog"
@@ -33,6 +34,8 @@ type sessionIO struct {
 	conn       transport.Conn
 	src        io.Reader
 	sink       io.Writer
+	rawSrc     any
+	rawSink    any
 	flushSink  func() error
 	closeWrite func() error
 	closeSrc   func() error
@@ -50,6 +53,7 @@ type pumpConfig struct {
 	heartbeat     time.Duration
 	deadThreshold int
 	log           *slog.Logger
+	splice        bool
 }
 
 type dataFrag struct {
@@ -139,8 +143,57 @@ type pump struct {
 	ioOnce sync.Once
 	cwOnce sync.Once
 
+	inPipe     *pipePair
+	outPipe    *pipePair
+	retainPipe *pipePair
+
 	fatalMu sync.Mutex
 	fatal   error
+}
+
+func (p *pump) canSplice() bool {
+	return p.cfg.splice && p.currentKind() == transport.KindTCP
+}
+
+func (p *pump) getSinkFD() (int, bool) {
+	if p.io.rawSink != nil {
+		if fd, ok := getFD(p.io.rawSink); ok {
+			return fd, true
+		}
+	}
+	if p.io.sink != nil {
+		if fd, ok := getFD(p.io.sink); ok {
+			return fd, true
+		}
+	}
+	return -1, false
+}
+
+func (p *pump) getSrcFD() (int, bool) {
+	if p.io.rawSrc != nil {
+		if fd, ok := getFD(p.io.rawSrc); ok {
+			return fd, true
+		}
+	}
+	if p.io.src != nil {
+		if fd, ok := getFD(p.io.src); ok {
+			return fd, true
+		}
+	}
+	return -1, false
+}
+
+func (p *pump) getTCPConn() *net.TCPConn {
+	p.connMu.Lock()
+	c := p.conn
+	p.connMu.Unlock()
+	if c == nil {
+		return nil
+	}
+	if tp, ok := c.(transport.TCPConnProvider); ok {
+		return tp.RawTCPConn()
+	}
+	return nil
 }
 
 func newPump(parent context.Context, io sessionIO, cfg pumpConfig, sendLog *session.Ring) *pump {
@@ -176,6 +229,11 @@ func newPump(parent context.Context, io sessionIO, cfg pumpConfig, sendLog *sess
 		p.cfg.switchTimeout = 5 * time.Second
 	}
 	p.lastIn.Store(time.Now().UnixNano())
+	if p.cfg.splice {
+		p.inPipe, _ = newPipePair(1024 * 1024)
+		p.outPipe, _ = newPipePair(1024 * 1024)
+		p.retainPipe, _ = newPipePair(1024 * 1024)
+	}
 	return p
 }
 
@@ -206,6 +264,15 @@ func (p *pump) shutdown() {
 	}
 	if p.sendLog != nil {
 		p.sendLog.Release()
+	}
+	if p.inPipe != nil {
+		_ = p.inPipe.Close()
+	}
+	if p.outPipe != nil {
+		_ = p.outPipe.Close()
+	}
+	if p.retainPipe != nil {
+		_ = p.retainPipe.Close()
 	}
 	if p.io.closeSrc != nil {
 		p.srcWG.Wait()
@@ -897,9 +964,82 @@ func (p *pump) netReader() error {
 			if c == nil {
 				return net.ErrClosed
 			}
-			f, err = c.ReadFrame()
-			if err != nil {
-				return err
+
+			sinkFd, hasSinkFD := p.getSinkFD()
+			tc := p.getTCPConn()
+			fhr, hasFHR := c.(transport.FrameHeaderReader)
+			if p.canSplice() && hasSinkFD && tc != nil && hasFHR && p.inPipe != nil {
+				typ, n, rErr := fhr.ReadFrameHeader()
+				if rErr != nil {
+					return rErr
+				}
+				p.lastIn.Store(time.Now().UnixNano())
+				p.notePeerFrame()
+
+				if typ == proto.TypeData {
+					if n < 8 {
+						_ = p.sendErr(proto.CodeProto, "bad DATA length")
+						return proto.ErrProto
+					}
+					seqBytes, sErr := fhr.ReadPayload(8)
+					if sErr != nil {
+						return sErr
+					}
+					seq := binary.BigEndian.Uint64(seqBytes)
+					dataLen := int(n - 8)
+
+					if seq > expected {
+						_ = p.sendErr(proto.CodeProto, "gap in data stream")
+						return proto.ErrProto
+					}
+					if seq+uint64(dataLen) <= expected {
+						if dataLen > 0 {
+							_, _ = fhr.ReadPayload(uint32(dataLen))
+						}
+						continue
+					}
+					if seq < expected {
+						overlap := int(expected - seq)
+						if overlap > 0 {
+							_, _ = fhr.ReadPayload(uint32(overlap))
+							dataLen -= overlap
+						}
+					}
+					if p.inGotClose.Load() && expected+uint64(dataLen) > p.inFinal.Load() {
+						_ = p.sendErr(proto.CodeProto, "data past CLOSE_DIR")
+						return proto.ErrProto
+					}
+
+					if p.io.flushSink != nil {
+						_ = p.io.flushSink()
+					}
+					spliced, spErr := spliceSocketToSink(tc, sinkFd, p.inPipe, dataLen)
+					if spErr != nil {
+						return spErr
+					}
+					expected += uint64(spliced)
+					p.expected.Store(expected)
+					delivered := p.delivered.Add(uint64(spliced))
+					if !testSuppressAck.Load() {
+						if err := p.sendCtrl(proto.Frame{Type: proto.TypeAck, Payload: proto.EncodeAck(delivered)}); err != nil {
+							return err
+						}
+					}
+					p.nudge()
+					p.tryCloseWrite()
+					continue
+				}
+
+				payload, pErr := fhr.ReadPayload(n)
+				if pErr != nil {
+					return pErr
+				}
+				f = proto.Frame{Type: typ, Payload: payload}
+			} else {
+				f, err = c.ReadFrame()
+				if err != nil {
+					return err
+				}
 			}
 		}
 		p.lastIn.Store(time.Now().UnixNano())
@@ -1004,8 +1144,8 @@ func (p *pump) netReader() error {
 	}
 }
 
-func (p *pump) tryCloseWrite(delivered uint64) {
-	if p.inGotClose.Load() && delivered >= p.inFinal.Load() {
+func (p *pump) tryCloseWrite() {
+	if p.inGotClose.Load() && p.delivered.Load() >= p.inFinal.Load() {
 		p.cwOnce.Do(func() {
 			if p.io.closeWrite != nil {
 				_ = p.io.closeWrite()
@@ -1016,7 +1156,6 @@ func (p *pump) tryCloseWrite(delivered uint64) {
 }
 
 func (p *pump) sinkWriter() error {
-	var delivered uint64
 	for {
 		select {
 		case <-p.sessCtx.Done():
@@ -1031,8 +1170,7 @@ func (p *pump) sinkWriter() error {
 						return err
 					}
 				}
-				delivered += uint64(len(frag.data))
-				p.delivered.Store(delivered)
+				delivered := p.delivered.Add(uint64(len(frag.data)))
 				if !testSuppressAck.Load() {
 					if err := p.sendCtrl(proto.Frame{Type: proto.TypeAck, Payload: proto.EncodeAck(delivered)}); err != nil {
 						return err
@@ -1040,9 +1178,9 @@ func (p *pump) sinkWriter() error {
 				}
 				p.nudge()
 			}
-			p.tryCloseWrite(delivered)
+			p.tryCloseWrite()
 		case <-p.sinkKick:
-			p.tryCloseWrite(delivered)
+			p.tryCloseWrite()
 		}
 	}
 }

@@ -1,18 +1,22 @@
 package kex
 
 import (
+	"bufio"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
+	"golang.org/x/crypto/ssh/terminal"
 )
 
 // LoadOrGenerateHostKey loads an OpenSSH Ed25519 private key from path.
@@ -86,6 +90,69 @@ func FingerprintSHA256(pub ed25519.PublicKey) string {
 // ErrHostKey is returned when host key verification fails (mismatch, untrusted, MITM).
 var ErrHostKey = errors.New("host key verification failed")
 
+var (
+	PromptReader io.Reader = os.Stdin
+	PromptWriter io.Writer = os.Stderr
+	PromptUser             = defaultPromptUser
+)
+
+func defaultPromptUser(serverAddr, fp string) (bool, error) {
+	if f, ok := PromptReader.(*os.File); ok && f == os.Stdin {
+		if !terminal.IsTerminal(int(f.Fd())) {
+			return false, fmt.Errorf("no interactive terminal available to prompt for host key verification")
+		}
+	}
+
+	fmt.Fprintf(PromptWriter, "The authenticity of host '%s' can't be established.\n", serverAddr)
+	fmt.Fprintf(PromptWriter, "ED25519 key fingerprint is %s.\n", fp)
+	fmt.Fprintf(PromptWriter, "Are you sure you want to continue connecting (yes/no)? ")
+
+	reader := bufio.NewReader(PromptReader)
+	line, err := reader.ReadString('\n')
+	if err != nil && (!errors.Is(err, io.EOF) || len(line) == 0) {
+		return false, fmt.Errorf("read user input: %w", err)
+	}
+
+	ans := strings.ToLower(strings.TrimSpace(line))
+	if ans == "yes" || ans == "y" {
+		return true, nil
+	}
+	return false, nil
+}
+
+func handleTOFU(knownHostsPath, serverAddr, normAddr string, sshPub ssh.PublicKey, fp, strictChecking, notFoundReason string) error {
+	mode := strings.ToLower(strings.TrimSpace(strictChecking))
+	if mode == "" {
+		if terminal.IsTerminal(int(os.Stdin.Fd())) && terminal.IsTerminal(int(os.Stderr.Fd())) {
+			mode = "ask"
+		} else {
+			mode = "yes"
+		}
+	}
+
+	switch mode {
+	case "yes":
+		return fmt.Errorf("kex: %w: %s and strict host key checking is enabled", ErrHostKey, notFoundReason)
+	case "accept-new", "no":
+		return appendKnownHost(knownHostsPath, normAddr, sshPub)
+	case "ask":
+		ok, err := PromptUser(serverAddr, fp)
+		if err != nil {
+			return fmt.Errorf("kex: %w: %v", ErrHostKey, err)
+		}
+		if !ok {
+			return fmt.Errorf("kex: %w: host key verification failed for %s", ErrHostKey, serverAddr)
+		}
+		if err := appendKnownHost(knownHostsPath, normAddr, sshPub); err != nil {
+			return err
+		}
+		fmt.Fprintf(PromptWriter, "Warning: Permanently added '%s' (ED25519) to the list of known hosts.\n", normAddr)
+		return nil
+	default:
+		return fmt.Errorf("kex: %w: unknown strict host key checking mode %q", ErrHostKey, strictChecking)
+	}
+}
+
 // VerifyKnownHosts checks a server's Ed25519 public host key against:
 // 1. Pinned fingerprint (if provided)
 // 2. OpenSSH known_hosts file
@@ -111,14 +178,21 @@ func VerifyKnownHosts(knownHostsPath, serverAddr string, pub ed25519.PublicKey, 
 
 	// 2. known_hosts file verification
 	if knownHostsPath == "" {
-		home, err := os.UserHomeDir()
-		if err == nil && home != "" {
-			knownHostsPath = filepath.Join(home, ".config", "relay", "known_hosts")
+		if env := os.Getenv("RELAY_TEST_KNOWN_HOSTS"); env != "" {
+			knownHostsPath = env
+		} else {
+			home, err := os.UserHomeDir()
+			if err == nil && home != "" {
+				knownHostsPath = filepath.Join(home, ".config", "relay", "known_hosts")
+			}
 		}
 	}
 
 	if knownHostsPath == "" {
-		return nil // No known_hosts configured and no home directory
+		if strings.ToLower(strings.TrimSpace(strictChecking)) == "no" {
+			return nil
+		}
+		return fmt.Errorf("kex: %w: no known_hosts file path available (configure --known-hosts, --server-fingerprint, or ensure HOME is set)", ErrHostKey)
 	}
 
 	normAddr := knownhosts.Normalize(serverAddr)
@@ -127,10 +201,8 @@ func VerifyKnownHosts(knownHostsPath, serverAddr string, pub ed25519.PublicKey, 
 	if err != nil {
 		if os.IsNotExist(err) {
 			// File does not exist yet -> TOFU
-			if strictChecking == "yes" {
-				return fmt.Errorf("kex: %w: known_hosts file %s does not exist and strict host key checking is enabled", ErrHostKey, knownHostsPath)
-			}
-			return appendKnownHost(knownHostsPath, normAddr, sshPub)
+			reason := fmt.Sprintf("known_hosts file %s does not exist", knownHostsPath)
+			return handleTOFU(knownHostsPath, serverAddr, normAddr, sshPub, fp, strictChecking, reason)
 		}
 		return fmt.Errorf("kex: %w: read known_hosts %s: %v", ErrHostKey, knownHostsPath, err)
 	}
@@ -140,7 +212,13 @@ func VerifyKnownHosts(knownHostsPath, serverAddr string, pub ed25519.PublicKey, 
 	if err == nil {
 		remoteAddr = tcpAddr
 	} else {
-		remoteAddr = &net.TCPAddr{IP: net.IPv4zero, Port: 7443}
+		port := 7443
+		if _, portStr, splitErr := net.SplitHostPort(serverAddr); splitErr == nil {
+			if p, convErr := strconv.Atoi(portStr); convErr == nil && p > 0 {
+				port = p
+			}
+		}
+		remoteAddr = &net.TCPAddr{IP: net.IPv4zero, Port: port}
 	}
 
 	checkErr := cb(normAddr, remoteAddr, sshPub)
@@ -155,16 +233,17 @@ func VerifyKnownHosts(knownHostsPath, serverAddr string, pub ed25519.PublicKey, 
 			return fmt.Errorf("kex: %w: REMOTE HOST IDENTIFICATION HAS CHANGED for %s! Found mismatched entry in %s", ErrHostKey, serverAddr, knownHostsPath)
 		}
 		// Unknown host: TOFU
-		if strictChecking == "yes" {
-			return fmt.Errorf("kex: %w: host key for %s is not in %s and strict host key checking is enabled", ErrHostKey, serverAddr, knownHostsPath)
-		}
-		return appendKnownHost(knownHostsPath, normAddr, sshPub)
+		reason := fmt.Sprintf("host key for %s is not in %s", serverAddr, knownHostsPath)
+		return handleTOFU(knownHostsPath, serverAddr, normAddr, sshPub, fp, strictChecking, reason)
 	}
 
 	return fmt.Errorf("kex: %w: %v", ErrHostKey, checkErr)
 }
 
 func appendKnownHost(path, normAddr string, key ssh.PublicKey) error {
+	if path == os.DevNull || path == "/dev/null" {
+		return nil
+	}
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("kex: create known_hosts dir %s: %w", dir, err)

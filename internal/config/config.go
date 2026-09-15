@@ -2,13 +2,16 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
 	"github.com/BurntSushi/toml"
 	"github.com/remote-relay/relay/internal/proto"
+	"golang.org/x/crypto/ssh/terminal"
 )
 
 const (
@@ -83,6 +86,8 @@ type Server struct {
 	HeartbeatInterval  Duration `toml:"heartbeat_interval"`
 	DeadPeerThreshold  int      `toml:"dead_peer_threshold"`
 	HostKey            string   `toml:"host_key"`
+	Splice             bool     `toml:"splice"`
+	AdaptiveKCP        bool     `toml:"adaptive_kcp"`
 }
 
 type Client struct {
@@ -100,6 +105,7 @@ type Client struct {
 	LogFormat             string   `toml:"log_format"`
 	AuthMethod            string   `toml:"auth_method"`
 	AuthUser              string   `toml:"auth_user"`
+	AuthSock              string   `toml:"auth_sock"`
 	IdentityFiles         []string `toml:"identity_files"`
 	AllowHA               bool     `toml:"allow_ha"`
 	HAProbeInterval       Duration `toml:"ha_probe_interval"`
@@ -109,6 +115,35 @@ type Client struct {
 	ServerFingerprint     string   `toml:"server_fingerprint"`
 	StrictHostKeyChecking string   `toml:"strict_host_key_checking"`
 	HappyEyeballsDelay    Duration `toml:"happy_eyeballs_delay"`
+	Splice                bool     `toml:"splice"`
+	AdaptiveKCP           bool     `toml:"adaptive_kcp"`
+	Interfaces            []string `toml:"interfaces"`
+	SourceIPs             []string `toml:"source_ips"`
+
+	TCPInterface string `toml:"-"`
+	UDPInterface string `toml:"-"`
+	TCPSourceIP  string `toml:"-"`
+	UDPSourceIP  string `toml:"-"`
+}
+
+func defaultSplice() bool {
+	return runtime.GOOS == "linux"
+}
+
+var isTerminal = func(fd uintptr) bool {
+	return terminal.IsTerminal(int(fd))
+}
+
+func isTTY() bool {
+	return isTerminal(os.Stdin.Fd()) && isTerminal(os.Stderr.Fd())
+}
+
+// DefaultStrictHostKeyChecking returns "ask" for interactive TTY, "yes" for headless scripts.
+func DefaultStrictHostKeyChecking() string {
+	if isTTY() {
+		return "ask"
+	}
+	return "yes"
 }
 
 func DefaultServer() Server {
@@ -134,11 +169,13 @@ func DefaultServer() Server {
 		DialTimeout:        Duration(10 * time.Second),
 		LogLevel:           "info",
 		LogFormat:          "text",
-		AuthMethod:         "none",
+		AuthMethod:         "ssh-publickey",
 		AuthFailDelay:      Duration(200 * time.Millisecond),
 		HeartbeatInterval:  Duration(750 * time.Millisecond),
 		DeadPeerThreshold:  3,
 		HostKey:            "/etc/relay/ssh_host_ed25519_key",
+		Splice:             defaultSplice(),
+		AdaptiveKCP:        true,
 	}
 }
 
@@ -156,15 +193,18 @@ func DefaultClient() Client {
 		ReconnectMaxElapsed:   Duration(5 * time.Minute),
 		LogLevel:              "warn",
 		LogFormat:             "text",
-		AuthMethod:            "none",
+		AuthMethod:            "ssh-publickey",
+		AuthSock:              "",
 		AllowHA:               false,
 		HAProbeInterval:       Duration(10 * time.Second),
 		HeartbeatInterval:     Duration(750 * time.Millisecond),
 		DeadPeerThreshold:     3,
 		KnownHosts:            "",
 		ServerFingerprint:     "",
-		StrictHostKeyChecking: "ask",
+		StrictHostKeyChecking: DefaultStrictHostKeyChecking(),
 		HappyEyeballsDelay:    Duration(250 * time.Millisecond),
+		Splice:                defaultSplice(),
+		AdaptiveKCP:           true,
 	}
 }
 
@@ -175,6 +215,9 @@ type ServerOptions struct {
 	HeartbeatInterval time.Duration
 	DeadPeerThreshold int
 	HostKey           string
+	AuthorizedKeys    string
+	Splice            *bool
+	AdaptiveKCP       *bool
 }
 
 type ClientOptions struct {
@@ -195,6 +238,12 @@ type ClientOptions struct {
 	ServerFingerprint     string
 	StrictHostKeyChecking string
 	HappyEyeballsDelay    time.Duration
+	Identity              string
+	AuthSock              string
+	Splice                *bool
+	AdaptiveKCP           *bool
+	Interfaces            []string
+	SourceIPs             []string
 }
 
 func LoadServer(opts ServerOptions) (Server, error) {
@@ -220,6 +269,15 @@ func LoadServer(opts ServerOptions) (Server, error) {
 	}
 	if opts.HostKey != "" {
 		cfg.HostKey = opts.HostKey
+	}
+	if opts.AuthorizedKeys != "" {
+		cfg.AuthorizedKeys = opts.AuthorizedKeys
+	}
+	if opts.Splice != nil {
+		cfg.Splice = *opts.Splice
+	}
+	if opts.AdaptiveKCP != nil {
+		cfg.AdaptiveKCP = *opts.AdaptiveKCP
 	}
 	if err := cfg.Validate(); err != nil {
 		return Server{}, err
@@ -280,8 +338,37 @@ func LoadClient(opts ClientOptions) (Client, error) {
 	if opts.StrictHostKeyChecking != "" {
 		cfg.StrictHostKeyChecking = opts.StrictHostKeyChecking
 	}
+	if cfg.StrictHostKeyChecking == "" {
+		cfg.StrictHostKeyChecking = DefaultStrictHostKeyChecking()
+	}
 	if opts.HappyEyeballsDelay > 0 {
 		cfg.HappyEyeballsDelay = Duration(opts.HappyEyeballsDelay)
+	}
+	if opts.Identity != "" {
+		cfg.IdentityFiles = []string{opts.Identity}
+	}
+	if opts.AuthSock != "" {
+		cfg.AuthSock = opts.AuthSock
+	}
+	if opts.Splice != nil {
+		cfg.Splice = *opts.Splice
+	}
+	if opts.AdaptiveKCP != nil {
+		cfg.AdaptiveKCP = *opts.AdaptiveKCP
+	}
+	tcpIface, udpIface, tcpIP, udpIP, err := ResolveClientBindings(cfg.Interfaces, cfg.SourceIPs, opts.Interfaces, opts.SourceIPs)
+	if err != nil {
+		return Client{}, err
+	}
+	cfg.TCPInterface = tcpIface
+	cfg.UDPInterface = udpIface
+	cfg.TCPSourceIP = tcpIP
+	cfg.UDPSourceIP = udpIP
+	if len(opts.Interfaces) > 0 {
+		cfg.Interfaces = opts.Interfaces
+	}
+	if len(opts.SourceIPs) > 0 {
+		cfg.SourceIPs = opts.SourceIPs
 	}
 	if err := cfg.Validate(); err != nil {
 		return Client{}, err
@@ -398,15 +485,56 @@ func (c Client) Validate() error {
 	if c.HappyEyeballsDelay <= 0 {
 		return fmt.Errorf("happy_eyeballs_delay must be positive")
 	}
+	if err := validStrictHostKeyChecking(c.StrictHostKeyChecking); err != nil {
+		return err
+	}
+	if c.TCPInterface == "" && c.UDPInterface == "" && c.TCPSourceIP == "" && c.UDPSourceIP == "" && (len(c.Interfaces) > 0 || len(c.SourceIPs) > 0) {
+		_, _, _, _, err := ResolveClientBindings(c.Interfaces, c.SourceIPs, nil, nil)
+		if err != nil {
+			return err
+		}
+	} else {
+		if c.TCPInterface != "" {
+			if _, err := InterfaceByName(c.TCPInterface); err != nil {
+				return fmt.Errorf("interface %q not found: %w", c.TCPInterface, err)
+			}
+		}
+		if c.UDPInterface != "" {
+			if _, err := InterfaceByName(c.UDPInterface); err != nil {
+				return fmt.Errorf("interface %q not found: %w", c.UDPInterface, err)
+			}
+		}
+		if c.TCPSourceIP != "" {
+			if ip := net.ParseIP(c.TCPSourceIP); ip == nil {
+				return fmt.Errorf("invalid source ip %q", c.TCPSourceIP)
+			}
+		}
+		if c.UDPSourceIP != "" {
+			if ip := net.ParseIP(c.UDPSourceIP); ip == nil {
+				return fmt.Errorf("invalid source ip %q", c.UDPSourceIP)
+			}
+		}
+	}
 	return nil
+}
+
+func validStrictHostKeyChecking(s string) error {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "ask", "yes", "no", "accept-new":
+		return nil
+	default:
+		return fmt.Errorf("unknown strict_host_key_checking %q (valid: yes, no, ask, accept-new)", s)
+	}
 }
 
 func validAuthMethod(m string) error {
 	switch strings.ToLower(strings.TrimSpace(m)) {
-	case "", "none", "ssh-publickey":
+	case "", "ssh-publickey":
 		return nil
+	case "none":
+		return fmt.Errorf("auth_method 'none' is completely deprecated and removed; only 'ssh-publickey' is supported")
 	default:
-		return fmt.Errorf("unknown auth_method %q", m)
+		return fmt.Errorf("unknown auth_method %q (only 'ssh-publickey' is supported)", m)
 	}
 }
 

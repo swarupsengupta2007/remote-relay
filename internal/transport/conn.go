@@ -38,3 +38,25 @@ type Conn interface {
 	Close() error
 	ResetReader()
 }
+
+// TCPConnProvider allows unwrapping the raw underlying TCP connection for zero-copy operations.
+type TCPConnProvider interface {
+	RawTCPConn() *net.TCPConn
+}
+
+// FrameHeaderReader allows reading frame headers without over-buffering payload bytes.
+type FrameHeaderReader interface {
+	ReadFrameHeader() (proto.Type, uint32, error)
+	ReadPayload(n uint32) ([]byte, error)
+	Buffered() int
+}
+
+// DataFrameHeaderWriter allows writing only the 13-byte TypeData frame header before splicing payload bytes.
+type DataFrameHeaderWriter interface {
+	WriteDataFrameHeader(seq uint64, dataLen int) error
+}
+
+// KCPStatsProvider allows retrieving dynamic ARQ and congestion tuning statistics from a KCP connection.
+type KCPStatsProvider interface {
+	AdaptiveKCPStats() (TunerStats, bool)
+}

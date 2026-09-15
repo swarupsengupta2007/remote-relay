@@ -7,9 +7,11 @@ the data plane upgrades to UDP (QUIC by default, KCP with `--kcp`) when a
 probe succeeds. If the WAN link breaks, the client reconnects and **resumes
 the same session** so the consumer (`ssh`) does not see a disconnect.
 
-Handshake authentication is **off by default** (`auth_method = "none"`). Set
-`auth_method = "ssh-publickey"` to require a signed challenge before the
-server dials. The payload is still typically an already-encrypted SSH stream.
+Handshake authentication is **mandatory** (`auth_method = "ssh-publickey"`).
+The legacy unauthenticated mode (`"none"`) is completely deprecated and removed.
+Both `--authorized-keys` (server) and `--identity` / `-i` (client) flags are
+available alongside TOML config and standard `~/.ssh` fallback paths (`flag > TOML > ~/.ssh`).
+The payload is typically an already-encrypted SSH stream.
 See **Authentication** and **Security** below.
 
 ## Status
@@ -24,6 +26,11 @@ See **Authentication** and **Security** below.
 | M5 SSH public-key auth | yes |
 | FEAT-ROB-01 BFD Sub-Second Detection & Dual-Path HA | yes |
 | FEAT-SEC-01 Encrypted Handshake (X25519 & ChaCha20-Poly1305) | yes |
+| FEAT-PERF-03 Fast 3-RTT Token-Authorized Resumption | yes |
+| FEAT-ROB-03 Dual-Stack Happy Eyeballs v2 (RFC 8305) | yes |
+| FEAT-PERF-01 Linux Kernel Zero-Copy Stream Splicing (`splice(2)`) | yes |
+| FEAT-PERF-02 Adaptive KCP Dynamic ARQ & Congestion Tuning | yes |
+| Single-Session KCP Repeated-Kills Soak & Netns Harness | yes |
 
 ### Netem & BFD Benchmarks (dual-netns veth)
 
@@ -52,7 +59,7 @@ go build -o relay ./cmd/relay
 ## Server
 
 ```
-./relay server [--config /etc/relay/server.toml] [--listen 0.0.0.0:7443] [--host-key /etc/relay/ssh_host_ed25519_key] [--heartbeat-interval 750ms] [--dead-peer-threshold 3] [--log-level info]
+./relay server [--config /etc/relay/server.toml] [--listen 0.0.0.0:7443] [--authorized-keys /path/to/authorized_keys] [--host-key /etc/relay/ssh_host_ed25519_key] [--heartbeat-interval 750ms] [--dead-peer-threshold 3] [--log-level info]
 ```
 
 If `--config` is omitted the server loads `/etc/relay/server.toml` when that
@@ -76,7 +83,7 @@ transports          = ["quic", "kcp"]
 default_destination = "127.0.0.1:22"
 allow_destinations  = ["127.0.0.1:22"] # ["*"] = open proxy (discouraged)
 
-hold_timeout        = "5m"
+hold_timeout        = "5m"             # keep below sshd ClientAliveInterval * ClientAliveCountMax (R7)
 buffer_bytes        = 67108864         # 64 MiB per session per direction
 total_buffer_bytes  = 536870912        # 512 MiB global ceiling
 send_window         = 4194304
@@ -100,7 +107,7 @@ log_format          = "text"           # text|json
 pprof_listen        = ""               # empty = disabled
 expvar_listen       = ""               # empty = disabled
 
-auth_method         = "none"           # none | ssh-publickey
+auth_method         = "ssh-publickey"  # mandatory (none deprecated & removed)
 authorized_keys     = ""               # empty = ~/.ssh/authorized_keys of the relay user
 auth_fail_delay     = "200ms"          # fixed delay on ERR_AUTH (no oracle)
 ```
@@ -111,7 +118,7 @@ Logs go to **stderr**. stdout is the relayed byte stream and must stay clean
 (it is the SSH transport).
 
 ```
-./relay client --server HOST:PORT [--dest HOST:PORT] [--tcp|--kcp] [--allow-ha] [--server-fingerprint FP] [--known-hosts PATH] [--strict-host-key-checking yes|no|accept-new] [--heartbeat-interval 750ms] [--dead-peer-threshold 3] [--config PATH] [--log-level warn] [%h %p]
+./relay client --server HOST:PORT [-i|--identity PATH] [--auth-sock PATH] [--dest HOST:PORT] [--tcp|--kcp] [--allow-ha] [--server-fingerprint FP] [--known-hosts PATH] [--strict-host-key-checking yes|no|ask|accept-new] [--heartbeat-interval 750ms] [--dead-peer-threshold 3] [--config PATH] [--log-level warn] [%h %p]
 ```
 
 Default client config path: `$HOME/.config/relay/client.toml` (optional).
@@ -147,7 +154,7 @@ allow_ha              = false           # true = dual-path HA (UDP primary, TCP 
 ha_probe_interval     = "10s"           # interval for background UDP probing when on TCP
 log_level             = "warn"
 log_format            = "text"
-auth_method           = "none"          # none | ssh-publickey
+auth_method           = "ssh-publickey" # mandatory (none deprecated & removed)
 auth_user             = ""              # empty = current user
 identity_files        = []              # empty = try ~/.ssh/id_ed25519, id_ecdsa, id_rsa
 ```
@@ -158,7 +165,7 @@ identity_files        = []              # empty = try ~/.ssh/id_ed25519, id_ecds
 Host via-relay
     HostName relay.example.com
     User alice
-    ProxyCommand relay client --server relay.example.com:7443
+    ProxyCommand relay client --server relay.example.com:7443 -i ~/.ssh/id_ed25519
 ```
 
 The server dials its own `default_destination` (`127.0.0.1:22`), so `sshd` on
@@ -186,37 +193,38 @@ printf 'hello\n' | relay client --server 127.0.0.1:7443 --dest 127.0.0.1:7
 
 ## Authentication
 
-`auth_method` defaults to `"none"` so existing deployments stay open. Auth is
-TOML-only (no CLI flag).
+Handshake authentication is **mandatory** (`auth_method = "ssh-publickey"`).
+The legacy unauthenticated mode (`"none"`) is completely deprecated and removed.
 
-To require SSH public-key auth on the relay handshake:
+Configuration follows strict precedence: **CLI flag > TOML config > `~/.ssh` default**.
 
-**Server** (`server.toml`):
+**Server**:
+* Flag: `--authorized-keys /path/to/authorized_keys`
+* Config (`server.toml`):
+  ```toml
+  auth_method     = "ssh-publickey"
+  authorized_keys = "/var/lib/relay/authorized_keys"
+  auth_fail_delay = "200ms"
+  ```
+* **Server Fail-Fast**: If neither `--authorized-keys` nor TOML `authorized_keys` is
+  configured, the server checks `~/.ssh/authorized_keys`. If that default file is missing
+  or has no valid public keys, the server **fails fast** at startup (exit code 1). If either
+  flag or TOML is supplied, that path is used directly.
+* Keys supported: Ed25519, ECDSA (P-256/384/521), RSA ≥ 2048 with SHA-2 (`rsa-sha2-256` / `rsa-sha2-512`).
+* Challenge is signed and verified **before** allocating a session or dialing the destination. Failure triggers fixed `auth_fail_delay` (200ms default) with no timing oracle.
 
-```toml
-auth_method     = "ssh-publickey"
-authorized_keys = "/var/lib/relay/authorized_keys"  # OpenSSH authorized_keys file
-auth_fail_delay = "200ms"
-```
-
-The server verifies the offered key against `authorized_keys` (ed25519, ecdsa
-P-256/384/521, RSA ≥ 2048 with `rsa-sha2-256`/`rsa-sha2-512`). It sends a
-challenge **before** allocating a session or dialing the destination. Failure
-is `ERR_AUTH` after `auth_fail_delay` (same delay for unknown key and bad
-signature). `RESUME` must re-sign with the same key; `resumeToken` alone is
-not enough.
-
-**Client** (`client.toml`):
-
-```toml
-auth_method    = "ssh-publickey"
-auth_user      = "alice"
-identity_files = ["/home/alice/.ssh/id_ed25519"]
-```
-
-If `identity_files` is empty the client tries `~/.ssh/id_ed25519`, `id_ecdsa`,
-`id_rsa` (PEM and OpenSSH formats). Both sides must set `ssh-publickey`; a
-`none` client against an authenticating server gets `ERR_AUTH`.
+**Client**:
+* Flag: `-i` / `--identity /path/to/private_key`, `--auth-sock /path/to/agent.sock`
+* Config (`client.toml`):
+  ```toml
+  auth_method    = "ssh-publickey"
+  auth_user      = "alice"
+  auth_sock      = ""                               # empty = use $SSH_AUTH_SOCK
+  identity_files = ["/home/alice/.ssh/id_ed25519"]
+  ```
+* **OpenSSH Agent (FEAT-UTL-01)**: Connects to local `ssh-agent` via `$SSH_AUTH_SOCK` (or `--auth-sock`). Enables passphrase-protected keys, hardware tokens (YubiKey / FIDO2 `sk-ssh-ed25519@openssh.com`), and keys loaded into `ssh-agent` without storing unencrypted keys on disk.
+* **Fallback Chain**: Active `ssh-agent` keys $\to$ unencrypted `identity_files` $\to$ default `~/.ssh/id_*` on disk.
+* **Fast Resumption (FEAT-PERF-03)**: Resumption inside the forward-secret tunnel is verified via 3-RTT token-authorized fast path, with transparent fallback to cryptographic challenge re-signing if the token is stale or expired. Hardware tokens only require physical touch once during initial connection.
 
 ## Resume, hold, and BFD failover
 
@@ -284,20 +292,24 @@ If both are set to the same address, one HTTP server serves both.
 
 ## Security
 
-- TCP handshake is cleartext (HELLO / RESUME, including `resumeToken`).
-- QUIC data plane is TLS 1.3 but unauthenticated (ephemeral self-signed cert
-  by default).
-- KCP data plane is cleartext.
-- With the default `auth_method = "none"`, anyone who can reach `listen_tcp`
-  can open a session to any destination the server allows.
-
-With `auth_method = "ssh-publickey"`, the server does not dial until a
-signature over a dest-bound challenge verifies against `authorized_keys`, and
-RESUME is bound to that key fingerprint.
-
-This is tolerable when the payload is SSH: SSH already authenticates and
-encrypts end-to-end. The realistic blast radius without relay auth is denial
-of service and metadata disclosure, not authentication bypass of `sshd`.
+- **Strict Control-Plane Encryption (FEAT-SEC-01)**: Control plane is strictly encrypted
+  via Ephemeral X25519 ECDH + HKDF-SHA256 + ChaCha20-Poly1305 with monotonically increasing
+  64-bit sequence nonces. Unencrypted handshakes are rejected unconditionally (`ERR_PROTO`).
+- **Host Key Verification & Pinning**: Server identity is authenticated via Ed25519 host key
+  signatures over the key exchange transcript hash. Verified against OpenSSH `known_hosts`
+  (`--known-hosts`, `--strict-host-key-checking`) or pinned SHA-256 fingerprint (`--server-fingerprint`).
+  Verification fails closed if known_hosts cannot be resolved unless `--strict-host-key-checking=no`.
+- **Protected Resumption & Fast-Path (FEAT-PERF-03)**: Session tokens (`resumeToken`) are never
+  exposed on the wire in cleartext; they are exchanged solely inside the forward-secret AEAD tunnel.
+  Fast 3-RTT resumption authenticates via token alone; expired/stale tokens fall back transparently
+  to full public-key challenge re-signing.
+- **Mandatory Client Authentication**: Handshake authentication is mandatory (`ssh-publickey`).
+  The server will not dial the destination socket until a valid signature over the destination-bound
+  challenge is verified against `authorized_keys`.
+- **Option A Clean Phase Cut**: Following successful handshake (`HELLO_OK` / `RESUME_OK`), the
+  session transitions cleanly to raw framing for `TypeData` payload frames, eliminating double-encryption
+  overhead with inner SSH streams.
+- The relayed payload is typically already an end-to-end authenticated and encrypted SSH connection.
 
 ## License
  

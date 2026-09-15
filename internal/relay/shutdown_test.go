@@ -166,6 +166,7 @@ func TestClientReturnsOnServerShutdown(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 	ccfg := config.DefaultClient()
+	ccfg.StrictHostKeyChecking = "no"
 	ccfg.Server = addr
 	ccfg.Destination = dest
 	ccfg.Transport = "tcp"
@@ -230,6 +231,7 @@ func TestShutdownUnblocksFullCtrlQ(t *testing.T) {
 	cctx, ccancel := context.WithCancel(context.Background())
 	defer ccancel()
 	ccfg := config.DefaultClient()
+	ccfg.StrictHostKeyChecking = "no"
 	ccfg.Server = addr
 	ccfg.Destination = destLn.Addr().String()
 	ccfg.Transport = "tcp"
@@ -285,6 +287,7 @@ func TestStructuredLogsOmitSecrets(t *testing.T) {
 	cctx, ccancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer ccancel()
 	ccfg := config.DefaultClient()
+	ccfg.StrictHostKeyChecking = "no"
 	ccfg.Server = srv.Addr()
 	ccfg.Destination = dest
 	ccfg.Transport = "tcp"

@@ -11,6 +11,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	kcp "github.com/xtaci/kcp-go/v5"
 )
 
 var (
@@ -49,6 +51,30 @@ func publishRelayExpvars() {
 				return s.refused.Load()
 			}
 			return 0
+		}))
+		expvar.Publish("spliced_bytes_in", expvar.Func(func() any {
+			in, _, _ := SplicedStats()
+			return in
+		}))
+		expvar.Publish("spliced_bytes_out", expvar.Func(func() any {
+			_, out, _ := SplicedStats()
+			return out
+		}))
+		expvar.Publish("splice_calls_total", expvar.Func(func() any {
+			_, _, calls := SplicedStats()
+			return calls
+		}))
+		expvar.Publish("kcp_out_segs", expvar.Func(func() any {
+			return atomic.LoadUint64(&kcp.DefaultSnmp.OutSegs)
+		}))
+		expvar.Publish("kcp_retrans_segs", expvar.Func(func() any {
+			return atomic.LoadUint64(&kcp.DefaultSnmp.RetransSegs)
+		}))
+		expvar.Publish("kcp_lost_segs", expvar.Func(func() any {
+			return atomic.LoadUint64(&kcp.DefaultSnmp.LostSegs)
+		}))
+		expvar.Publish("kcp_snd_queue", expvar.Func(func() any {
+			return atomic.LoadUint64(&kcp.DefaultSnmp.RingBufferSndQueue)
 		}))
 	})
 }

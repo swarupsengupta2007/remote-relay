@@ -26,6 +26,8 @@ import (
 	"github.com/remote-relay/relay/internal/proto"
 	"github.com/remote-relay/relay/internal/transport"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/agent"
+	"os/exec"
 )
 
 const authFailDelay = 50 * time.Millisecond
@@ -66,6 +68,7 @@ func TestUnauthenticatedClientRejectedBeforeDial(t *testing.T) {
 	_, addr, _ := startRelayCfg(t, scfg)
 
 	ccfg := config.DefaultClient()
+	ccfg.StrictHostKeyChecking = "no"
 	ccfg.Server = addr
 	ccfg.Destination = destLn.Addr().String()
 	ccfg.Transport = "tcp"
@@ -119,6 +122,7 @@ func TestUnauthorizedKeyERRAuthFixedDelay(t *testing.T) {
 	_, addr, _ := startRelayCfg(t, scfg)
 
 	ccfg := config.DefaultClient()
+	ccfg.StrictHostKeyChecking = "no"
 	ccfg.Server = addr
 	ccfg.Destination = destLn.Addr().String()
 	ccfg.Transport = "tcp"
@@ -155,7 +159,7 @@ func TestAuthOKDestMismatchDoesNotSendAUTH(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = completeClientAuth(rec, auth.None{}, auth.Challenge{
+	err = completeClientAuth(rec, auth.New(auth.Config{}), auth.Challenge{
 		Destination: "127.0.0.1:22",
 		Canonical:   []byte(`{"v":1}`),
 	}, fr)
@@ -587,6 +591,7 @@ func TestAuthorizedResumeSameKeyByteExact(t *testing.T) {
 
 func authClient(server, dest, identity string) config.Client {
 	ccfg := config.DefaultClient()
+	ccfg.StrictHostKeyChecking = "no"
 	ccfg.Server = server
 	ccfg.Destination = dest
 	ccfg.Transport = "tcp"
@@ -757,3 +762,437 @@ func (c *writeRecordConn) RemoteAddr() net.Addr        { return nil }
 func (c *writeRecordConn) Kind() transport.Kind        { return transport.KindTCP }
 func (c *writeRecordConn) Close() error                { return nil }
 func (c *writeRecordConn) ResetReader()                {}
+
+func startRelayAgentSocket(t *testing.T, ag agent.Agent) (string, func()) {
+	t.Helper()
+	dir := t.TempDir()
+	sock := filepath.Join(dir, "agent.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_ = agent.ServeAgent(ag, c)
+			}(conn)
+		}
+	}()
+	return sock, func() {
+		_ = ln.Close()
+		<-done
+	}
+}
+
+func TestClientAuthViaAgentNoDiskFiles(t *testing.T) {
+	destLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer destLn.Close()
+	go func() {
+		for {
+			c, err := destLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				_, _ = io.Copy(conn, conn)
+			}(c)
+		}
+	}()
+
+	keyring := agent.NewKeyring()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := keyring.Add(agent.AddedKey{PrivateKey: priv, Comment: "agent-only-key"}); err != nil {
+		t.Fatal(err)
+	}
+	sock, cleanup := startRelayAgentSocket(t, keyring)
+	defer cleanup()
+
+	signer, _ := ssh.NewSignerFromKey(priv)
+	pubLine := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey())))
+
+	dir := t.TempDir()
+	ak := filepath.Join(dir, "authorized_keys")
+	if err := os.WriteFile(ak, []byte(pubLine+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	scfg := config.DefaultServer()
+	scfg.ListenTCP = "127.0.0.1:0"
+	scfg.DefaultDestination = destLn.Addr().String()
+	scfg.AllowDestinations = []string{destLn.Addr().String(), "*"}
+	scfg.Transports = []string{"tcp"}
+	scfg.AuthMethod = auth.MethodPublicKey
+	scfg.AuthorizedKeys = ak
+	_, addr, _ := startRelayCfg(t, scfg)
+
+	t.Setenv("RELAY_TEST_IDENTITY", filepath.Join(dir, "nonexistent"))
+
+	ccfg := config.DefaultClient()
+	ccfg.StrictHostKeyChecking = "no"
+	ccfg.Server = addr
+	ccfg.Destination = destLn.Addr().String()
+	ccfg.Transport = "tcp"
+	ccfg.AuthSock = sock
+	ccfg.IdentityFiles = nil // ZERO files on disk
+
+	payload := bytes.Repeat([]byte("hello-agent-tunnel\n"), 1000)
+	var outBuf bytes.Buffer
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err = RunClient(ctx, ccfg, bytes.NewReader(payload), &outBuf, logging.New(io.Discard, "error", "text"))
+	if err != nil {
+		t.Fatalf("RunClient with agent failed: %v", err)
+	}
+
+	if !bytes.Equal(outBuf.Bytes(), payload) {
+		t.Fatalf("data mismatch: got %d bytes, want %d bytes", outBuf.Len(), len(payload))
+	}
+}
+
+func TestClientAuthViaAgentPassphraseProtectedKey(t *testing.T) {
+	destLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer destLn.Close()
+	go func() {
+		for {
+			c, err := destLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				_, _ = io.Copy(conn, conn)
+			}(c)
+		}
+	}()
+
+	dir := t.TempDir()
+	privPath := filepath.Join(dir, "id_enc_relay")
+	cmd := exec.Command("ssh-keygen", "-t", "ed25519", "-N", "secretpass123", "-f", privPath, "-C", "enc@relay")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("ssh-keygen: %v: %s", err, out)
+	}
+
+	pubBytes, err := os.ReadFile(privPath + ".pub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ak := filepath.Join(dir, "authorized_keys")
+	if err := os.WriteFile(ak, pubBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	encBytes, err := os.ReadFile(privPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawPriv, err := ssh.ParseRawPrivateKeyWithPassphrase(encBytes, []byte("secretpass123"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	keyring := agent.NewKeyring()
+	if err := keyring.Add(agent.AddedKey{PrivateKey: rawPriv, Comment: privPath}); err != nil {
+		t.Fatal(err)
+	}
+	sock, cleanup := startRelayAgentSocket(t, keyring)
+	defer cleanup()
+
+	scfg := config.DefaultServer()
+	scfg.ListenTCP = "127.0.0.1:0"
+	scfg.DefaultDestination = destLn.Addr().String()
+	scfg.AllowDestinations = []string{destLn.Addr().String(), "*"}
+	scfg.Transports = []string{"tcp"}
+	scfg.AuthMethod = auth.MethodPublicKey
+	scfg.AuthorizedKeys = ak
+	_, addr, _ := startRelayCfg(t, scfg)
+
+	ccfg := config.DefaultClient()
+	ccfg.StrictHostKeyChecking = "no"
+	ccfg.Server = addr
+	ccfg.Destination = destLn.Addr().String()
+	ccfg.Transport = "tcp"
+	ccfg.AuthSock = sock
+	ccfg.IdentityFiles = []string{privPath} // Points to encrypted file on disk!
+
+	payload := []byte("encrypted-key-delegated-to-agent-test")
+	var outBuf bytes.Buffer
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err = RunClient(ctx, ccfg, bytes.NewReader(payload), &outBuf, logging.New(io.Discard, "error", "text"))
+	if err != nil {
+		t.Fatalf("RunClient with passphrase key delegated to agent failed: %v", err)
+	}
+	if !bytes.Equal(outBuf.Bytes(), payload) {
+		t.Fatalf("payload mismatch")
+	}
+}
+
+func TestClientAuthAgentStaleSocketFallbackToDisk(t *testing.T) {
+	destLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer destLn.Close()
+	go func() {
+		for {
+			c, err := destLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				_, _ = io.Copy(conn, conn)
+			}(c)
+		}
+	}()
+
+	dir := t.TempDir()
+	priv, pubLine := writeEd25519Key(t, dir, "id_disk_fallback")
+	ak := filepath.Join(dir, "authorized_keys")
+	if err := os.WriteFile(ak, []byte(pubLine+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	scfg := config.DefaultServer()
+	scfg.ListenTCP = "127.0.0.1:0"
+	scfg.DefaultDestination = destLn.Addr().String()
+	scfg.AllowDestinations = []string{destLn.Addr().String(), "*"}
+	scfg.Transports = []string{"tcp"}
+	scfg.AuthMethod = auth.MethodPublicKey
+	scfg.AuthorizedKeys = ak
+	_, addr, _ := startRelayCfg(t, scfg)
+
+	ccfg := config.DefaultClient()
+	ccfg.StrictHostKeyChecking = "no"
+	ccfg.Server = addr
+	ccfg.Destination = destLn.Addr().String()
+	ccfg.Transport = "tcp"
+	ccfg.AuthSock = "/tmp/nonexistent-stale-agent-sock-" + t.Name() + ".sock"
+	ccfg.IdentityFiles = []string{priv}
+
+	payload := []byte("stale-agent-socket-fallback-success")
+	var outBuf bytes.Buffer
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err = RunClient(ctx, ccfg, bytes.NewReader(payload), &outBuf, logging.New(io.Discard, "error", "text"))
+	if err != nil {
+		t.Fatalf("RunClient fallback on stale agent socket failed: %v", err)
+	}
+	if !bytes.Equal(outBuf.Bytes(), payload) {
+		t.Fatalf("payload mismatch")
+	}
+}
+
+func TestClientAuthViaRealSSHAgentProcess(t *testing.T) {
+	if _, err := exec.LookPath("ssh-agent"); err != nil {
+		t.Skip("ssh-agent binary not found in PATH")
+	}
+	if _, err := exec.LookPath("ssh-add"); err != nil {
+		t.Skip("ssh-add binary not found in PATH")
+	}
+
+	dir := t.TempDir()
+	privPath := filepath.Join(dir, "id_real_agent")
+	cmd := exec.Command("ssh-keygen", "-t", "ed25519", "-N", "", "-f", privPath, "-C", "real-agent-test")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("ssh-keygen: %v: %s", err, out)
+	}
+
+	// Start real ssh-agent process
+	agentSock := filepath.Join(dir, "real-agent.sock")
+	agentCmd := exec.Command("ssh-agent", "-a", agentSock, "-d")
+	if err := agentCmd.Start(); err != nil {
+		t.Fatalf("failed to start ssh-agent: %v", err)
+	}
+	defer func() {
+		_ = agentCmd.Process.Kill()
+		_ = agentCmd.Wait()
+	}()
+
+	// Wait for socket to become available
+	var conn net.Conn
+	var err error
+	for i := 0; i < 20; i++ {
+		time.Sleep(50 * time.Millisecond)
+		conn, err = net.Dial("unix", agentSock)
+		if err == nil {
+			conn.Close()
+			break
+		}
+	}
+	if err != nil {
+		t.Fatalf("failed to connect to real ssh-agent socket: %v", err)
+	}
+
+	// Add key using ssh-add
+	addCmd := exec.Command("ssh-add", privPath)
+	addCmd.Env = append(os.Environ(), "SSH_AUTH_SOCK="+agentSock)
+	if out, err := addCmd.CombinedOutput(); err != nil {
+		t.Fatalf("ssh-add failed: %v: %s", err, out)
+	}
+
+	// Now remove private key from disk to ensure client has NO file on disk!
+	if err := os.Remove(privPath); err != nil {
+		t.Fatal(err)
+	}
+
+	// Destination echo server
+	destLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer destLn.Close()
+	go func() {
+		for {
+			c, err := destLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				_, _ = io.Copy(conn, conn)
+			}(c)
+		}
+	}()
+
+	pubBytes, err := os.ReadFile(privPath + ".pub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ak := filepath.Join(dir, "authorized_keys")
+	if err := os.WriteFile(ak, pubBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	scfg := config.DefaultServer()
+	scfg.ListenTCP = "127.0.0.1:0"
+	scfg.DefaultDestination = destLn.Addr().String()
+	scfg.AllowDestinations = []string{destLn.Addr().String(), "*"}
+	scfg.Transports = []string{"tcp"}
+	scfg.AuthMethod = auth.MethodPublicKey
+	scfg.AuthorizedKeys = ak
+	_, addr, _ := startRelayCfg(t, scfg)
+
+	t.Setenv("RELAY_TEST_IDENTITY", filepath.Join(dir, "nonexistent"))
+
+	ccfg := config.DefaultClient()
+	ccfg.StrictHostKeyChecking = "no"
+	ccfg.Server = addr
+	ccfg.Destination = destLn.Addr().String()
+	ccfg.Transport = "tcp"
+	ccfg.AuthSock = agentSock
+	ccfg.IdentityFiles = nil // No files on disk!
+
+	payload := []byte("real-openssh-agent-process-verification-success")
+	var outBuf bytes.Buffer
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err = RunClient(ctx, ccfg, bytes.NewReader(payload), &outBuf, logging.New(io.Discard, "error", "text"))
+	if err != nil {
+		t.Fatalf("RunClient with real ssh-agent failed: %v", err)
+	}
+	if !bytes.Equal(outBuf.Bytes(), payload) {
+		t.Fatalf("payload mismatch")
+	}
+}
+
+func TestClientAuthViaAgentResumeFastAndFallback(t *testing.T) {
+	dest := startHoldDest(t)
+	dir := t.TempDir()
+
+	keyring := agent.NewKeyring()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := keyring.Add(agent.AddedKey{PrivateKey: priv, Comment: "resume-agent-key"}); err != nil {
+		t.Fatal(err)
+	}
+	sock, cleanup := startRelayAgentSocket(t, keyring)
+	defer cleanup()
+
+	signer, _ := ssh.NewSignerFromKey(priv)
+	pubLine := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey())))
+	ak := filepath.Join(dir, "authorized_keys")
+	if err := os.WriteFile(ak, []byte(pubLine+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	scfg := config.DefaultServer()
+	scfg.ListenTCP = "127.0.0.1:0"
+	scfg.DefaultDestination = dest
+	scfg.AllowDestinations = []string{dest, "*"}
+	scfg.Transports = []string{"tcp"}
+	scfg.HoldTimeout = config.Duration(10 * time.Second)
+	scfg.AuthMethod = auth.MethodPublicKey
+	scfg.AuthorizedKeys = ak
+	_, addr, _ := startRelayCfg(t, scfg)
+
+	t.Setenv("RELAY_TEST_IDENTITY", filepath.Join(dir, "nonexistent"))
+
+	cliCfg := config.DefaultClient()
+	cliCfg.Server = addr
+	cliCfg.Destination = dest
+	cliCfg.Transport = "tcp"
+	cliCfg.StrictHostKeyChecking = "no"
+	cliCfg.AuthSock = sock
+	cliCfg.IdentityFiles = nil // Pure agent
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+
+	// Initial connect via agent
+	conn, hello, err := clientHello(ctx, cliCfg)
+	if err != nil {
+		t.Fatalf("initial clientHello via agent failed: %v", err)
+	}
+	_ = conn.Close()
+
+	// 1. Fast 3-RTT resume with valid token via agent
+	rconn1, rok1, err := clientResume(ctx, cliCfg, hello.SessionID, hello.ResumeToken, 0)
+	if err != nil {
+		t.Fatalf("fast clientResume via agent failed: %v", err)
+	}
+	_ = rconn1.Close()
+	if rok1.SessionID != hello.SessionID {
+		t.Fatalf("session id mismatch: got %s", rok1.SessionID)
+	}
+	if rok1.ResumeToken == "" || rok1.ResumeToken == hello.ResumeToken {
+		t.Fatalf("token rotation expected, got %s", rok1.ResumeToken)
+	}
+
+	// 2. Cryptographic fallback resume with stale token via agent
+	rconn2, rok2, err := clientResume(ctx, cliCfg, hello.SessionID, "stale-corrupted-token", 0)
+	if err != nil {
+		t.Fatalf("fallback clientResume via agent failed: %v", err)
+	}
+	_ = rconn2.Close()
+	if rok2.SessionID != hello.SessionID {
+		t.Fatalf("fallback session id mismatch: got %s", rok2.SessionID)
+	}
+}

@@ -97,6 +97,7 @@ func runClientTo(t *testing.T, server, dest string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 	ccfg := config.DefaultClient()
+	ccfg.StrictHostKeyChecking = "no"
 	ccfg.Server = server
 	ccfg.Destination = dest
 	ccfg.Transport = "tcp"
@@ -149,6 +150,7 @@ func TestE2EByteExactBothDirections(t *testing.T) {
 	defer cancel()
 
 	cfg := config.DefaultClient()
+	cfg.StrictHostKeyChecking = "no"
 	cfg.Server = relayAddr
 	cfg.Destination = destLn.Addr().String()
 	cfg.Transport = "tcp"
@@ -259,6 +261,7 @@ func TestHalfClose(t *testing.T) {
 	defer cancel()
 
 	cfg := config.DefaultClient()
+	cfg.StrictHostKeyChecking = "no"
 	cfg.Server = relayAddr
 	cfg.Destination = destLn.Addr().String()
 	cfg.Transport = "tcp"
@@ -395,5 +398,68 @@ func TestClampChunk(t *testing.T) {
 	}
 	if got := clampChunk(proto.MaxFrameLen); got != proto.MaxFrameLen-8 {
 		t.Fatalf("oversize: %d", got)
+	}
+}
+
+func TestE2EClientInterfaceAndSourceIPBinding(t *testing.T) {
+	// Simple echo target
+	destLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer destLn.Close()
+	dest := destLn.Addr().String()
+
+	go func() {
+		for {
+			c, err := destLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				_, _ = io.Copy(conn, conn)
+			}(c)
+		}
+	}()
+
+	_, srvAddr, _ := startRelay(t, dest)
+
+	// 1. Client bound to loopback interface 'lo' and source IP 127.0.0.1
+	ccfg := config.DefaultClient()
+	ccfg.StrictHostKeyChecking = "no"
+	ccfg.Server = srvAddr
+	ccfg.Destination = dest
+	ccfg.Transport = "tcp"
+	ccfg.TCPInterface = "lo"
+	ccfg.TCPSourceIP = "127.0.0.1"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+
+	log := logging.New(io.Discard, "error", "text")
+	input := []byte("hello binding world")
+	var stdout bytes.Buffer
+	err = RunClient(ctx, ccfg, bytes.NewReader(input), &stdout, log)
+	if err != nil {
+		t.Fatalf("RunClient with lo and 127.0.0.1 failed: %v", err)
+	}
+	if stdout.String() != string(input) {
+		t.Fatalf("got %q, want %q", stdout.String(), string(input))
+	}
+
+	// 2. Client bound to non-existent interface fails fast
+	ccfgBad := config.DefaultClient()
+	ccfgBad.StrictHostKeyChecking = "no"
+	ccfgBad.Server = srvAddr
+	ccfgBad.Destination = dest
+	ccfgBad.Transport = "tcp"
+	ccfgBad.TCPInterface = "nonexistent_device_42"
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel2()
+	err = RunClient(ctx2, ccfgBad, bytes.NewReader(nil), io.Discard, log)
+	if err == nil {
+		t.Fatal("expected error with nonexistent interface, got nil")
 	}
 }

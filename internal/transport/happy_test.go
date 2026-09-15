@@ -177,6 +177,12 @@ func TestDialHappyEyeballsTCPIPv6Wins(t *testing.T) {
 	}
 	defer conn.Close()
 
+	for i := 0; i < 50; i++ {
+		if v6Accepted.Load() {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	if !v6Accepted.Load() {
 		t.Errorf("expected IPv6 to win and be accepted")
 	}
@@ -390,5 +396,153 @@ func TestProbeDualStackHappyEyeballs(t *testing.T) {
 	// Stagger delay was 100ms, so elapsed should be >= 80ms
 	if elapsed < 80*time.Millisecond {
 		t.Errorf("probe completed too fast (%v), expected >= 80ms due to IPv6 delay", elapsed)
+	}
+}
+
+func TestDialHappyEyeballsTCPWithBind_FamilyFiltering(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	lnV4, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lnV4.Close()
+	portV4 := lnV4.Addr().(*net.TCPAddr).Port
+
+	res := &mockResolver{
+		lookup: func(ctx context.Context, network, host string) ([]net.IP, error) {
+			if network == "ip6" {
+				return []net.IP{net.ParseIP("2001:db8::1")}, nil
+			}
+			if network == "ip4" {
+				return []net.IP{net.ParseIP("127.0.0.1")}, nil
+			}
+			return nil, errors.New("unknown")
+		},
+	}
+
+	var dialedAddrs []string
+	var dialMu sync.Mutex
+	dialFn := func(cctx context.Context, network, candAddr string) (net.Conn, error) {
+		dialMu.Lock()
+		dialedAddrs = append(dialedAddrs, candAddr)
+		dialMu.Unlock()
+		if strings.Contains(candAddr, "2001:db8::1") {
+			// Mock TCP dial by actually connecting to local listener
+			return net.Dial("tcp", lnV4.Addr().String())
+		}
+		d := net.Dialer{Timeout: 1 * time.Second}
+		return d.DialContext(cctx, network, candAddr)
+	}
+
+	// 1. Bound to IPv4: IPv6 should be completely filtered out
+	bindV4 := BindConfig{SourceIP: net.ParseIP("127.0.0.2")}
+	conn, err := DialHappyEyeballsTCPWithResolverAndBind(ctx, fmt.Sprintf("example.com:%d", portV4), 250*time.Millisecond, res, dialFn, bindV4)
+	if err != nil {
+		t.Fatalf("unexpected dial error: %v", err)
+	}
+	_ = conn.Close()
+
+	dialMu.Lock()
+	if len(dialedAddrs) != 1 || !strings.HasPrefix(dialedAddrs[0], "127.0.0.1:") {
+		t.Fatalf("expected only 127.0.0.1 dialed, got %v", dialedAddrs)
+	}
+	dialedAddrs = nil
+	dialMu.Unlock()
+
+	// 2. Bound to IPv6: IPv4 should be completely filtered out
+	bindV6 := BindConfig{SourceIP: net.ParseIP("::1")}
+	conn, err = DialHappyEyeballsTCPWithResolverAndBind(ctx, fmt.Sprintf("example.com:%d", portV4), 250*time.Millisecond, res, dialFn, bindV6)
+	if err != nil {
+		t.Fatalf("unexpected dial error: %v", err)
+	}
+	_ = conn.Close()
+
+	dialMu.Lock()
+	if len(dialedAddrs) != 1 || !strings.HasPrefix(dialedAddrs[0], "[2001:db8::1]:") {
+		t.Fatalf("expected only 2001:db8::1 dialed, got %v", dialedAddrs)
+	}
+	dialedAddrs = nil
+	dialMu.Unlock()
+
+	// 3. Bound to IPv6 but resolver only returns IPv4: should return error immediately
+	resV4Only := &mockResolver{
+		lookup: func(ctx context.Context, network, host string) ([]net.IP, error) {
+			if network == "ip4" {
+				return []net.IP{net.ParseIP("127.0.0.1")}, nil
+			}
+			return nil, errors.New("no ipv6")
+		},
+	}
+	_, err = DialHappyEyeballsTCPWithResolverAndBind(ctx, "example.com:80", 250*time.Millisecond, resV4Only, dialFn, bindV6)
+	if err == nil || !strings.Contains(err.Error(), "no IPv6 addresses found") {
+		t.Fatalf("expected no IPv6 addresses found error, got %v", err)
+	}
+}
+
+func TestProbeDualStackWithBind_FamilyFiltering(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	res := &mockResolver{
+		lookup: func(ctx context.Context, network, host string) ([]net.IP, error) {
+			if network == "ip6" {
+				return []net.IP{net.ParseIP("2001:db8::1")}, nil
+			}
+			if network == "ip4" {
+				return []net.IP{net.ParseIP("127.0.0.1")}, nil
+			}
+			return nil, errors.New("unknown")
+		},
+	}
+
+	var probedAddrs []string
+	var probeMu sync.Mutex
+	probeFn := func(cctx context.Context, mux *UDPMux, addr net.Addr, tok [16]byte, attempts int, timeout time.Duration) error {
+		probeMu.Lock()
+		probedAddrs = append(probedAddrs, addr.String())
+		probeMu.Unlock()
+		return nil
+	}
+
+	token := [16]byte{1, 2, 3}
+	bindV4 := BindConfig{SourceIP: net.ParseIP("127.0.0.1")}
+	mux, winner, err := ProbeDualStackWithResolverAndBind(ctx, "example.com:7443", token, 1, 500*time.Millisecond, 100*time.Millisecond, res, probeFn, bindV4)
+	if err != nil {
+		t.Fatalf("unexpected probe error: %v", err)
+	}
+	defer mux.Close()
+
+	if winner == nil || !strings.HasPrefix(winner.String(), "127.0.0.1:") {
+		t.Fatalf("expected 127.0.0.1 winner, got %v", winner)
+	}
+	probeMu.Lock()
+	if len(probedAddrs) != 1 || !strings.HasPrefix(probedAddrs[0], "127.0.0.1:") {
+		t.Fatalf("expected only 127.0.0.1 probed, got %v", probedAddrs)
+	}
+	probeMu.Unlock()
+}
+
+func TestBindToDeviceErrorFailFast(t *testing.T) {
+	oldFn := bindToDeviceFn
+	defer func() { bindToDeviceFn = oldFn }()
+
+	bindToDeviceFn = func(fd uintptr, iface string) error {
+		return errors.New("operation not permitted")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	bind := BindConfig{Interface: "eth0"}
+	_, err := DialTCPWithBind(ctx, "127.0.0.1:12345", bind)
+	if err == nil || !strings.Contains(err.Error(), "operation not permitted") {
+		t.Fatalf("expected operation not permitted error, got %v", err)
+	}
+
+	_, err = ListenUDPMuxWithBind("127.0.0.1:0", bind)
+	if err == nil || !strings.Contains(err.Error(), "operation not permitted") {
+		t.Fatalf("expected operation not permitted error, got %v", err)
 	}
 }

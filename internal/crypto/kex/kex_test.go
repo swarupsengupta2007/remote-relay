@@ -310,22 +310,86 @@ func TestKnownHostsVerification(t *testing.T) {
 		t.Fatalf("strict checking with missing file succeeded unexpectedly")
 	}
 
-	// 3. TOFU: record pub1
-	if err := VerifyKnownHosts(khPath, addr, pub1, "", "ask"); err != nil {
-		t.Fatalf("TOFU failed: %v", err)
+	// 3. Mode "ask" without interactive terminal -> fail
+	if err := VerifyKnownHosts(khPath, addr, pub1, "", "ask"); err == nil {
+		t.Fatalf("expected ask to fail without interactive terminal, got nil")
 	}
 
-	// 4. Match pub1 from file
+	// 4. Mode "ask" with user answering "no" -> fail and do not record
+	{
+		oldReader, oldWriter := PromptReader, PromptWriter
+		PromptReader = strings.NewReader("no\n")
+		var promptOut bytes.Buffer
+		PromptWriter = &promptOut
+		err := VerifyKnownHosts(khPath, addr, pub1, "", "ask")
+		PromptReader, PromptWriter = oldReader, oldWriter
+		if err == nil {
+			t.Fatalf("expected ask with 'no' to fail, got nil")
+		}
+		if !strings.Contains(err.Error(), "host key verification failed") {
+			t.Fatalf("unexpected error message: %v", err)
+		}
+	}
+
+	// 5. Mode "ask" with user answering "yes" -> succeed and record pub1
+	{
+		oldReader, oldWriter := PromptReader, PromptWriter
+		PromptReader = strings.NewReader("yes\n")
+		var promptOut bytes.Buffer
+		PromptWriter = &promptOut
+		err := VerifyKnownHosts(khPath, addr, pub1, "", "ask")
+		PromptReader, PromptWriter = oldReader, oldWriter
+		if err != nil {
+			t.Fatalf("TOFU failed with 'yes': %v", err)
+		}
+		if !strings.Contains(promptOut.String(), "The authenticity of host") {
+			t.Fatalf("expected prompt output, got: %s", promptOut.String())
+		}
+		if !strings.Contains(promptOut.String(), "Permanently added") {
+			t.Fatalf("expected permanently added warning, got: %s", promptOut.String())
+		}
+	}
+
+	// 6. Match pub1 from file
 	if err := VerifyKnownHosts(khPath, addr, pub1, "", "yes"); err != nil {
 		t.Fatalf("match from file failed: %v", err)
 	}
 
-	// 5. MITM check: pub2 presents for same address -> fatal mismatch
+	// 7. MITM check: pub2 presents for same address -> fatal mismatch
 	err := VerifyKnownHosts(khPath, addr, pub2, "", "yes")
 	if err == nil {
 		t.Fatalf("expected MITM error for changed host key, got nil")
 	}
 	if !strings.Contains(err.Error(), "REMOTE HOST IDENTIFICATION HAS CHANGED") {
 		t.Fatalf("unexpected MITM error: %v", err)
+	}
+
+	// 8. Mode "accept-new" for another address -> succeed without prompting
+	addr2 := "relay2.example.com:7443"
+	if err := VerifyKnownHosts(khPath, addr2, pub2, "", "accept-new"); err != nil {
+		t.Fatalf("accept-new failed: %v", err)
+	}
+	if err := VerifyKnownHosts(khPath, addr2, pub2, "", "yes"); err != nil {
+		t.Fatalf("match from file after accept-new failed: %v", err)
+	}
+}
+
+func TestKnownHostsEmptyPathFailClosed(t *testing.T) {
+	pub, _, _ := ed25519.GenerateKey(rand.Reader)
+	addr := "unresolvable-domain-name.invalid:8443"
+
+	t.Setenv("HOME", "")
+	// 1. strictChecking = "yes" must fail closed
+	err := VerifyKnownHosts("", addr, pub, "", "yes")
+	if err == nil {
+		t.Fatalf("expected fail-closed error with empty knownHostsPath and HOME, got nil")
+	}
+	if !strings.Contains(err.Error(), "no known_hosts file path available") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+
+	// 2. strictChecking = "no" must succeed even with empty knownHostsPath
+	if err := VerifyKnownHosts("", addr, pub, "", "no"); err != nil {
+		t.Fatalf("expected success for strictChecking=no with empty knownHostsPath, got %v", err)
 	}
 }

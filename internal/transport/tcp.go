@@ -3,7 +3,9 @@ package transport
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
 	"time"
 
@@ -28,6 +30,14 @@ func DialTCP(ctx context.Context, addr string) (Conn, error) {
 
 func DialTCPWithDelay(ctx context.Context, addr string, delay time.Duration) (Conn, error) {
 	return DialHappyEyeballsTCP(ctx, addr, delay)
+}
+
+func DialTCPWithBind(ctx context.Context, addr string, bind BindConfig) (Conn, error) {
+	return DialHappyEyeballsTCPWithResolverAndBind(ctx, addr, DefaultConnectionAttemptDelay, nil, nil, bind)
+}
+
+func DialTCPWithDelayAndBind(ctx context.Context, addr string, delay time.Duration, bind BindConfig) (Conn, error) {
+	return DialHappyEyeballsTCPWithResolverAndBind(ctx, addr, delay, nil, nil, bind)
 }
 
 func ListenTCP(addr string) (net.Listener, error) {
@@ -58,8 +68,79 @@ func WrapTCP(c net.Conn) (Conn, error) {
 	}, nil
 }
 
+func (c *tcpConn) RawTCPConn() *net.TCPConn {
+	return c.raw
+}
+
+func (c *tcpConn) Buffered() int {
+	return c.br.Buffered()
+}
+
+func (c *tcpConn) ReadFrameHeader() (proto.Type, uint32, error) {
+	var hdr [5]byte
+	if c.br.Buffered() >= 5 {
+		if _, err := io.ReadFull(c.br, hdr[:]); err != nil {
+			return 0, 0, err
+		}
+	} else if c.br.Buffered() > 0 {
+		if _, err := io.ReadFull(c.br, hdr[:]); err != nil {
+			return 0, 0, err
+		}
+	} else {
+		if _, err := io.ReadFull(c.raw, hdr[:]); err != nil {
+			return 0, 0, err
+		}
+	}
+	n := binary.BigEndian.Uint32(hdr[1:])
+	if n > proto.MaxFrameLen {
+		return 0, 0, proto.ErrFrame
+	}
+	typ := proto.Type(hdr[0])
+	if !typ.Known() {
+		return 0, 0, proto.ErrProto
+	}
+	return typ, n, nil
+}
+
+func (c *tcpConn) ReadPayload(n uint32) ([]byte, error) {
+	if n == 0 {
+		return nil, nil
+	}
+	buf := make([]byte, n)
+	if c.br.Buffered() > 0 {
+		if _, err := io.ReadFull(c.br, buf); err != nil {
+			return nil, err
+		}
+	} else {
+		if _, err := io.ReadFull(c.raw, buf); err != nil {
+			return nil, err
+		}
+	}
+	return buf, nil
+}
+
 func (c *tcpConn) ReadFrame() (proto.Frame, error) {
-	return proto.ReadFrame(c.br)
+	typ, n, err := c.ReadFrameHeader()
+	if err != nil {
+		return proto.Frame{}, err
+	}
+	payload, err := c.ReadPayload(n)
+	if err != nil {
+		return proto.Frame{}, err
+	}
+	return proto.Frame{Type: typ, Payload: payload}, nil
+}
+
+func (c *tcpConn) WriteDataFrameHeader(seq uint64, dataLen int) error {
+	if err := c.bw.Flush(); err != nil {
+		return err
+	}
+	var hdr [13]byte
+	hdr[0] = byte(proto.TypeData)
+	binary.BigEndian.PutUint32(hdr[1:5], uint32(8+dataLen))
+	binary.BigEndian.PutUint64(hdr[5:13], seq)
+	_, err := c.raw.Write(hdr[:])
+	return err
 }
 
 func (c *tcpConn) WriteFrame(f proto.Frame) error {
@@ -85,3 +166,10 @@ func (c *tcpConn) Close() error {
 func (c *tcpConn) ResetReader() {
 	c.br.Reset(c.raw)
 }
+
+var (
+	_ Conn                  = (*tcpConn)(nil)
+	_ TCPConnProvider       = (*tcpConn)(nil)
+	_ FrameHeaderReader     = (*tcpConn)(nil)
+	_ DataFrameHeaderWriter = (*tcpConn)(nil)
+)

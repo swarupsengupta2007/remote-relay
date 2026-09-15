@@ -463,6 +463,8 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 		conn:       rawConn,
 		src:        dtcp,
 		sink:       dtcp,
+		rawSrc:     dtcp,
+		rawSink:    dtcp,
 		closeWrite: dtcp.CloseWrite,
 		closeSrc:   func() error { return dtcp.Close() },
 		outDir:     proto.DirDown,
@@ -477,6 +479,7 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 		heartbeat:     s.cfg.HeartbeatInterval.Duration(),
 		deadThreshold: s.cfg.DeadPeerThreshold,
 		log:           log,
+		splice:        s.cfg.Splice,
 	}, sendLog)
 
 	l := &live{

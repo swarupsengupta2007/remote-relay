@@ -24,7 +24,7 @@ func TestDefaults(t *testing.T) {
 	if s.PprofListen != "" || s.ExpvarListen != "" {
 		t.Fatalf("debug listeners should default empty: %+v", s)
 	}
-	if s.AuthMethod != "none" {
+	if s.AuthMethod != "ssh-publickey" {
 		t.Fatalf("auth_method=%q", s.AuthMethod)
 	}
 	if s.BufferBytes != 67108864 || s.TotalBufferBytes != 536870912 {
@@ -38,7 +38,7 @@ func TestDefaults(t *testing.T) {
 	}
 
 	c := DefaultClient()
-	if c.Transport != "quic" || c.LogLevel != "warn" || c.AuthMethod != "none" {
+	if c.Transport != "quic" || c.LogLevel != "warn" || c.AuthMethod != "ssh-publickey" {
 		t.Fatalf("client %+v", c)
 	}
 	if err := c.Validate(); err != nil {
@@ -239,6 +239,10 @@ func TestValidationErrors(t *testing.T) {
 	if err := s.Validate(); err == nil {
 		t.Fatal("expected unknown auth_method error")
 	}
+	s.AuthMethod = "none"
+	if err := s.Validate(); err == nil {
+		t.Fatal("expected deprecated none auth_method error")
+	}
 
 	c := DefaultClient()
 	c.Transport = ""
@@ -293,5 +297,189 @@ func TestAllowAll(t *testing.T) {
 	}
 	if !DestinationAllowed("127.0.0.1:22", []string{"127.0.0.1:22"}) {
 		t.Fatal("should allow")
+	}
+}
+
+func TestSpliceConfig(t *testing.T) {
+	s := DefaultServer()
+	if s.Splice != defaultSplice() {
+		t.Fatalf("expected s.Splice=%v, got %v", defaultSplice(), s.Splice)
+	}
+	c := DefaultClient()
+	if c.Splice != defaultSplice() {
+		t.Fatalf("expected c.Splice=%v, got %v", defaultSplice(), c.Splice)
+	}
+
+	dir := t.TempDir()
+	srvToml := filepath.Join(dir, "srv.toml")
+	if err := os.WriteFile(srvToml, []byte("splice = false\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loadedSrv, err := LoadServer(ServerOptions{ConfigPath: srvToml})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loadedSrv.Splice != false {
+		t.Fatalf("expected loadedSrv.Splice=false, got %v", loadedSrv.Splice)
+	}
+
+	// Option override over TOML
+	tr := true
+	loadedSrv2, err := LoadServer(ServerOptions{ConfigPath: srvToml, Splice: &tr})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loadedSrv2.Splice != true {
+		t.Fatalf("expected loadedSrv2.Splice=true, got %v", loadedSrv2.Splice)
+	}
+
+	cliToml := filepath.Join(dir, "cli.toml")
+	if err := os.WriteFile(cliToml, []byte("server = \"1.2.3.4:5\"\nsplice = false\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loadedCli, err := LoadClient(ClientOptions{ConfigPath: cliToml})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loadedCli.Splice != false {
+		t.Fatalf("expected loadedCli.Splice=false, got %v", loadedCli.Splice)
+	}
+
+	loadedCli2, err := LoadClient(ClientOptions{ConfigPath: cliToml, Splice: &tr})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loadedCli2.Splice != true {
+		t.Fatalf("expected loadedCli2.Splice=true, got %v", loadedCli2.Splice)
+	}
+}
+
+func TestAdaptiveKCPConfig(t *testing.T) {
+	s := DefaultServer()
+	if !s.AdaptiveKCP {
+		t.Fatalf("expected default s.AdaptiveKCP=true, got %v", s.AdaptiveKCP)
+	}
+	c := DefaultClient()
+	if !c.AdaptiveKCP {
+		t.Fatalf("expected default c.AdaptiveKCP=true, got %v", c.AdaptiveKCP)
+	}
+
+	dir := t.TempDir()
+	srvToml := filepath.Join(dir, "srv.toml")
+	if err := os.WriteFile(srvToml, []byte("adaptive_kcp = false\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loadedSrv, err := LoadServer(ServerOptions{ConfigPath: srvToml})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loadedSrv.AdaptiveKCP != false {
+		t.Fatalf("expected loadedSrv.AdaptiveKCP=false, got %v", loadedSrv.AdaptiveKCP)
+	}
+
+	// Option override over TOML
+	tr := true
+	loadedSrv2, err := LoadServer(ServerOptions{ConfigPath: srvToml, AdaptiveKCP: &tr})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loadedSrv2.AdaptiveKCP != true {
+		t.Fatalf("expected loadedSrv2.AdaptiveKCP=true, got %v", loadedSrv2.AdaptiveKCP)
+	}
+
+	fl := false
+	loadedSrv3, err := LoadServer(ServerOptions{AdaptiveKCP: &fl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loadedSrv3.AdaptiveKCP != false {
+		t.Fatalf("expected loadedSrv3.AdaptiveKCP=false, got %v", loadedSrv3.AdaptiveKCP)
+	}
+
+	cliToml := filepath.Join(dir, "cli.toml")
+	if err := os.WriteFile(cliToml, []byte("server = \"1.2.3.4:5\"\nadaptive_kcp = false\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loadedCli, err := LoadClient(ClientOptions{ConfigPath: cliToml})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loadedCli.AdaptiveKCP != false {
+		t.Fatalf("expected loadedCli.AdaptiveKCP=false, got %v", loadedCli.AdaptiveKCP)
+	}
+
+	loadedCli2, err := LoadClient(ClientOptions{ConfigPath: cliToml, AdaptiveKCP: &tr})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loadedCli2.AdaptiveKCP != true {
+		t.Fatalf("expected loadedCli2.AdaptiveKCP=true, got %v", loadedCli2.AdaptiveKCP)
+	}
+}
+
+func TestStrictHostKeyCheckingConfig(t *testing.T) {
+	origIsTerminal := isTerminal
+	defer func() { isTerminal = origIsTerminal }()
+
+	// 1. Interactive TTY defaults to "ask"
+	isTerminal = func(fd uintptr) bool { return true }
+	if got := DefaultStrictHostKeyChecking(); got != "ask" {
+		t.Fatalf("expected 'ask' for TTY, got %q", got)
+	}
+	cliTTY := DefaultClient()
+	if cliTTY.StrictHostKeyChecking != "ask" {
+		t.Fatalf("expected DefaultClient().StrictHostKeyChecking='ask' for TTY, got %q", cliTTY.StrictHostKeyChecking)
+	}
+
+	// 2. Headless script defaults to "yes"
+	isTerminal = func(fd uintptr) bool { return false }
+	if got := DefaultStrictHostKeyChecking(); got != "yes" {
+		t.Fatalf("expected 'yes' for headless script, got %q", got)
+	}
+	cliHeadless := DefaultClient()
+	if cliHeadless.StrictHostKeyChecking != "yes" {
+		t.Fatalf("expected DefaultClient().StrictHostKeyChecking='yes' for headless, got %q", cliHeadless.StrictHostKeyChecking)
+	}
+
+	// 3. Validation
+	for _, mode := range []string{"yes", "no", "ask", "accept-new", "YES", "ASK", ""} {
+		c := DefaultClient()
+		c.StrictHostKeyChecking = mode
+		if err := c.Validate(); err != nil {
+			t.Fatalf("expected valid for %q, got error: %v", mode, err)
+		}
+	}
+	for _, invalid := range []string{"maybe", "true", "false", "accept"} {
+		c := DefaultClient()
+		c.StrictHostKeyChecking = invalid
+		if err := c.Validate(); err == nil {
+			t.Fatalf("expected validation error for invalid mode %q", invalid)
+		}
+	}
+
+	// 4. Overrides via TOML and ClientOptions
+	dir := t.TempDir()
+	tomlPath := filepath.Join(dir, "strict.toml")
+	if err := os.WriteFile(tomlPath, []byte("server = \"1.2.3.4:5\"\nstrict_host_key_checking = \"accept-new\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadClient(ClientOptions{ConfigPath: tomlPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.StrictHostKeyChecking != "accept-new" {
+		t.Fatalf("expected TOML value 'accept-new', got %q", loaded.StrictHostKeyChecking)
+	}
+
+	// CLI option overrides TOML
+	loaded2, err := LoadClient(ClientOptions{
+		ConfigPath:            tomlPath,
+		StrictHostKeyChecking: "no",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded2.StrictHostKeyChecking != "no" {
+		t.Fatalf("expected CLI override 'no', got %q", loaded2.StrictHostKeyChecking)
 	}
 }

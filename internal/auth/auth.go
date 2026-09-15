@@ -1,16 +1,14 @@
 package auth
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/json"
-	"fmt"
-	"strings"
 	"time"
+
+	"golang.org/x/crypto/ssh/agent"
 )
 
 const (
-	MethodNone      = "none"
 	MethodPublicKey = "ssh-publickey"
 
 	// DefaultFailDelay is applied to ssh-publickey failures so key-not-found
@@ -43,13 +41,13 @@ type Identity struct {
 }
 
 type Authenticator interface {
-	Name() string // "none" | "ssh-publickey"
+	Name() string // "ssh-publickey"
 	// RequiresChallenge is true when the server must finish AUTH/AUTH_OK
 	// before allocating a session or dialing the destination.
 	RequiresChallenge() bool
 	Verify(challenge Challenge, auth json.RawMessage) (Identity, error)
 	Respond(challenge Challenge) (json.RawMessage, error)
-	// Sign produces the AUTH JSON {sig} over the challenge. none returns {}.
+	// Sign produces the AUTH JSON {sig} over the challenge.
 	Sign(challenge Challenge) (json.RawMessage, error)
 	FailDelay() time.Duration
 }
@@ -61,15 +59,12 @@ type Config struct {
 	AuthorizedKeys string
 	IdentityFiles  []string
 	FailDelay      time.Duration
+	AuthSock       string      // Unix domain socket for ssh-agent (defaults to $SSH_AUTH_SOCK if empty)
+	Agent          agent.Agent // Optional injected agent for testing or custom programmatic use
 }
 
 func New(cfg Config) Authenticator {
-	switch strings.ToLower(strings.TrimSpace(cfg.Method)) {
-	case MethodPublicKey:
-		return NewPublicKey(cfg)
-	default:
-		return None{}
-	}
+	return NewPublicKey(cfg)
 }
 
 // DeriveChallenge is SHA256(sessionId ‖ clientNonce ‖ serverNonce ‖ destination ‖ canonical).
@@ -84,37 +79,4 @@ func DeriveChallenge(ch Challenge) []byte {
 	h.Write([]byte(ch.Destination))
 	h.Write(ch.Canonical)
 	return h.Sum(nil)
-}
-
-// None is the v1 authenticator: empty/{} auth, no identity.
-type None struct{}
-
-func (None) Name() string { return MethodNone }
-
-func (None) RequiresChallenge() bool { return false }
-
-func (None) FailDelay() time.Duration { return 0 }
-
-func (None) Verify(_ Challenge, raw json.RawMessage) (Identity, error) {
-	id := Identity{Method: MethodNone, Name: "anonymous"}
-	trim := bytes.TrimSpace(raw)
-	if len(trim) == 0 || string(trim) == "null" {
-		return id, nil
-	}
-	var m map[string]any
-	if err := json.Unmarshal(trim, &m); err != nil {
-		return Identity{}, fmt.Errorf("auth: %w", err)
-	}
-	if len(m) != 0 {
-		return Identity{}, fmt.Errorf("none authenticator expected empty auth")
-	}
-	return id, nil
-}
-
-func (None) Respond(_ Challenge) (json.RawMessage, error) {
-	return json.RawMessage("{}"), nil
-}
-
-func (None) Sign(_ Challenge) (json.RawMessage, error) {
-	return json.RawMessage("{}"), nil
 }

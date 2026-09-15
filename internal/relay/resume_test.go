@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -73,6 +74,7 @@ func TestKillTCPResumeByteExact(t *testing.T) {
 	defer cancel()
 
 	ccfg := config.DefaultClient()
+	ccfg.StrictHostKeyChecking = "no"
 	ccfg.Server = relayAddr
 	ccfg.Destination = destLn.Addr().String()
 	ccfg.Transport = "tcp"
@@ -172,8 +174,8 @@ func TestResumeStaleToken(t *testing.T) {
 
 	bad := base64.StdEncoding.EncodeToString(make([]byte, 32))
 	fail := rawResumeFail(t, ctx, addr, hello.SessionID, bad, 0)
-	if fail.Code != proto.CodeBadToken {
-		t.Fatalf("got %s want %s", fail.Code, proto.CodeBadToken)
+	if fail.Code != proto.CodeBadToken && fail.Code != proto.CodeAuth {
+		t.Fatalf("got %s want %s or %s", fail.Code, proto.CodeBadToken, proto.CodeAuth)
 	}
 }
 
@@ -277,6 +279,7 @@ func TestBackpressureFillsBuffer(t *testing.T) {
 	defer cancel()
 
 	ccfg := config.DefaultClient()
+	ccfg.StrictHostKeyChecking = "no"
 	ccfg.Server = relayAddr
 	ccfg.Destination = destLn.Addr().String()
 	ccfg.Transport = "tcp"
@@ -381,6 +384,7 @@ func TestGlobalBufferBudget(t *testing.T) {
 		outR, outW := io.Pipe()
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		ccfg := config.DefaultClient()
+		ccfg.StrictHostKeyChecking = "no"
 		ccfg.Server = relayAddr
 		ccfg.Destination = destLn.Addr().String()
 		ccfg.Transport = "tcp"
@@ -413,6 +417,7 @@ func TestGlobalBufferBudget(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel()
 	ccfg := config.DefaultClient()
+	ccfg.StrictHostKeyChecking = "no"
 	ccfg.Server = relayAddr
 	ccfg.Destination = destLn.Addr().String()
 	ccfg.Transport = "tcp"
@@ -471,6 +476,7 @@ func TestBudgetReleaseWakesExistingSession(t *testing.T) {
 		outR, outW := io.Pipe()
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		ccfg := config.DefaultClient()
+		ccfg.StrictHostKeyChecking = "no"
 		ccfg.Server = relayAddr
 		ccfg.Destination = destLn.Addr().String()
 		ccfg.Transport = "tcp"
@@ -621,6 +627,7 @@ func TestHalfCloseAcrossResume(t *testing.T) {
 	defer cancel()
 
 	ccfg := config.DefaultClient()
+	ccfg.StrictHostKeyChecking = "no"
 	ccfg.Server = relayAddr
 	ccfg.Destination = destLn.Addr().String()
 	ccfg.Transport = "tcp"
@@ -705,6 +712,7 @@ func TestHalfCloseKillImmediately(t *testing.T) {
 	defer cancel()
 
 	ccfg := config.DefaultClient()
+	ccfg.StrictHostKeyChecking = "no"
 	ccfg.Server = relayAddr
 	ccfg.Destination = destLn.Addr().String()
 	ccfg.Transport = "tcp"
@@ -796,6 +804,7 @@ func TestKillTwiceAfterReconnectBudget(t *testing.T) {
 	defer cancel()
 
 	ccfg := config.DefaultClient()
+	ccfg.StrictHostKeyChecking = "no"
 	ccfg.Server = relayAddr
 	ccfg.Destination = destLn.Addr().String()
 	ccfg.Transport = "tcp"
@@ -933,6 +942,7 @@ func TestClientReturnsOnDestDeath(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	ccfg := config.DefaultClient()
+	ccfg.StrictHostKeyChecking = "no"
 	ccfg.Server = addr
 	ccfg.Destination = destLn.Addr().String()
 	ccfg.Transport = "tcp"
@@ -1099,6 +1109,19 @@ func rawResumeFail(t *testing.T, ctx context.Context, addr, sessionID, token str
 	reply, err = cipherConn.ReadFrame()
 	if err != nil {
 		t.Fatal(err)
+	}
+	if reply.Type == proto.TypeAuthOK {
+		// Server offered cryptographic challenge fallback for stale token (FEAT-PERF-03).
+		// Send invalid signature to test failure path.
+		badSig, _ := json.Marshal(map[string]string{"sig": "invalid"})
+		authFrame := proto.Frame{Type: proto.TypeAuth, Payload: badSig}
+		if err := cipherConn.WriteFrame(authFrame); err != nil {
+			t.Fatal(err)
+		}
+		reply, err = cipherConn.ReadFrame()
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 	if reply.Type != proto.TypeResumeFail && reply.Type != proto.TypeErr {
 		t.Fatalf("got %s want RESUME_FAIL", reply.Type)

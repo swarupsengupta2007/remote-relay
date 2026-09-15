@@ -117,7 +117,9 @@ func (s *Server) startKCPLocked() {
 	if ep == nil || ep.kcp != nil {
 		return
 	}
-	ln, err := transport.ListenKCP(ep.mux.KCP())
+	kcpCfg := transport.DefaultAdaptiveKCPConfig()
+	kcpCfg.Enabled = s.cfg.AdaptiveKCP
+	ln, err := transport.ListenKCPWithOptions(ep.mux.KCP(), kcpCfg)
 	if err != nil {
 		s.log.Warn("kcp listen failed", "err", err)
 		return
