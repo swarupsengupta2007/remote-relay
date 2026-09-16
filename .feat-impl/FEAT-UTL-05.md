@@ -1,6 +1,6 @@
 # FEAT-UTL-05: Multi-Hop Jumphost Chaining (`-J`)
 
-**Status:** Implemented (Phase 1 + cheap Phase 2). Mid-session inner-hop re-auth (Case C), rebuild-on-resume (Case D), per-hop QUIC/KCP/HA, and nested `splice(2)` are deferred.
+**Status:** Implemented (Phase 1 + Phase 2 Case C/D + J-D4). Nested `splice(2)` is deferred indefinitely (R-D4). Phase 3 (NATed terminal) remains blocked on FEAT-UTL-04.
 **Target packages:** `cmd/relay`, `internal/relay`, `internal/proto`, `internal/auth`, `internal/config`, `internal/crypto/kex`
 **Date:** 2026-09-15
 
@@ -614,19 +614,22 @@ servers, and every policy/attestation negative test fails closed.
 
 ```
 Phase 2
-├─ [ ] 2.1  Recursive handleChain for arbitrary depth ≤ max_chain_depth
-├─ [ ] 2.2  Per-hop transport + ha from the -J query suffix (J-D4)
-├─ [ ] 2.3  Per-hop UDP probe/SWITCH/upgrade at each intermediate
-├─ [ ] 2.4  Case C: mid-session TypeAuthOK in netReader (pump.go:951),
-│            quiesce, chain_auth_timeout, chain_auth_relays_max
-├─ [ ] 2.5  Case D: rebuild-on-resume when the nested session is already dead
-├─ [ ] 2.6  OriginIP accounting + max_chain_conns_per_peer (J-D14, JR4)
-├─ [ ] 2.7  chain_max_sessions, 4-ring budget accounting (JR5)
-├─ [ ] 2.8  Σ hold warning against sshd_alive_budget (JR8)
-├─ [ ] 2.9  obs.go: chainId/hop/upstream fields, 5 new expvars
-├─ [ ] 2.10 Optional: re-enable splice when the nested carrier is TCP (JR7)
-└─ [ ] 2.11 Tests: repeated inner/outer/both kills, per-hop KCP, HA promotion
-             on an inner hop, 64 chained sessions leak check, netns harness
+├─ [x] 2.1  Recursive handleChain for arbitrary depth ≤ max_chain_depth
+├─ [x] 2.2  Per-hop transport + ha from the -J query suffix (J-D4)
+├─ [x] 2.3  Per-hop UDP probe/SWITCH/upgrade at each intermediate (nested
+│            upgrades once around the first serveConn when HelloOK selected
+│            quic/kcp; hop-1 upgrade is the originator's RunClient path)
+├─ [x] 2.4  Case C: mid-session TypeAuthOK in netReader, chainAuthHeld mutex
+│            (not SWITCH quiesce), chain_auth_timeout, chain_auth_relays_max
+├─ [x] 2.5  Case D: hop-1 RESUME waits for nested live; rebuilds if termError
+├─ [x] 2.6  OriginIP accounting + max_chain_conns_per_peer (J-D14, JR4)
+├─ [x] 2.7  chain_max_sessions, 4-ring budget accounting (JR5)
+├─ [x] 2.8  Σ hold warning against sshd_alive_budget (JR8)
+├─ [x] 2.9  chainId/hop/upstream fields, chain_* expvars
+├─ [ ] 2.10 Nested splice — deferred indefinitely (R-D4)
+└─ [x] 2.11 Tests: inner/outer/both kills, hop-1 KCP, SWITCH mutex, leak check,
+             netns JUMP-03/04/05 sketched in scripts/test_jumphost_netns.py
+             (inner-hop HA promotion test not added)
 ```
 
 **Phase 2 exit criteria:** `scripts/test_jumphost_netns.py` passes — 3 netns

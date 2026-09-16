@@ -757,16 +757,16 @@ server stands in for `sshd`)
 | R7 | A resumed SSH session that was held for minutes may still die because `sshd`'s own `ClientAliveInterval` fired while its socket was unread. | Real, and outside our control. `hold_timeout` should be set below the deployment's `sshd` alive-interval budget; document this in `README.md` and surface `heldMs` in logs so operators can tune. |
 | R8 | Offset bookkeeping bugs are silent stream corruption — the worst failure mode for SSH. | I1–I5 as explicit invariants, the positional payload pattern in tests (§13), `-race` on all tests, and `ERR_PROTO` on any gap rather than best-effort recovery. |
 | JR1 | Attestation freshness: without J-D16 a rogue intermediate can pair a genuine `KexReply` with a fabricated `AuthOK` and harvest a signature valid against any peer sharing `authorized_keys`. | **Resolved by D16.** `TestChainAttestationReplay` / `TestNonceBindingKexEqualsAuth` are the regression tests. |
-| JR2 | Inner-hop stale-token fallback needs the outer control channel live. If both hops break at once, the inner hop cannot re-authenticate. | Phase 2 Case D: rebuild the onward chain during the hop-1 resume. Phase 1 tears the chain down. |
+| JR2 | Inner-hop stale-token fallback needs the outer control channel live. If both hops break at once, the inner hop cannot re-authenticate. | Case D: hop-1 `RESUME_OK` waits for the nested leg; rebuilds via `negotiateOnward` if it has terminally failed. |
 | JR3 | I1 weakens at an intermediate: bytes ACKed into the nested ring are lost if the intermediate crashes. | Inherent to D11. Documented in README next to "hold is in-process". |
 | JR4 | `max_conns_per_ip` false positives — all chained traffic arrives from one peer IP. | `OriginIP` accounting plus `max_chain_conns_per_peer` (default 256). OriginIP is trusted for accounting only, never for policy. |
 | JR5 | 4 rings and ~12 goroutines per chained session; `max_sessions` overstates chained capacity ~2×. | `chain_max_sessions` (default `max_sessions/4`); nested rings on the shared `Budget`. |
 | JR6 | +2 RTT per hop at setup. | Acceptable; PERF-03 removes it on resume. `chainSetupMs` is logged per hop. |
-| JR7 | No `splice(2)` on a nested leg. | Phase 1 disables it (`rawSrc`/`rawSink` nil). Phase 2 may re-enable when the nested carrier is TCP. |
+| JR7 | No `splice(2)` on a nested leg. | Disabled indefinitely (R-D4): `io.Pipe`, `rawSrc`/`rawSink` nil. |
 | JR8 | Σ `hold_timeout` across hops exceeds `sshd` `ClientAliveInterval`. | Warn at handshake when the sum exceeds `sshd_alive_budget` (default 2m). |
 | JR9 | Loop / hairpin: `-J` naming this process, or two intermediates pointing at each other. | `Visited` + self-address check + `max_chain_depth`. `TestChainLoopDetected`. |
 | JR10 | `allow_relay_hops = ["*"]` turns a relay into an open chaining amplifier. | Rejected in `Validate()` unless `max_chain_depth == 1`; warned at startup. |
-| JR11 | Mid-session `TypeAuthOK` (Case C) requires quiescing a pump. | Deferred to Phase 2; a stale nested token currently tears the chain down. |
+| JR11 | Mid-session `TypeAuthOK` (Case C) must not interleave with `SWITCH`. | Mutex `chainAuthHeld` on the inbound pump; do not reuse SWITCH quiesce. Relay fails if quiesce is already set. |
 
 Open questions to settle during implementation (not blocking M0/M1):
 1. Should `--keep-tcp` retain the TCP conn as a control plane after upgrade

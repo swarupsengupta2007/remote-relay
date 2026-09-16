@@ -1,7 +1,7 @@
 # Remaining FEAT-UTL-05 — Phase 2 (Case C / Case D / per-hop transport)
 
-**Status:** Agreed remaining-work spec. No code changed by this document.
-**Date:** 2026-09-15
+**Status:** Implemented in-tree (Case C, Case D, J-D4). Nested splice remains deferred (R-D4). Phase 3 remains out of scope (R-D5).
+**Date:** 2026-09-16
 **Source:** interview over the leftover of [`.feat-impl/FEAT-UTL-05.md`](.feat-impl/FEAT-UTL-05.md) / `jumphost_plan.md` §6 Phase 2–3, against the Phase 1 tree.
 **Target packages:** `internal/relay` (`pump.go`, `chain.go`, `chain_nested.go`, `client.go`, `client_chain.go`, `upgrade.go`), `internal/config` (no new knobs required)
 

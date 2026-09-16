@@ -475,18 +475,17 @@ already in the tree; the package did not compile).
 ### 3. Originator + CLI
 - `clientHello` sends `TypeChain` when `-J` is set; `verifyRelayedChallenge` checks destination, attestation, J-D16 nonce binding, and `DeriveChallenge` over `helloJson`.
 - Resume always redials hop 1, not `--server` (the terminal).
-- Phase 1 forces TCP on every hop; per-hop `transport=`/`ha=` is parsed and warned.
+- Per-hop `?transport=` / `?ha=` is honoured on hop 1; nested upgrade runs when the onward HelloOK selected quic/kcp.
 - `-J` / `--jumphost` / `--chain` on `relay client`.
 
 ### 4. Tests
-- `internal/relay/chain_test.go`: e2e both directions, 3 hops, policy denials, attestation replay / host-key mismatch / destination mismatch, version-skew fail-closed, half-close, outer-hop resume, origin-IP accounting, splice disabled, concurrency leak.
+- `internal/relay/chain_test.go`: e2e both directions, 3 hops, policy denials, attestation replay / host-key mismatch / destination mismatch, version-skew fail-closed, half-close, Cases A–D resume, per-hop KCP on hop 1, origin-IP accounting, splice disabled, concurrency leak.
 - Config `ParseJumphost` + Validate rules; kex `VerifyAttestation`; `cmd/relay` `-J` parsing.
 
-### 5. Deferred (as agreed in `jump_todo.md`)
-- Phase 2.4 Case C (mid-session `TypeAuthOK` in `netReader`).
-- Phase 2.5 Case D (rebuild-on-resume of a dead nested session).
-- Per-hop QUIC/KCP/HA and nested `splice(2)`.
-- Phase 3 NATed terminal (`HopSpec.Target`).
+### 5. Deferred
+- Nested `splice(2)` (R-D4, indefinitely).
+- Nested HA standby loop (hop-1 HA works; nested `AllowHA` is plumbed on resume config).
+- Phase 3 NATed terminal (`HopSpec.Target`, FEAT-UTL-04).
 
 ### 6. Docs
 - `.feat-impl/FEAT-UTL-05.md`, `features.md` Tier 2, `design.md` D11–D16 / I6 / JR1–JR11, README jumphost section, `scripts/test_jumphost_netns.py`.
@@ -497,5 +496,15 @@ already in the tree; the package did not compile).
 
 Append a new `## <Agent>` heading below this line. Write what you changed,
 not a restatement of the tree.
+
+## 2026-09-16
+
+Landed remaining FEAT-UTL-05 Phase 2 in `internal/relay`:
+
+- Case C: `writeResumeRoleHook` + `live.relayChainAuth` / originator `onAuthOK`; SWITCH mutex `chainAuthHeld`.
+- Case D: `handleResume` calls `ensureNestedLive`; rebuilds only when nested `termError` is set; hop-1 resume loops `AUTH_OK{hop>1}` / `CHAIN_OK`.
+- J-D4: stop forcing TCP; `chainHopTransport` + hop-1 `pickTransport`; nested `startUpgrade` when the onward hop selected quic/kcp.
+- Nested `close()` drains the send log before cancel so JR3 ACKs are not cut off at teardown.
+- Nested splice still off. Nested HA standby loop not started (AllowHA is on `nestedClientConfig` only). Phase 3 untouched.
 
 

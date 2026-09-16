@@ -7,8 +7,8 @@ Topology:
   ns-cli 10.10.1.2  --veth-cj--  ns-j1 10.10.1.1
   ns-j1  10.10.2.1  --veth-js--  ns-srv 10.10.2.2  (sshd on 127.0.0.1:2222)
 
-Phase 1 covers JUMP-01, JUMP-02, JUMP-06, JUMP-07. JUMP-03/04/05 need
-Phase 2 (inner resume, Case D, per-hop KCP) and are recorded as skipped.
+Covers JUMP-01..07: baseline, outer/inner/simultaneous kill, per-hop KCP,
+wire inspect, depth. Nested splice and Phase 3 (NATed terminal) stay out.
 """
 import os
 import sys
@@ -115,7 +115,8 @@ def setup_env():
 
     (T / "j1.toml").write_text(f"""
 listen_tcp          = "10.10.1.1:{J1_PORT}"
-transports          = ["tcp"]
+udp_listen          = "10.10.1.1:{J1_PORT}"
+transports          = ["tcp", "kcp"]
 default_destination = "127.0.0.1:{SSHD_PORT}"
 allow_destinations  = ["127.0.0.1:{SSHD_PORT}"]
 allow_relay_hops    = ["10.10.2.2:{SRV_PORT}"]
@@ -211,6 +212,85 @@ def jump_02_outer_kill():
     record_result("JUMP-02-OuterKill", ok, f"rc={rc} byte-exact={ok}")
 
 
+def _kill_transfer(name, drop_cmds, undrop_cmds):
+    src = T / f"jump-{name}.bin"
+    dst = T / f"jump-{name}.out"
+    netns("ns-cli", f"dd if=/dev/urandom of={src} bs=1M count=4 status=none")
+    want = hashlib.sha256(src.read_bytes()).hexdigest()
+    if dst.exists():
+        dst.unlink()
+    proc = subprocess.Popen(
+        ["ip", "netns", "exec", "ns-cli", "bash", "-c",
+         f"ssh -F /dev/null -i {T}/id_ed25519 -o IdentitiesOnly=yes "
+         f"-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
+         f"-o ProxyCommand='{proxy_cmd()}' root@dummy 'cat > {dst}' < {src}"],
+    )
+    time.sleep(1.5)
+    for c in drop_cmds:
+        netns(c[0], c[1], check=False)
+    time.sleep(3)
+    for c in undrop_cmds:
+        netns(c[0], c[1], check=False)
+    try:
+        rc = proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        record_result(name, False, "ssh timed out after DROP")
+        return
+    ok = rc == 0 and dst.exists() and hashlib.sha256(dst.read_bytes()).hexdigest() == want
+    record_result(name, ok, f"rc={rc} byte-exact={ok}")
+
+
+def jump_03_inner_kill():
+    print("--- JUMP-03-InnerKill: DROP j1↔S during transfer ---")
+    _kill_transfer(
+        "JUMP-03-InnerKill",
+        [("ns-srv", "iptables -A INPUT -i veth-js-srv -j DROP")],
+        [("ns-srv", "iptables -D INPUT -i veth-js-srv -j DROP")],
+    )
+
+
+def jump_04_simultaneous_kill():
+    print("--- JUMP-04-SimultaneousKill: DROP both hops during transfer ---")
+    _kill_transfer(
+        "JUMP-04-SimultaneousKill",
+        [
+            ("ns-j1", "iptables -A INPUT -i veth-cj-j1 -j DROP"),
+            ("ns-srv", "iptables -A INPUT -i veth-js-srv -j DROP"),
+        ],
+        [
+            ("ns-j1", "iptables -D INPUT -i veth-cj-j1 -j DROP"),
+            ("ns-srv", "iptables -D INPUT -i veth-js-srv -j DROP"),
+        ],
+    )
+
+
+def jump_05_kcp_leg():
+    print("--- JUMP-05-KCPLeg: hop 1 KCP, hop 2 TCP ---")
+    src = T / "jump-kcp.bin"
+    dst = T / "jump-kcp.out"
+    netns("ns-cli", f"dd if=/dev/urandom of={src} bs=1M count=4 status=none")
+    want = hashlib.sha256(src.read_bytes()).hexdigest()
+    if dst.exists():
+        dst.unlink()
+    kh = T / "cli_known_hosts_kcp"
+    cmd = (
+        f"{BIN} client --server 10.10.2.2:{SRV_PORT} "
+        f"-J '10.10.1.1:{J1_PORT}?transport=kcp' "
+        f"--dest 127.0.0.1:{SSHD_PORT} --kcp "
+        f"--strict-host-key-checking accept-new --known-hosts {kh} "
+        f"-i {T}/id_ed25519"
+    )
+    full = (
+        f"ssh -F /dev/null -i {T}/id_ed25519 -o IdentitiesOnly=yes "
+        f"-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
+        f"-o ProxyCommand='{cmd}' root@dummy 'cat > {dst}' < {src}"
+    )
+    ret = netns("ns-cli", full, check=False)
+    ok = ret.returncode == 0 and dst.exists() and hashlib.sha256(dst.read_bytes()).hexdigest() == want
+    record_result("JUMP-05-KCPLeg", ok, f"rc={ret.returncode} byte-exact={ok}")
+
+
 def jump_06_wireinspect():
     print("--- JUMP-06-WireInspect: no resumeToken on j1↔srv ---")
     pcap = T / "jump-wire.pcap"
@@ -259,9 +339,9 @@ def main():
         start_servers()
         jump_01_baseline()
         jump_02_outer_kill()
-        record_skip("JUMP-03-InnerKill", "Phase 2: inner-hop resume without originator involvement")
-        record_skip("JUMP-04-SimultaneousKill", "Phase 2 Case D: rebuild-on-resume")
-        record_skip("JUMP-05-KCPLeg", "Phase 2: per-hop transport")
+        jump_03_inner_kill()
+        jump_04_simultaneous_kill()
+        jump_05_kcp_leg()
         jump_06_wireinspect()
         jump_07_depth()
     finally:

@@ -194,8 +194,10 @@ Host via-jumps
 Each hop is a full independent relay session (its own KEX, resume token, ring,
 BFD). The originator verifies every hop's host key; the private key never
 leaves the client. Intermediates must list permitted next hops in
-`allow_relay_hops` (empty = chaining refused). Phase 1 forces TCP on every hop;
-per-hop `?transport=kcp` / `?ha=1` is parsed but not yet honoured.
+`allow_relay_hops` (empty = chaining refused). Per-hop `?transport=kcp|quic|tcp`
+and `?ha=1` are honoured on the originator’s hop 1 and advertised to later hops.
+Nested `splice(2)` is not used; an intermediate ACKs when bytes are in its nested
+ring, not when the next hop has them.
 
 A hop can be pinned inline to skip `known_hosts`:
 

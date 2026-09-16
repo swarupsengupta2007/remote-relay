@@ -247,7 +247,7 @@ The current architecture assumes the server has a public IP address and the dest
 
 ### [FEAT-UTL-05](.feat-impl/FEAT-UTL-05.md): Multi-Hop Jumphost Chaining (`-J`)
 * **Priority**: `P1` (High)
-* **Status**: Implemented (Phase 1 + cheap Phase 2). Case C/D, per-hop QUIC/KCP/HA, nested splice deferred.
+* **Status**: Implemented (Phase 1 + Case C/D + per-hop transport). Nested splice deferred; Phase 3 NATed terminal blocked on UTL-04.
 * **Target Package**: `cmd/relay`, `internal/relay`, `internal/proto`, `internal/config`, `internal/crypto/kex`
 
 #### 1. Problem Statement
@@ -258,11 +258,12 @@ The relay is strictly two-party: `client → server → destination`. Reaching a
 - **Relayed signature (J-D2)** plus **KEX attestation (J-D3)**: the private key never leaves the originator; every hop's host key is verified by the originator. J-D16 reuses the KEX `serverNonce` as the auth nonce so a rogue intermediate cannot pair a genuine attestation with a fabricated challenge.
 - **Default-deny `allow_relay_hops` (J-D8/J-D9)**, `max_chain_depth` (default 4), loop detection, `OriginIP` accounting, `chain_max_sessions`.
 - **New frames** `TypeChain` (0x0E) / `TypeChainOK` (0x0F) so a v1 peer fails closed (`ERR_PROTO`) instead of silently dialing its own destination (J-D10).
-- Phase 1 forces TCP on every hop. A stale nested resume token tears the chain down (Case C/D are Phase 2).
+- **Case C/D**: a stale inner resume token is relayed to the originator on the hop-1 data plane; hop-1 `RESUME_OK` waits until the nested leg is live (or rebuilds it).
+- **Per-hop transport (J-D4)**: `-J hop?transport=kcp` / `?ha=1` is honoured on hop 1 (originator upgrade/HA) and advertised onward; nested UDP upgrade runs when the next hop selected quic/kcp. Nested `splice(2)` stays off.
 
 #### 3. Verification
-- In-process tests in `internal/relay/chain_test.go` (byte-exact e2e, 3 hops, policy denials, attestation replay, outer-hop resume, splice disabled, origin-IP accounting).
-- Netns harness `scripts/test_jumphost_netns.py` (not in CI; needs root + netns + sshd).
+- In-process tests in `internal/relay/chain_test.go` (byte-exact e2e, 3 hops, policy denials, attestation replay, Cases A–D resume, per-hop KCP on hop 1, splice disabled, origin-IP accounting).
+- Netns harness `scripts/test_jumphost_netns.py` JUMP-01..07 (not in CI; needs root + netns + sshd).
 
 ---
 
