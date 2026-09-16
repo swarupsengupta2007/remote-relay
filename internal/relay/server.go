@@ -50,12 +50,22 @@ type Server struct {
 	shut       atomic.Bool
 	finishOnce sync.Once
 
-	ipMu    sync.Mutex
-	ipConns map[string]int
-	ipSess  map[string]int
+	ipMu       sync.Mutex
+	ipConns    map[string]int
+	ipSess     map[string]int
+	chainPeers map[string]int
 
 	accepts atomic.Int64
 	refused atomic.Int64
+
+	// FEAT-UTL-05 chaining counters (published as expvars in obs.go).
+	// chainActive is the live chained-session gauge that chain_sessions reports.
+	chainActive         atomic.Int64
+	chainHops           atomic.Int64
+	chainAuthRelays     atomic.Int64
+	chainRefused        atomic.Int64
+	chainAttestFailures atomic.Int64
+	chainGone           atomic.Int64
 
 	debugMu    sync.Mutex
 	debug      []*http.Server
@@ -177,6 +187,9 @@ func (s *Server) Serve(ctx context.Context) error {
 	if config.AllowAll(s.cfg.AllowDestinations) {
 		s.log.Warn("allow_destinations includes \"*\": this process is an open TCP proxy")
 	}
+	if config.AllowAll(s.cfg.AllowRelayHops) {
+		s.log.Warn("allow_relay_hops includes \"*\": this process will chain to any next hop (max_chain_depth must be 1)")
+	}
 
 	s.mu.Lock()
 	ln := s.ln
@@ -279,6 +292,10 @@ func (s *Server) handle(raw net.Conn) {
 		writeErr(conn, proto.CodeProto, "kex init failed: "+err.Error())
 		return
 	}
+	// J-D16: the KEX serverNonce doubles as the auth serverNonce. ExchangeHash
+	// (signed by the host key) and DeriveChallenge both cover it, which is what
+	// binds a relayed attestation to the challenge an originator signs.
+	kexNonce := kexSrv.AttestationNonce()
 
 	_ = conn.SetDeadline(time.Now().Add(handshakeTimeout))
 	if err := conn.WriteFrame(proto.Frame{Type: proto.TypeKexReply, Payload: replyPayload}); err != nil {
@@ -315,22 +332,42 @@ func (s *Server) handle(raw net.Conn) {
 	}
 	// Flood cap counts live TCP sockets (2× max_conns_per_ip). HELLO is
 	// refused with ERR_NO_CAPACITY; RESUME of an existing session proceeds.
-	if max := s.cfg.MaxConnsPerIP; max > 0 && n > 2*max && f.Type == proto.TypeHello {
+	if max := s.cfg.MaxConnsPerIP; max > 0 && n > 2*max && (f.Type == proto.TypeHello || f.Type == proto.TypeChain) {
 		s.refused.Add(1)
 		writeErr(cipherConn, proto.CodeNoCapacity, "too many connections from this address")
 		return
 	}
 	switch f.Type {
 	case proto.TypeResume:
-		s.handleResume(ctx, cipherConn, f)
+		s.handleResume(ctx, cipherConn, f, kexNonce)
 	case proto.TypeHello:
-		s.handleHello(ctx, cipherConn, f, ip, releaseTCP)
+		s.handleHello(ctx, cipherConn, f, ip, releaseTCP, kexNonce)
+	case proto.TypeChain:
+		s.handleChain(ctx, cipherConn, f, ip, releaseTCP, kexNonce)
 	default:
 		writeErr(cipherConn, proto.CodeProto, "expected HELLO")
 	}
 }
 
-func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.Frame, ip string, releaseTCP func()) {
+// dialDestination opens the terminal TCP connection a session pumps against.
+// It is the seam a chained leg substitutes: an intermediate presents a nested
+// relay session in place of a real destination socket (FEAT-UTL-05 §2.1).
+func (s *Server) dialDestination(ctx context.Context, dest string) (*net.TCPConn, *proto.Error) {
+	d := net.Dialer{Timeout: s.cfg.DialTimeout.Duration(), KeepAlive: 15 * time.Second}
+	dconn, err := d.DialContext(ctx, "tcp", dest)
+	if err != nil {
+		return nil, proto.NewError(proto.CodeDestRefused, "dial destination failed")
+	}
+	dtcp, ok := dconn.(*net.TCPConn)
+	if !ok {
+		_ = dconn.Close()
+		return nil, proto.NewError(proto.CodeInternal, "destination is not tcp")
+	}
+	_ = dtcp.SetNoDelay(true)
+	return dtcp, nil
+}
+
+func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.Frame, ip string, releaseTCP func(), kexNonce string) {
 	var hello proto.Hello
 	if err := proto.UnmarshalPayload(f, &hello); err != nil {
 		writeErr(conn, proto.CodeProto, "bad HELLO")
@@ -354,7 +391,7 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 		return
 	}
 
-	id, sess, token, serverNonce, ok := s.helloAuth(conn, hello, f.Payload, dest)
+	id, sess, token, serverNonce, ok := s.helloAuth(conn, hello, f.Payload, dest, kexNonce)
 	if !ok {
 		return
 	}
@@ -392,21 +429,12 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 		return
 	}
 
-	d := net.Dialer{Timeout: s.cfg.DialTimeout.Duration(), KeepAlive: 15 * time.Second}
-	dconn, err := d.DialContext(ctx, "tcp", dest)
-	if err != nil {
+	dtcp, derr := s.dialDestination(ctx, dest)
+	if derr != nil {
 		s.store.Remove(sess.ID)
-		writeErr(conn, proto.CodeDestRefused, "dial destination failed")
+		writeErr(conn, derr.Code, derr.Msg)
 		return
 	}
-	dtcp, ok := dconn.(*net.TCPConn)
-	if !ok {
-		_ = dconn.Close()
-		s.store.Remove(sess.ID)
-		writeErr(conn, proto.CodeInternal, "destination is not tcp")
-		return
-	}
-	_ = dtcp.SetNoDelay(true)
 
 	window := s.cfg.SendWindow
 	if hello.Window > 0 && hello.Window < window {
@@ -422,16 +450,6 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 		s.refused.Add(1)
 		writeErr(conn, proto.CodeNoCapacity, "buffer budget exhausted")
 		return
-	}
-	if serverNonce == "" {
-		var err error
-		serverNonce, err = proto.RandomNonce()
-		if err != nil {
-			_ = dtcp.Close()
-			s.store.Remove(sess.ID)
-			writeErr(conn, proto.CodeInternal, "nonce")
-			return
-		}
 	}
 	selected, udp := s.pickTransport(hello.Transport, sess.ID, conn.LocalAddr())
 	okMsg := proto.HelloOK{
@@ -516,7 +534,7 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 	l.run(ctx, rawConn)
 }
 
-func (s *Server) handleResume(ctx context.Context, conn transport.Conn, f proto.Frame) {
+func (s *Server) handleResume(ctx context.Context, conn transport.Conn, f proto.Frame, kexNonce string) {
 	if s.shutting() {
 		writeResumeFail(conn, proto.CodeShutdown, "shutting down")
 		return
@@ -561,7 +579,7 @@ func (s *Server) handleResume(ctx context.Context, conn transport.Conn, f proto.
 
 	if fallback {
 		l.log.Info("resume token invalid or missing; initiating cryptographic fallback", "sessionId", msg.SessionID)
-		if !s.resumeAuth(conn, msg, f.Payload) {
+		if !s.resumeAuth(conn, msg, f.Payload, kexNonce) {
 			return
 		}
 	}
@@ -617,6 +635,8 @@ type live struct {
 	window          int
 	holdTimeout     time.Duration
 	dest            *net.TCPConn
+	nested          *nestedHop
+	releaseChain    func()
 	log             *slog.Logger
 	clientIP        string
 	releaseHelloTCP func()
@@ -1176,6 +1196,13 @@ func (l *live) cleanup(expired bool) {
 	if l.dest != nil {
 		_ = l.dest.Close()
 	}
+	if l.nested != nil {
+		l.nested.close()
+	}
+	if l.releaseChain != nil {
+		l.releaseChain()
+		l.releaseChain = nil
+	}
 	l.shutdown()
 	if expired || l.store.IsExpired(l.id) {
 		l.store.Expire(l.id)
@@ -1239,7 +1266,7 @@ func (s *Server) authFail(conn transport.Conn, started time.Time) {
 	writeErr(conn, proto.CodeAuth, "auth failed")
 }
 
-func (s *Server) helloAuth(conn transport.Conn, hello proto.Hello, canonical []byte, dest string) (auth.Identity, *session.Session, string, string, bool) {
+func (s *Server) helloAuth(conn transport.Conn, hello proto.Hello, canonical []byte, dest, kexNonce string) (auth.Identity, *session.Session, string, string, bool) {
 	if !s.auth.RequiresChallenge() {
 		id, err := s.auth.Verify(auth.Challenge{
 			Destination: dest,
@@ -1254,7 +1281,7 @@ func (s *Server) helloAuth(conn transport.Conn, hello proto.Hello, canonical []b
 			writeErr(conn, proto.CodeInternal, "session allocate")
 			return auth.Identity{}, nil, "", "", false
 		}
-		return id, sess, token, "", true
+		return id, sess, token, kexNonce, true
 	}
 
 	var offer auth.Offer
@@ -1267,7 +1294,7 @@ func (s *Server) helloAuth(conn transport.Conn, hello proto.Hello, canonical []b
 		writeErr(conn, proto.CodeInternal, "session allocate")
 		return auth.Identity{}, nil, "", "", false
 	}
-	serverNonce, err := proto.RandomNonce()
+	serverNonce, err := authServerNonce(kexNonce)
 	if err != nil {
 		writeErr(conn, proto.CodeInternal, "nonce")
 		return auth.Identity{}, nil, "", "", false
@@ -1297,7 +1324,18 @@ func (s *Server) helloAuth(conn transport.Conn, hello proto.Hello, canonical []b
 	return id, sess, token, serverNonce, true
 }
 
-func (s *Server) resumeAuth(conn transport.Conn, msg proto.Resume, canonical []byte) bool {
+// authServerNonce returns the nonce a challenge is built with. J-D16 pins it to
+// the KEX serverNonce so a relayed attestation and the challenge it vouches for
+// share a value the server's host key signed. The random fallback only applies
+// to carriers that never ran a KEX (QUIC/KCP RESUME).
+func authServerNonce(kexNonce string) (string, error) {
+	if kexNonce != "" {
+		return kexNonce, nil
+	}
+	return proto.RandomNonce()
+}
+
+func (s *Server) resumeAuth(conn transport.Conn, msg proto.Resume, canonical []byte, kexNonce string) bool {
 	if !s.auth.RequiresChallenge() {
 		return true
 	}
@@ -1306,7 +1344,7 @@ func (s *Server) resumeAuth(conn transport.Conn, msg proto.Resume, canonical []b
 		s.authFail(conn, time.Time{})
 		return false
 	}
-	serverNonce, err := proto.RandomNonce()
+	serverNonce, err := authServerNonce(kexNonce)
 	if err != nil {
 		s.authFail(conn, time.Time{})
 		return false
@@ -1338,13 +1376,44 @@ func (s *Server) resumeAuth(conn transport.Conn, msg proto.Resume, canonical []b
 }
 
 func (s *Server) issueChallenge(conn transport.Conn, ch auth.Challenge) bool {
-	digest := auth.DeriveChallenge(ch)
-	ok := proto.AuthOK{
+	return s.issueAuthOK(conn, proto.AuthOK{
 		SessionID:   ch.SessionID,
 		ServerNonce: ch.ServerNonce,
-		Challenge:   base64.StdEncoding.EncodeToString(digest),
+		Challenge:   base64.StdEncoding.EncodeToString(auth.DeriveChallenge(ch)),
 		Destination: ch.Destination,
+	})
+}
+
+// challengeAndVerify is issueChallenge + readAuth + Verify, with the chain
+// fields (Hop, HelloJSON, Attest) populated on AUTH_OK. hop 1 of a CHAIN uses
+// this so the originator sees Hop=1 rather than the direct-session default 0.
+func (s *Server) challengeAndVerify(conn transport.Conn, ch auth.Challenge, hop int, helloJSON string, attest *proto.HopAttestation) (auth.Identity, bool) {
+	if !s.issueAuthOK(conn, proto.AuthOK{
+		SessionID:   ch.SessionID,
+		ServerNonce: ch.ServerNonce,
+		Challenge:   base64.StdEncoding.EncodeToString(auth.DeriveChallenge(ch)),
+		Destination: ch.Destination,
+		Hop:         hop,
+		HelloJSON:   helloJSON,
+		Attest:      attest,
+	}) {
+		return auth.Identity{}, false
 	}
+	raw, ok := s.readAuth(conn)
+	if !ok {
+		s.authFail(conn, time.Time{})
+		return auth.Identity{}, false
+	}
+	started := time.Now()
+	id, err := s.auth.Verify(ch, raw)
+	if err != nil {
+		s.authFail(conn, started)
+		return auth.Identity{}, false
+	}
+	return id, true
+}
+
+func (s *Server) issueAuthOK(conn transport.Conn, ok proto.AuthOK) bool {
 	fr, err := proto.MarshalFrame(proto.TypeAuthOK, ok)
 	if err != nil {
 		return false

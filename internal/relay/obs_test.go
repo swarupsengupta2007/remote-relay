@@ -72,7 +72,7 @@ func TestPprofAndExpvarListen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"sessions", "held", "buffer_used", "accepts"} {
+	for _, key := range []string{"sessions", "held", "buffer_used", "accepts", "chain_sessions", "chain_hops_total", "chain_auth_relays", "chain_refused", "chain_attest_failures"} {
 		if !bytes.Contains(raw, []byte(`"`+key+`"`)) {
 			n := len(raw)
 			if n > 400 {

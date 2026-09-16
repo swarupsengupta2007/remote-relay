@@ -48,7 +48,7 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `usage: relay <server|client|version> [flags]
 
   relay server [--config PATH] [--listen HOST:PORT] [--host-key PATH] [--splice|--no-splice] [--adaptive-kcp|--no-adaptive-kcp] [--log-level LVL]
-  relay client --server HOST:PORT [--dest HOST:PORT] [--tcp|--kcp] [--allow-ha] [--splice|--no-splice] [--adaptive-kcp|--no-adaptive-kcp] [--interface NAME[@proto]] [--source-ip IP[@proto]] [--auth-sock PATH] [--server-fingerprint FP] [--known-hosts PATH] [--config PATH] [--log-level LVL] [%%h %%p]
+  relay client --server HOST:PORT [-J|--jumphost|--chain HOST:PORT] [--dest HOST:PORT] [--tcp|--kcp] [--allow-ha] [--splice|--no-splice] [--adaptive-kcp|--no-adaptive-kcp] [--interface NAME[@proto]] [--source-ip IP[@proto]] [--auth-sock PATH] [--server-fingerprint FP] [--known-hosts PATH] [--config PATH] [--log-level LVL] [%%h %%p]
   relay version
 `)
 }
@@ -156,8 +156,12 @@ func runClient(args []string) int {
 	authSock := fs.String("auth-sock", "", "path to ssh-agent Unix socket (overrides $SSH_AUTH_SOCK)")
 	var interfaces stringSliceFlag
 	var sourceIPs stringSliceFlag
+	var jumphost stringSliceFlag
 	fs.Var(&interfaces, "interface", "bind to network interface [NAME[@tcp|@udp]] (repeatable or comma-separated)")
 	fs.Var(&sourceIPs, "source-ip", "bind to source IP address [IP[@tcp|@udp]] (repeatable or comma-separated)")
+	fs.Var(&jumphost, "J", "jumphost chain [user@]host:port[?transport=tcp|kcp|quic][&ha=1][#SHA256:…] (repeatable or comma-separated); --server is the terminal")
+	fs.Var(&jumphost, "jumphost", "alias of -J")
+	fs.Var(&jumphost, "chain", "alias of -J")
 	splice := fs.Bool("splice", false, "enable Linux kernel zero-copy stream splicing (splice(2))")
 	noSplice := fs.Bool("no-splice", false, "disable Linux kernel zero-copy stream splicing")
 	adaptiveKCP := fs.Bool("adaptive-kcp", false, "enable dynamic adaptive ARQ and congestion tuning for KCP")
@@ -189,12 +193,16 @@ func runClient(args []string) int {
 
 	destSet := false
 	allowHASet := false
+	jumphostSet := false
 	fs.Visit(func(f *flag.Flag) {
 		if f.Name == "dest" {
 			destSet = true
 		}
 		if f.Name == "allow-ha" {
 			allowHASet = true
+		}
+		if f.Name == "J" || f.Name == "jumphost" || f.Name == "chain" {
+			jumphostSet = true
 		}
 	})
 
@@ -245,6 +253,8 @@ func runClient(args []string) int {
 		AdaptiveKCP:           adaptiveKCPOpt,
 		Interfaces:            interfaces,
 		SourceIPs:             sourceIPs,
+		Jumphost:              jumphost,
+		JumphostSet:           jumphostSet,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "relay client: %v\n", err)

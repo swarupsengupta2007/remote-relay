@@ -116,6 +116,9 @@ func TestRunClientArgs(t *testing.T) {
 		{"client too many positional args", []string{"client", "--server", "127.0.0.1:7443", "host", "22", "extra"}, 2, "extra arguments"},
 		{"client missing server", []string{"client", "--config", emptyServerConf}, 1, "server is required"},
 		{"client tcp and allow-ha mutual exclusion", []string{"client", "--tcp", "--allow-ha", "--server", "127.0.0.1:7443"}, 2, "--allow-ha cannot be used with --tcp"},
+		{"client jumphost requires server", []string{"client", "-J", "j1.example.com:7443", "--config", emptyServerConf}, 1, "server is required"},
+		{"client jumphost bad hop", []string{"client", "-J", "no-port", "--server", "127.0.0.1:7443"}, 1, "jumphost"},
+		{"client jumphost alias --chain", []string{"client", "--chain", "no-port", "--server", "127.0.0.1:7443"}, 1, "jumphost"},
 	}
 
 	for _, tt := range tests {
@@ -257,6 +260,34 @@ log_level = "info"
 	}
 	if len(cfg.IdentityFiles) != 1 || cfg.IdentityFiles[0] != "/tmp/my_test_key" {
 		t.Fatalf("expected IdentityFiles to contain /tmp/my_test_key, got %+v", cfg.IdentityFiles)
+	}
+
+	// 10. -J / jumphost CLI overlay
+	cfg, err = config.LoadClient(config.ClientOptions{
+		ConfigPath:  confPath,
+		Jumphost:    []string{"cli-hop.example.com:7443"},
+		JumphostSet: true,
+	})
+	if err != nil {
+		t.Fatalf("load config with jumphost: %v", err)
+	}
+	if len(cfg.Jumphost) != 1 || cfg.Jumphost[0] != "cli-hop.example.com:7443" {
+		t.Fatalf("jumphost = %v", cfg.Jumphost)
+	}
+}
+
+func TestClientHelpMentionsJumphost(t *testing.T) {
+	var code int
+	_, stderr := captureOutput(func() {
+		code = run([]string{"client", "-h"})
+	})
+	if code != 0 {
+		t.Fatalf("help exit %d", code)
+	}
+	for _, want := range []string{"-J", "-jumphost", "-chain"} {
+		if !strings.Contains(stderr, want) {
+			t.Fatalf("client -h missing %q in %q", want, stderr)
+		}
 	}
 }
 

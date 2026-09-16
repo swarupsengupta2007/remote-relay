@@ -188,7 +188,9 @@ func (s *Server) handleQUIC(ctx context.Context, qconn *quic.Conn) {
 	}
 	switch f.Type {
 	case proto.TypeResume:
-		s.handleResume(ctx, conn, f)
+		// QUIC/KCP carriers accept RESUME only and run no KEX, so there is no
+		// attestation nonce to bind: the challenge falls back to a random one.
+		s.handleResume(ctx, conn, f, "")
 	default:
 		writeErr(conn, proto.CodeProto, "expected RESUME")
 	}
@@ -223,7 +225,7 @@ func (s *Server) handleKCP(ctx context.Context, conn transport.Conn) {
 	}
 	switch f.Type {
 	case proto.TypeResume:
-		s.handleResume(ctx, conn, f)
+		s.handleResume(ctx, conn, f, "")
 	default:
 		writeErr(conn, proto.CodeProto, "expected RESUME")
 	}

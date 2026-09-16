@@ -33,6 +33,32 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 	if log == nil {
 		log = logging.NewClient(cfg.LogLevel, cfg.LogFormat)
 	}
+	// pathCfg is the config used after HELLO for resume/upgrade. On a chained
+	// path the originator only ever reconnects to hop 1; cfg.Server stays the
+	// terminal so TypeChain can name it.
+	pathCfg := cfg
+	if len(cfg.Jumphost) > 0 {
+		hops, err := config.ParseJumphost(cfg.Jumphost)
+		if err != nil {
+			return err
+		}
+		if len(hops) == 0 {
+			return proto.NewError(proto.CodeProto, "jumphost list is empty")
+		}
+		// Phase 1: every hop is TCP. Per-hop transport= / ha= is parsed so
+		// Phase 2 is additive, but honouring it here would probe UDP on a
+		// nested leg that has no SWITCH path yet.
+		if !cfg.IsTCP() || cfg.AllowHA {
+			log.Warn("jumphost chaining uses tcp for every hop; per-hop transport and --allow-ha are not honoured yet")
+		}
+		cfg.Transport = "tcp"
+		cfg.AllowHA = false
+		pathCfg = cfg
+		pathCfg.Server = hops[0].Addr
+		pathCfg.ServerFingerprint = hops[0].Fp
+		pathCfg.Transport = "tcp"
+		pathCfg.AllowHA = false
+	}
 
 	schedule := parseBackoff(cfg.ReconnectBackoff)
 	maxElapsed := cfg.ReconnectMaxElapsed.Duration()
@@ -66,7 +92,7 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 		_ = conn.Close()
 		return fmt.Errorf("udp route unavailable and --allow-ha not specified: server does not provide udp transport")
 	}
-	if err := checkStrictUDPProbe(ctx, cfg, conn, helloOK.UDP); err != nil {
+	if err := checkStrictUDPProbe(ctx, pathCfg, conn, helloOK.UDP); err != nil {
 		_ = conn.Close()
 		return err
 	}
@@ -149,14 +175,14 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 
 	var standbyMgr *standbyManager
 	if cfg.AllowHA {
-		standbyMgr = newStandbyManager(ctx, cfg, log, sessionID, token, p)
+		standbyMgr = newStandbyManager(ctx, pathCfg, log, sessionID, token, p)
 		defer standbyMgr.stop()
 	}
 
 	var currentBFD *bfd.Session
 
 	for {
-		upgCh, upgCancel := startUpgrade(ctx, p, cfg, current, sessionID, token, target, udp, log)
+		upgCh, upgCancel := startUpgrade(ctx, p, pathCfg, current, sessionID, token, target, udp, log)
 		bfdToUse := currentBFD
 		currentBFD = nil
 		err = p.serveConnWithBFD(p.sessCtx, current, sendFrom, bfdToUse, nil)
@@ -214,7 +240,7 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 		resumed := false
 		for reconnectable(err) && time.Now().Before(deadline) {
 			dialCtx, dialCancel := context.WithDeadline(ctx, deadline)
-			nconn, rok, rerr := clientResume(dialCtx, cfg, sessionID, token, p.delivered.Load())
+			nconn, rok, rerr := clientResume(dialCtx, pathCfg, sessionID, token, p.delivered.Load())
 			dialCancel()
 			if rerr != nil {
 				if !reconnectable(rerr) && !errors.Is(rerr, context.DeadlineExceeded) {
@@ -248,11 +274,11 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 				_ = udpHold.Close()
 				udpHold = nil
 			}
-			if !cfg.AllowHA && !cfg.IsTCP() && (target == "tcp" || udp == nil) {
+			if !pathCfg.AllowHA && !pathCfg.IsTCP() && (target == "tcp" || udp == nil) {
 				_ = nconn.Close()
 				return fmt.Errorf("udp route unavailable and --allow-ha not specified: server does not provide udp transport")
 			}
-			if perr := checkStrictUDPProbe(ctx, cfg, nconn, udp); perr != nil {
+			if perr := checkStrictUDPProbe(ctx, pathCfg, nconn, udp); perr != nil {
 				_ = nconn.Close()
 				if ctx.Err() != nil {
 					return ctx.Err()
@@ -303,6 +329,13 @@ func clientAuth(cfg config.Client) auth.Authenticator {
 
 func clientHello(ctx context.Context, cfg config.Client) (transport.Conn, proto.HelloOK, error) {
 	var none proto.HelloOK
+	hops, err := config.ParseJumphost(cfg.Jumphost)
+	if err != nil {
+		return nil, none, err
+	}
+	if len(hops) > 0 {
+		return clientChainHello(ctx, cfg, hops)
+	}
 	tcpBind := transport.BindConfig{
 		Interface: cfg.TCPInterface,
 		SourceIP:  net.ParseIP(cfg.TCPSourceIP),

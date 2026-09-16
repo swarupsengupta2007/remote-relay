@@ -76,6 +76,36 @@ func publishRelayExpvars() {
 		expvar.Publish("kcp_snd_queue", expvar.Func(func() any {
 			return atomic.LoadUint64(&kcp.DefaultSnmp.RingBufferSndQueue)
 		}))
+		expvar.Publish("chain_sessions", expvar.Func(func() any {
+			if s := activeMetrics.Load(); s != nil {
+				return s.chainActive.Load()
+			}
+			return 0
+		}))
+		expvar.Publish("chain_hops_total", expvar.Func(func() any {
+			if s := activeMetrics.Load(); s != nil {
+				return s.chainHops.Load()
+			}
+			return 0
+		}))
+		expvar.Publish("chain_auth_relays", expvar.Func(func() any {
+			if s := activeMetrics.Load(); s != nil {
+				return s.chainAuthRelays.Load()
+			}
+			return 0
+		}))
+		expvar.Publish("chain_refused", expvar.Func(func() any {
+			if s := activeMetrics.Load(); s != nil {
+				return s.chainRefused.Load()
+			}
+			return 0
+		}))
+		expvar.Publish("chain_attest_failures", expvar.Func(func() any {
+			if s := activeMetrics.Load(); s != nil {
+				return s.chainAttestFailures.Load()
+			}
+			return 0
+		}))
 	})
 }
 

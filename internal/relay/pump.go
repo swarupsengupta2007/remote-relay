@@ -516,7 +516,8 @@ func reconnectable(err error) bool {
 		case proto.CodeProto, proto.CodeFrame, proto.CodeVersion,
 			proto.CodeDestRefused, proto.CodeDestForbidden, proto.CodeNoCapacity,
 			proto.CodeUnknownSession, proto.CodeBadToken, proto.CodeExpired,
-			proto.CodeAuth, proto.CodeShutdown:
+			proto.CodeAuth, proto.CodeShutdown,
+			proto.CodeChainTooLong, proto.CodeChainLoop, proto.CodeHopForbidden:
 			return false
 		}
 	}
