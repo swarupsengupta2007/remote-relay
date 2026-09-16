@@ -22,9 +22,8 @@ import (
 	"github.com/remote-relay/relay/internal/transport"
 )
 
-// errChainGone marks the onward leg of a chained session as terminally lost.
-// Phase 1 has no rebuild path (plan §2.10 Case D is Phase 2.5), so the inbound
-// session is expired with it.
+// errChainGone marks the onward leg of a chained session as terminally lost
+// after nested hold/retry is exhausted. Case D may rebuild before this fires.
 var errChainGone = errors.New("onward relay hop lost")
 
 // handleChain serves a CHAIN frame at an intermediate relay. Every hop is a
@@ -212,6 +211,9 @@ func (s *Server) handleChain(ctx context.Context, conn transport.Conn, f proto.F
 		deadCh:          make(chan struct{}),
 	}
 	l.onPeerFrame = func() { l.store.ConfirmToken(l.id) }
+	nested.inbound = l
+	nested.hopIndex = nextHopIndex
+	p.cfg.onAuth = func(a proto.Auth) error { return l.deliverChainAuth(a) }
 	s.livesMu.Lock()
 	s.lives[sess.ID] = l
 	s.livesMu.Unlock()
@@ -242,11 +244,13 @@ func (s *Server) handleChain(ctx context.Context, conn transport.Conn, f proto.F
 		return
 	}
 
+	selected, udp := s.pickTransport(ch.Transport, sess.ID, conn.LocalAddr())
 	okMsg := proto.HelloOK{
 		V:           1,
 		SessionID:   sess.ID,
 		ResumeToken: token,
-		Transport:   "tcp",
+		Transport:   selected,
+		UDP:         udp,
 		Limits: proto.Limits{
 			BufferBytes:     inBuf,
 			HoldTimeoutMs:   int(s.cfg.HoldTimeout.Duration() / time.Millisecond),
@@ -266,8 +270,178 @@ func (s *Server) handleChain(ctx context.Context, conn transport.Conn, f proto.F
 	sessLog.Info("chained session started",
 		"dest", ch.Destination, "peer", rawConn.RemoteAddr().String(),
 		"upstream", next.Addr, "hop", ownHopIndex, "hops", len(ch.Hops)+1,
-		"originIp", originIP, "transport", "tcp")
+		"originIp", originIP, "transport", selected)
 	l.run(ctx, rawConn)
+}
+
+func (l *live) ensureNestedLive(ctx context.Context, inbound transport.Conn) error {
+	n := l.nested
+	if n == nil {
+		return nil
+	}
+	if n.pump != nil && n.pump.linkUp.Load() {
+		return nil
+	}
+	wait := l.cfg.ChainAuthTimeout.Duration()
+	if wait <= 0 {
+		wait = 10 * time.Second
+	}
+	deadline := time.Now().Add(wait)
+	for time.Now().Before(deadline) {
+		if n.pump != nil && n.pump.linkUp.Load() {
+			return nil
+		}
+		if n.termError() != nil {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	if n.pump != nil && n.pump.linkUp.Load() {
+		return nil
+	}
+	if n.termError() == nil {
+		// Nested is between serveConn attempts (Case B). Rebuilding now
+		// would cancel a live pump; hop-1 resume can proceed.
+		return nil
+	}
+	return l.rebuildNested(ctx, inbound)
+}
+
+func (l *live) rebuildNested(ctx context.Context, inbound transport.Conn) error {
+	n := l.nested
+	if n == nil || l.srv == nil {
+		return proto.ErrExpired
+	}
+	oldGone := n.onGone
+	n.onGone = nil
+	if n.cancel != nil {
+		n.cancel()
+	}
+	n.closeConn()
+	if n.runDone != nil {
+		select {
+		case <-n.runDone:
+		case <-ctx.Done():
+			n.onGone = oldGone
+			return ctx.Err()
+		}
+	}
+
+	ch := n.chainHello
+	next := n.hop
+	var tail []proto.HopSpec
+	if len(ch.Hops) > 1 {
+		tail = ch.Hops[1:]
+	}
+	nn, perr := l.srv.negotiateOnward(ctx, inbound, ch, next, tail, n.selfAddr, n.originIP, n.hopIndex, n.log)
+	if perr != nil {
+		n.onGone = oldGone
+		if oldGone != nil {
+			oldGone(perr)
+		}
+		return perr
+	}
+	conn := nn.takeConn()
+	_ = nn.toOnwardR.Close()
+	_ = nn.toOnwardW.Close()
+	_ = nn.fromOnwardR.Close()
+	_ = nn.fromOnwardW.Close()
+
+	n.mu.Lock()
+	n.termErr = nil
+	n.sessionID = nn.sessionID
+	n.token = nn.token
+	n.limits = nn.limits
+	n.transport = nn.transport
+	n.udp = nn.udp
+	n.holdTimeout = nn.holdTimeout
+	n.resumeCfg = nn.resumeCfg
+	n.conn = conn
+	n.mu.Unlock()
+	n.onGone = oldGone
+	if n.pump == nil || n.parentCtx == nil {
+		n.start(n.parentCtx, n.startBuf, n.startChunk, n.startWin, n.startSw)
+		return nil
+	}
+	n.relaunch()
+	return nil
+}
+
+func (l *live) relayChainAuth(aok proto.AuthOK) (proto.Auth, error) {
+	var none proto.Auth
+	if l.pump == nil {
+		return none, proto.NewError(proto.CodeAuth, "no inbound pump")
+	}
+	if !l.pump.holdChainAuth() {
+		return none, errChainAuthRetry
+	}
+	defer l.pump.releaseChainAuth()
+
+	max := l.cfg.ChainAuthRelaysMax
+	if max > 0 && int(l.chainAuthN.Load()) >= max {
+		return none, proto.NewError(proto.CodeAuth, "too many relayed challenges")
+	}
+	l.chainAuthN.Add(1)
+	if l.srv != nil {
+		l.srv.chainAuthRelays.Add(1)
+	}
+
+	timeout := l.cfg.ChainAuthTimeout.Duration()
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	replyCh := make(chan proto.Auth, 1)
+	l.mu.Lock()
+	l.chainAuthCh = replyCh
+	l.chainAuthHop = aok.Hop
+	l.mu.Unlock()
+	defer func() {
+		l.mu.Lock()
+		l.chainAuthCh = nil
+		l.mu.Unlock()
+	}()
+
+	fr, err := proto.MarshalFrame(proto.TypeAuthOK, aok)
+	if err != nil {
+		return none, err
+	}
+	if err := l.sendCtrl(fr); err != nil {
+		return none, err
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case a := <-replyCh:
+		return a, nil
+	case <-timer.C:
+		return none, errChainAuthTimeout
+	case <-l.sessCtx.Done():
+		return none, l.sessCtx.Err()
+	}
+}
+
+func (l *live) deliverChainAuth(a proto.Auth) error {
+	l.mu.Lock()
+	ch := l.chainAuthCh
+	hop := l.chainAuthHop
+	l.mu.Unlock()
+	if ch == nil {
+		return proto.NewError(proto.CodeProto, "unexpected AUTH")
+	}
+	if a.Hop != 0 && a.Hop != hop {
+		return proto.NewError(proto.CodeProto, "AUTH hop does not match the outstanding challenge")
+	}
+	select {
+	case ch <- a:
+		return nil
+	default:
+		return proto.NewError(proto.CodeProto, "AUTH dropped")
+	}
 }
 
 // chainPolicy applies every refusal that does not need a dial, in the order the
@@ -510,6 +684,10 @@ func (s *Server) negotiateOnward(
 	}
 
 	n := newNestedHop(s, log, next, ch.Destination, ch.ChainID, s.nestedClientConfig(next, ch.Destination))
+	n.chainHello = ch
+	n.selfAddr = selfAddr
+	n.originIP = originIP
+	n.hopIndex = nextHopIndex
 	n.setConn(cipher.Underlying())
 
 	relays := 0
@@ -586,6 +764,7 @@ func (s *Server) negotiateOnward(
 			n.token = ok.ResumeToken
 			n.limits = ok.Limits
 			n.transport = ok.Transport
+			n.udp = ok.UDP
 			n.holdTimeout = time.Duration(ok.Limits.HoldTimeoutMs) * time.Millisecond
 			_ = cipher.SetDeadline(time.Time{})
 			log.Info("onward hop established", "upstream", next.Addr, "hop", nextHopIndex,
@@ -665,45 +844,48 @@ func (s *Server) verifyOnwardHostKey(next proto.HopSpec, pub ed25519.PublicKey, 
 	return kex.VerifyKnownHosts(s.cfg.RelayKnownHosts, next.Addr, pub, next.Fp, s.cfg.RelayStrictHostKeyChecking)
 }
 
-// chainHopTransport picks the onward transport preference. Phase 1 forces TCP
-// on every hop: the QUIC/KCP accept paths take RESUME only, so a per-hop
-// upgrade needs the Phase 2.3 work at each intermediate. The requested value is
-// still parsed and reported so Phase 2 is purely additive.
+// chainHopTransport picks the onward transport preference. An empty hop
+// transport omits the list so the next server picks (same as a bare HELLO).
+// A single name expands through TransportPreferenceList (quic ⇒ quic,kcp).
 func chainHopTransport(next proto.HopSpec, log *slog.Logger) []string {
-	for _, t := range next.Transport {
-		if !strings.EqualFold(t, "tcp") {
-			log.Warn("per-hop transport is not honoured yet; using tcp for this hop",
-				"upstream", next.Addr, "requested", strings.Join(next.Transport, ","))
-			break
-		}
+	if len(next.Transport) == 0 {
+		return nil
 	}
-	if next.AllowHA {
-		log.Warn("per-hop --allow-ha is not honoured yet", "upstream", next.Addr)
+	if len(next.Transport) == 1 {
+		return config.TransportPreferenceList(next.Transport[0])
 	}
-	return []string{"tcp"}
+	return next.Transport
 }
 
 // nestedClientConfig synthesises the client-side configuration for the onward
 // leg, so the existing resume machinery (clientResume → writeResumeRole) can
-// drive it. It carries no identity material: an intermediate cannot answer a
-// fresh challenge on the originator's behalf, which is plan §2.10 Case C and is
-// Phase 2.4. A nested resume therefore only ever takes the token fast path.
+// drive it. It carries no identity material: Case C relays a fresh challenge
+// to the originator instead of signing here.
 func (s *Server) nestedClientConfig(next proto.HopSpec, dest string) config.Client {
 	c := config.DefaultClient()
 	c.Server = next.Addr
 	c.Destination = dest
 	c.Transport = "tcp"
+	if len(next.Transport) > 0 {
+		c.Transport = next.Transport[0]
+	}
 	c.AuthMethod = s.cfg.AuthMethod
 	c.AuthUser = next.User
 	c.KnownHosts = s.cfg.RelayKnownHosts
 	c.ServerFingerprint = next.Fp
 	c.StrictHostKeyChecking = s.cfg.RelayStrictHostKeyChecking
+	// Unattended intermediates cannot TOFU. If this process has neither a pin
+	// nor relay_known_hosts, skip local verification: the originator still
+	// checks every relayed transcript (J-D3), including Case C resume KEX.
+	if next.Fp == "" && strings.TrimSpace(s.cfg.RelayKnownHosts) == "" {
+		c.StrictHostKeyChecking = "no"
+	}
 	c.HeartbeatInterval = s.cfg.HeartbeatInterval
 	c.DeadPeerThreshold = s.cfg.DeadPeerThreshold
 	c.KeepaliveInterval = s.cfg.KeepaliveInterval
 	c.IdleTimeout = s.cfg.IdleTimeout
 	c.ReconnectMaxElapsed = s.cfg.HoldTimeout
-	c.AllowHA = false
+	c.AllowHA = next.AllowHA
 	c.Splice = false
 	c.AdaptiveKCP = s.cfg.AdaptiveKCP
 	c.LogLevel = s.cfg.LogLevel

@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"strings"
 	"time"
 
 	"github.com/remote-relay/relay/internal/auth"
@@ -32,7 +31,7 @@ func clientChainHello(ctx context.Context, cfg config.Client, jumphosts []proto.
 	hops = append(hops, jumphosts...)
 	hops = append(hops, proto.HopSpec{
 		Addr:      cfg.Server,
-		Transport: []string{"tcp"},
+		Transport: cfg.TransportPreference(),
 		Fp:        cfg.ServerFingerprint,
 		User:      cfg.AuthUser,
 	})
@@ -104,23 +103,16 @@ func clientChainHello(ctx context.Context, cfg config.Client, jumphosts []proto.
 		return nil, none, err
 	}
 
-	for _, h := range hops {
-		for _, t := range h.Transport {
-			if t != "" && !strings.EqualFold(t, "tcp") {
-				log.Warn("per-hop transport is not honoured yet; using tcp", "hop", h.Addr, "requested", t)
-			}
-		}
-		if h.AllowHA {
-			log.Warn("per-hop --allow-ha is not honoured yet", "hop", h.Addr)
-		}
+	hop1Pref := cfg.TransportPreference()
+	if len(first.Transport) > 0 {
+		hop1Pref = first.Transport
 	}
-
 	hello := proto.ChainHello{
 		V:           1,
 		ChainID:     chainID,
 		Hops:        hops[1:],
 		Destination: cfg.Destination,
-		Transport:   []string{"tcp"},
+		Transport:   hop1Pref,
 		ClientNonce: nonce,
 		Auth:        authMsg,
 		Window:      cfg.SendWindow,
@@ -197,6 +189,30 @@ func clientChainHello(ctx context.Context, cfg config.Client, jumphosts []proto.
 			return nil, none, proto.NewError(proto.CodeProto, "expected AUTH_OK, CHAIN_OK or HELLO_OK, got "+reply.Type.String())
 		}
 	}
+}
+
+func signRelayedDataPlane(p *pump, cfg config.Client, hops []proto.HopSpec, dest string, a auth.Authenticator, aok proto.AuthOK) error {
+	if aok.Hop == 0 {
+		return proto.NewError(proto.CodeProto, "hop-0 AUTH_OK on data plane")
+	}
+	ch, err := verifyRelayedChallenge(cfg, hops, dest, nil, aok)
+	if err != nil {
+		return err
+	}
+	resp, err := a.Sign(ch)
+	if err != nil {
+		return err
+	}
+	var signed proto.Auth
+	if err := json.Unmarshal(resp, &signed); err != nil {
+		return err
+	}
+	signed.Hop = aok.Hop
+	fr, err := proto.MarshalFrame(proto.TypeAuth, signed)
+	if err != nil {
+		return err
+	}
+	return p.sendCtrl(fr)
 }
 
 func completeChainAuth(conn transport.Conn, a auth.Authenticator, cfg config.Client, hops []proto.HopSpec, dest string, offer json.RawMessage, reply proto.Frame) error {

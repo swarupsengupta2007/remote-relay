@@ -21,11 +21,13 @@ import (
 )
 
 var (
-	ErrDeadPeer      = errors.New("dead-peer detected: bfd timeout")
-	errByeSent       = errors.New("bye sent")
-	errByeReceived   = errors.New("bye received")
-	errIdle          = errors.New("idle timeout")
-	errTransportDown = errors.New("transport down")
+	ErrDeadPeer         = errors.New("dead-peer detected: bfd timeout")
+	errByeSent          = errors.New("bye sent")
+	errByeReceived      = errors.New("bye received")
+	errIdle             = errors.New("idle timeout")
+	errTransportDown    = errors.New("transport down")
+	errChainAuthRetry   = errors.New("chain auth deferred")
+	errChainAuthTimeout = errors.New("chain auth timeout")
 
 	testSuppressAck atomic.Bool
 )
@@ -54,6 +56,25 @@ type pumpConfig struct {
 	deadThreshold int
 	log           *slog.Logger
 	splice        bool
+	// onAuthOK handles a mid-session AUTH_OK on the originator (Case C).
+	onAuthOK func(proto.AuthOK) error
+	// onAuth handles a mid-session AUTH on an intermediate inbound pump (Case C).
+	onAuth func(proto.Auth) error
+	// resumeHook signs a nested-hop AUTH_OK the local process cannot sign.
+	resumeHook resumeChallengeFn
+}
+
+// chainAuthHeld is set on the inbound pump while a Case C relay is in flight
+// so SWITCH cannot interleave (JR11).
+func (p *pump) holdChainAuth() bool {
+	if p.quiesce.Load() {
+		return false
+	}
+	return p.chainAuthHeld.CompareAndSwap(false, true)
+}
+
+func (p *pump) releaseChainAuth() {
+	p.chainAuthHeld.Store(false)
 }
 
 type dataFrag struct {
@@ -131,6 +152,7 @@ type pump struct {
 
 	quiesce       atomic.Bool
 	quiesceSeen   atomic.Bool
+	chainAuthHeld atomic.Bool
 	sentOff       atomic.Uint64
 	upgrading     atomic.Bool
 	switchUp      atomic.Uint64
@@ -497,6 +519,9 @@ func reconnectable(err error) bool {
 	if errors.Is(err, errByeSent) || errors.Is(err, errByeReceived) {
 		return false
 	}
+	if errors.Is(err, errChainAuthRetry) || errors.Is(err, errChainAuthTimeout) {
+		return true
+	}
 	if errors.Is(err, kex.ErrHostKey) || strings.Contains(err.Error(), "kex:") || strings.Contains(err.Error(), "host key") {
 		return false
 	}
@@ -710,6 +735,10 @@ func (p *pump) waitQuiesced(ctx context.Context, d time.Duration) (up, down uint
 // SWITCH.offset is the takeover point (D9). The new path emits from RESUME
 // offsets (I2); bytes already on the old path are dropped by dedupe (I3).
 func (p *pump) handleSwitch(sw proto.Switch) error {
+	if p.chainAuthHeld.Load() {
+		_ = p.sendErr(proto.CodeProto, "chain auth in flight")
+		return proto.ErrProto
+	}
 	switch sw.Dir {
 	case proto.DirBoth, p.io.inDir, p.io.outDir:
 	default:
@@ -1126,6 +1155,36 @@ func (p *pump) netReader() error {
 				return uerr
 			}
 			if err := p.handleSwitch(sw); err != nil {
+				return err
+			}
+		case proto.TypeAuthOK:
+			var aok proto.AuthOK
+			if uerr := proto.UnmarshalPayload(f, &aok); uerr != nil {
+				_ = p.sendErr(proto.CodeProto, "bad AUTH_OK")
+				return uerr
+			}
+			if p.cfg.onAuthOK == nil {
+				_ = p.sendErr(proto.CodeProto, "unexpected AUTH_OK")
+				return proto.ErrProto
+			}
+			if p.quiesce.Load() {
+				_ = p.sendErr(proto.CodeProto, "AUTH_OK during switch")
+				return proto.ErrProto
+			}
+			if err := p.cfg.onAuthOK(aok); err != nil {
+				return err
+			}
+		case proto.TypeAuth:
+			var a proto.Auth
+			if uerr := proto.UnmarshalPayload(f, &a); uerr != nil {
+				_ = p.sendErr(proto.CodeProto, "bad AUTH")
+				return uerr
+			}
+			if p.cfg.onAuth == nil {
+				_ = p.sendErr(proto.CodeProto, "unexpected AUTH")
+				return proto.ErrProto
+			}
+			if err := p.cfg.onAuth(a); err != nil {
 				return err
 			}
 		case proto.TypeBye:

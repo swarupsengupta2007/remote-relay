@@ -45,19 +45,15 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 		if len(hops) == 0 {
 			return proto.NewError(proto.CodeProto, "jumphost list is empty")
 		}
-		// Phase 1: every hop is TCP. Per-hop transport= / ha= is parsed so
-		// Phase 2 is additive, but honouring it here would probe UDP on a
-		// nested leg that has no SWITCH path yet.
-		if !cfg.IsTCP() || cfg.AllowHA {
-			log.Warn("jumphost chaining uses tcp for every hop; per-hop transport and --allow-ha are not honoured yet")
-		}
-		cfg.Transport = "tcp"
-		cfg.AllowHA = false
 		pathCfg = cfg
-		pathCfg.Server = hops[0].Addr
-		pathCfg.ServerFingerprint = hops[0].Fp
-		pathCfg.Transport = "tcp"
-		pathCfg.AllowHA = false
+		if len(hops[0].Transport) > 0 {
+			pathCfg.Transport = hops[0].Transport[0]
+		}
+		if hops[0].AllowHA {
+			pathCfg.AllowHA = true
+		}
+		// Server stays the terminal so Case D can name hops 2…N. Hop-1 dials
+		// use resumeDialAddr.
 	}
 
 	schedule := parseBackoff(cfg.ReconnectBackoff)
@@ -145,6 +141,21 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 		log:           log,
 		splice:        cfg.Splice,
 	}, sendLog)
+	if len(cfg.Jumphost) > 0 {
+		chainHops, herr := config.ParseJumphost(cfg.Jumphost)
+		if herr == nil && len(chainHops) > 0 {
+			chainHops = append(chainHops, proto.HopSpec{
+				Addr: cfg.Server, Fp: cfg.ServerFingerprint, User: cfg.AuthUser,
+			})
+			signer := clientAuth(cfg)
+			if c, ok := signer.(io.Closer); ok {
+				defer c.Close()
+			}
+			p.cfg.onAuthOK = func(aok proto.AuthOK) error {
+				return signRelayedDataPlane(p, cfg, chainHops, cfg.Destination, signer, aok)
+			}
+		}
+	}
 	p.startIO()
 	defer p.shutdown()
 
@@ -509,16 +520,32 @@ func clientResume(ctx context.Context, cfg config.Client, sessionID, token strin
 }
 
 func clientResumeRole(ctx context.Context, cfg config.Client, sessionID, token string, downAcked uint64, role string) (transport.Conn, proto.ResumeOK, error) {
+	return clientResumeHook(ctx, cfg, sessionID, token, downAcked, role, nil)
+}
+
+func resumeDialAddr(cfg config.Client) (addr, fp string) {
+	addr, fp = cfg.Server, cfg.ServerFingerprint
+	if hops, err := config.ParseJumphost(cfg.Jumphost); err == nil && len(hops) > 0 {
+		addr = hops[0].Addr
+		if hops[0].Fp != "" {
+			fp = hops[0].Fp
+		}
+	}
+	return addr, fp
+}
+
+func clientResumeHook(ctx context.Context, cfg config.Client, sessionID, token string, downAcked uint64, role string, onChallenge resumeChallengeFn) (transport.Conn, proto.ResumeOK, error) {
 	var none proto.ResumeOK
 	tcpBind := transport.BindConfig{
 		Interface: cfg.TCPInterface,
 		SourceIP:  net.ParseIP(cfg.TCPSourceIP),
 	}
-	conn, err := transport.DialTCPWithDelayAndBind(ctx, cfg.Server, cfg.HappyEyeballsDelay.Duration(), tcpBind)
+	addr, _ := resumeDialAddr(cfg)
+	conn, err := transport.DialTCPWithDelayAndBind(ctx, addr, cfg.HappyEyeballsDelay.Duration(), tcpBind)
 	if err != nil {
 		return nil, none, err
 	}
-	ok, err := writeResumeRole(ctx, conn, cfg, sessionID, token, downAcked, role)
+	ok, err := writeResumeRoleHook(ctx, conn, cfg, sessionID, token, downAcked, role, onChallenge)
 	if err != nil {
 		_ = conn.Close()
 		return nil, none, err

@@ -2,6 +2,7 @@ package relay
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"io"
 	"log/slog"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/remote-relay/relay/internal/config"
+	"github.com/remote-relay/relay/internal/crypto/kex"
 	"github.com/remote-relay/relay/internal/proto"
 	"github.com/remote-relay/relay/internal/session"
 	"github.com/remote-relay/relay/internal/transport"
@@ -43,6 +45,7 @@ type nestedHop struct {
 	sessionID   string
 	token       string
 	transport   string
+	udp         *proto.UdpInfo
 	limits      proto.Limits
 	holdTimeout time.Duration
 
@@ -54,6 +57,19 @@ type nestedHop struct {
 	once     sync.Once
 	pumpOnce sync.Once
 	onGone   func(error)
+
+	inbound  *live
+	hopIndex int
+
+	chainHello proto.ChainHello
+	selfAddr   string
+	originIP   string
+	startBuf   int
+	startChunk int
+	startWin   int
+	startSw    time.Duration
+	parentCtx  context.Context
+	runDone    chan struct{}
 }
 
 func newNestedHop(srv *Server, log *slog.Logger, hop proto.HopSpec, dest, chainID string, resumeCfg config.Client) *nestedHop {
@@ -115,15 +131,19 @@ func (n *nestedHop) termError() error {
 // recursion between the two pumps' closeSrc hooks terminate.
 func (n *nestedHop) close() {
 	n.once.Do(func() {
+		// EOF the originator→terminal pipe first so the nested netWriter can
+		// flush bytes already ACKed on hop-1 (JR3) before we cancel the runner.
+		err := n.termError()
+		_ = n.toOnwardW.CloseWithError(err)
+		if n.pump != nil && n.pump.linkUp.Load() && n.pump.sendLog != nil {
+			deadline := time.Now().Add(5 * time.Second)
+			for n.pump.sendLog.Len() > 0 && n.pump.linkUp.Load() && time.Now().Before(deadline) {
+				time.Sleep(2 * time.Millisecond)
+			}
+		}
 		if n.cancel != nil {
 			n.cancel()
 		}
-		// A clean finish closes with io.EOF semantics so the inbound pump's
-		// srcReader reports a real end-of-stream; an abnormal one propagates
-		// errChainGone so the inbound session fails instead of emitting a
-		// CLOSE_DIR that never happened.
-		err := n.termError()
-		_ = n.toOnwardW.CloseWithError(err)
 		_ = n.fromOnwardW.CloseWithError(err)
 		_ = n.toOnwardR.Close()
 		_ = n.fromOnwardR.Close()
@@ -140,6 +160,8 @@ func (n *nestedHop) close() {
 // that keeps the terminal's sshd socket alive across a carrier break on this
 // leg alone (plan §2.10 Case B).
 func (n *nestedHop) start(parent context.Context, bufCap, chunk, window int, switchTimeout time.Duration) {
+	n.parentCtx = parent
+	n.startBuf, n.startChunk, n.startWin, n.startSw = bufCap, chunk, window, switchTimeout
 	ctx, cancel := context.WithCancel(parent)
 	n.cancel = cancel
 
@@ -163,14 +185,31 @@ func (n *nestedHop) start(parent context.Context, bufCap, chunk, window int, swi
 		deadThreshold: n.srv.cfg.DeadPeerThreshold,
 		log:           n.log,
 		splice:        false,
+		resumeHook:    n.relayResumeChallenge,
 	}, sendLog)
 
-	go n.run(ctx, n.takeConn())
+	n.launch(ctx)
 }
 
-// run drives the onward carrier. The retry budget is clamped to the hold
-// timeout the next hop advertised, so this leg gives up at the same moment the
-// peer stops holding the session (mirrors client.go:139-144).
+// relaunch restarts the onward runner on the existing pump and pipes. Used by
+// Case D rebuild so the inbound bridge is not torn down.
+func (n *nestedHop) relaunch() {
+	ctx, cancel := context.WithCancel(n.parentCtx)
+	n.cancel = cancel
+	n.launch(ctx)
+}
+
+func (n *nestedHop) launch(ctx context.Context) {
+	n.runDone = make(chan struct{})
+	go func() {
+		defer close(n.runDone)
+		n.run(ctx, n.takeConn())
+	}()
+}
+
+// run drives the onward carrier. UDP upgrade runs once around the first
+// serveConn when the hop advertised quic/kcp; the retry budget is clamped to
+// hold_timeout. Nested splice stays off (R-D4).
 func (n *nestedHop) run(ctx context.Context, first transport.Conn) {
 	n.pump.startIO()
 	schedule := parseBackoff(n.resumeCfg.ReconnectBackoff)
@@ -181,7 +220,42 @@ func (n *nestedHop) run(ctx context.Context, first transport.Conn) {
 
 	conn := first
 	sendFrom := uint64(0)
-	err := n.pump.serveConn(ctx, conn, sendFrom)
+	token := n.token
+	target := n.transport
+	udp := n.udp
+	var udpHold io.Closer
+	defer func() {
+		if udpHold != nil {
+			_ = udpHold.Close()
+		}
+	}()
+
+	var err error
+	if (target == "quic" || target == "kcp") && udp != nil {
+		upgCh, upgCancel := startUpgrade(ctx, n.pump, n.resumeCfg, conn, n.sessionID, token, target, udp, n.log)
+		err = n.pump.serveConn(ctx, conn, sendFrom)
+		upg := takeUpgrade(upgCh, upgCancel, n.pump)
+		if upg.conn != nil {
+			udpHold = upg.hold
+			conn = upg.conn
+			n.setConn(conn)
+			sendFrom = upg.rok.UpAcked
+			token = upg.rok.ResumeToken
+			n.token = token
+			if upg.rok.UDP != nil {
+				udp = upg.rok.UDP
+			}
+			if upg.rok.Transport != "" {
+				target = upg.rok.Transport
+			}
+			n.pump.sendLog.AdvanceTo(sendFrom)
+			err = n.pump.serveConn(ctx, conn, sendFrom)
+		} else if upg.hold != nil {
+			_ = upg.hold.Close()
+		}
+	} else {
+		err = n.pump.serveConn(ctx, conn, sendFrom)
+	}
 
 	for reconnectable(err) && ctx.Err() == nil && n.pump.sessionErr() == nil {
 		deadline := time.Now().Add(maxElapsed)
@@ -189,7 +263,7 @@ func (n *nestedHop) run(ctx context.Context, first transport.Conn) {
 		resumed := false
 		for reconnectable(err) && time.Now().Before(deadline) && ctx.Err() == nil {
 			dialCtx, cancel := context.WithDeadline(ctx, deadline)
-			nconn, rok, rerr := clientResume(dialCtx, n.resumeCfg, n.sessionID, n.token, n.pump.delivered.Load())
+			nconn, rok, rerr := clientResumeHook(dialCtx, n.resumeCfg, n.sessionID, token, n.pump.delivered.Load(), "", n.relayResumeChallenge)
 			cancel()
 			if rerr != nil {
 				if !reconnectable(rerr) && !errors.Is(rerr, context.DeadlineExceeded) {
@@ -203,7 +277,14 @@ func (n *nestedHop) run(ctx context.Context, first transport.Conn) {
 				attempt++
 				continue
 			}
-			n.token = rok.ResumeToken
+			token = rok.ResumeToken
+			n.token = token
+			if rok.UDP != nil {
+				udp = rok.UDP
+			}
+			if rok.Transport != "" {
+				target = rok.Transport
+			}
 			if rok.Limits.SwitchTimeoutMs > 0 {
 				n.pump.cfg.switchTimeout = time.Duration(rok.Limits.SwitchTimeoutMs) * time.Millisecond
 			}
@@ -229,10 +310,28 @@ func (n *nestedHop) run(ctx context.Context, first transport.Conn) {
 	if se := n.pump.sessionErr(); se != nil {
 		err = se
 	}
-	// classify() maps a clean BYE and a cancelled parent context to nil, so a
-	// session that ended normally does not take the inbound leg down with it.
 	n.setTermError(n.pump.classify(err))
 	if n.onGone != nil {
 		n.onGone(n.termError())
 	}
+}
+
+func (n *nestedHop) relayResumeChallenge(aok proto.AuthOK, canonical, kexInit, kexReply []byte) (proto.Auth, error) {
+	if n.inbound == nil {
+		return proto.Auth{}, proto.NewError(proto.CodeAuth, "no inbound session for chain auth")
+	}
+	aok.Hop = n.hopIndex
+	aok.HelloJSON = string(canonical)
+	attest := &proto.HopAttestation{
+		Addr:     n.hop.Addr,
+		KexInit:  base64.StdEncoding.EncodeToString(kexInit),
+		KexReply: base64.StdEncoding.EncodeToString(kexReply),
+	}
+	if len(kexReply) == kex.KexReplyLen {
+		if line, err := kex.RawEd25519ToAuthorizedKeysLine(kexReply[48:80]); err == nil {
+			attest.HostKeySSH = line
+		}
+	}
+	aok.Attest = attest
+	return n.inbound.relayChainAuth(aok)
 }

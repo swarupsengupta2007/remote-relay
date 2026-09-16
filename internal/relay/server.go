@@ -584,6 +584,18 @@ func (s *Server) handleResume(ctx context.Context, conn transport.Conn, f proto.
 		}
 	}
 
+	if l.nested != nil {
+		if err := l.ensureNestedLive(ctx, conn); err != nil {
+			code, m := proto.CodeExpired, "onward hop lost"
+			var pe *proto.Error
+			if errors.As(err, &pe) {
+				code, m = pe.Code, pe.Msg
+			}
+			writeResumeFail(conn, code, m)
+			return
+		}
+	}
+
 	isStandby := msg.Role == "standby"
 	req := attachReq{conn: conn, resume: &msg, standby: isStandby, fallback: fallback, done: make(chan error, 1)}
 	if isStandby {
@@ -652,11 +664,14 @@ type live struct {
 	standbyDone         chan error
 	standbyPrefetched   []proto.Frame
 
-	mu       sync.Mutex
-	heldAt   time.Time
-	dead     bool
-	cleaned  bool
-	pathHist []pathInfo
+	mu           sync.Mutex
+	heldAt       time.Time
+	dead         bool
+	cleaned      bool
+	pathHist     []pathInfo
+	chainAuthCh  chan proto.Auth
+	chainAuthHop int
+	chainAuthN   atomic.Int64
 }
 
 func (l *live) notePath(c transport.Conn) {

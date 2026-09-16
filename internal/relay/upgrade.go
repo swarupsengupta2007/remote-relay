@@ -249,7 +249,7 @@ func tryUpgrade(ctx context.Context, p *pump, cfg config.Client, tcpConn transpo
 			res.err = err
 			return res
 		}
-		rok, err := writeResumeOn(ctx, uconn, cfg, sessionID, token, p.delivered.Load())
+		rok, err := writeResumeRoleHook(ctx, uconn, cfg, sessionID, token, p.delivered.Load(), "", p.cfg.resumeHook)
 		if err != nil {
 			p.upgrading.Store(false)
 			_ = uconn.Close()
@@ -287,9 +287,19 @@ func writeResumeOn(ctx context.Context, conn transport.Conn, cfg config.Client, 
 	return writeResumeRole(ctx, conn, cfg, sessionID, token, downAcked, "")
 }
 
+// resumeChallengeFn signs a nested-hop AUTH_OK the local process cannot sign
+// (Case C). canonical is the RESUME JSON; kexInit/kexReply are the resume KEX
+// transcript to attest.
+type resumeChallengeFn func(aok proto.AuthOK, canonical, kexInit, kexReply []byte) (proto.Auth, error)
+
 func writeResumeRole(ctx context.Context, conn transport.Conn, cfg config.Client, sessionID, token string, downAcked uint64, role string) (proto.ResumeOK, error) {
+	return writeResumeRoleHook(ctx, conn, cfg, sessionID, token, downAcked, role, nil)
+}
+
+func writeResumeRoleHook(ctx context.Context, conn transport.Conn, cfg config.Client, sessionID, token string, downAcked uint64, role string, onChallenge resumeChallengeFn) (proto.ResumeOK, error) {
 	var none proto.ResumeOK
 	controlConn := conn
+	var kexInit, kexReply []byte
 	if conn.Kind() == transport.KindTCP {
 		kexCli, err := kex.NewClientSession()
 		if err != nil {
@@ -298,7 +308,8 @@ func writeResumeRole(ctx context.Context, conn transport.Conn, cfg config.Client
 		if err := conn.SetDeadline(deadlineOr(ctx, handshakeTimeout)); err != nil {
 			return none, err
 		}
-		if err := conn.WriteFrame(proto.Frame{Type: proto.TypeKexInit, Payload: kexCli.InitPayload()}); err != nil {
+		kexInit = kexCli.InitPayload()
+		if err := conn.WriteFrame(proto.Frame{Type: proto.TypeKexInit, Payload: kexInit}); err != nil {
 			return none, fmt.Errorf("send KEX_INIT: %w", err)
 		}
 		reply, err := conn.ReadFrame()
@@ -309,8 +320,10 @@ func writeResumeRole(ctx context.Context, conn transport.Conn, cfg config.Client
 		if reply.Type != proto.TypeKexReply {
 			return none, proto.NewError(proto.CodeProto, "expected KEX_REPLY, got "+reply.Type.String())
 		}
+		kexReply = append([]byte(nil), reply.Payload...)
 		verifyHostKey := func(pub ed25519.PublicKey) error {
-			return kex.VerifyKnownHosts(cfg.KnownHosts, cfg.Server, pub, cfg.ServerFingerprint, cfg.StrictHostKeyChecking)
+			addr, fp := resumeDialAddr(cfg)
+			return kex.VerifyKnownHosts(cfg.KnownHosts, addr, pub, fp, cfg.StrictHostKeyChecking)
 		}
 		c2sKey, s2cKey, err := kexCli.ProcessReply(reply.Payload, verifyHostKey)
 		if err != nil {
@@ -363,29 +376,70 @@ func writeResumeRole(ctx context.Context, conn transport.Conn, cfg config.Client
 		_ = controlConn.SetDeadline(time.Time{})
 		return none, err
 	}
-	reply, err := controlConn.ReadFrame()
-	if err != nil {
-		_ = controlConn.SetDeadline(time.Time{})
-		return none, err
+
+	var hops []proto.HopSpec
+	if len(cfg.Jumphost) > 0 {
+		hops, _ = config.ParseJumphost(cfg.Jumphost)
+		hops = append(hops, proto.HopSpec{Addr: cfg.Server, Fp: cfg.ServerFingerprint, User: cfg.AuthUser})
 	}
-	if reply.Type == proto.TypeAuthOK {
-		ch := auth.Challenge{
-			SessionID:   sessionID,
-			Destination: cfg.Destination,
-			ClientNonce: nonce,
-			Canonical:   fr.Payload,
-			Offer:       msg.Auth,
-		}
-		if err := completeClientAuth(controlConn, a, ch, reply); err != nil {
+
+	var reply proto.Frame
+	for {
+		var rerr error
+		reply, rerr = controlConn.ReadFrame()
+		if rerr != nil {
 			_ = controlConn.SetDeadline(time.Time{})
-			return none, err
+			return none, rerr
 		}
-		reply, err = controlConn.ReadFrame()
-		if err != nil {
-			_ = controlConn.SetDeadline(time.Time{})
-			return none, err
+		switch reply.Type {
+		case proto.TypeAuthOK:
+			var aok proto.AuthOK
+			if uerr := proto.UnmarshalPayload(reply, &aok); uerr != nil {
+				_ = controlConn.SetDeadline(time.Time{})
+				return none, uerr
+			}
+			if onChallenge != nil && aok.Hop == 0 {
+				signed, herr := onChallenge(aok, fr.Payload, kexInit, kexReply)
+				if herr != nil {
+					_ = controlConn.SetDeadline(time.Time{})
+					return none, herr
+				}
+				out, merr := proto.MarshalFrame(proto.TypeAuth, proto.Auth{Sig: signed.Sig})
+				if merr != nil {
+					_ = controlConn.SetDeadline(time.Time{})
+					return none, merr
+				}
+				if werr := controlConn.WriteFrame(out); werr != nil {
+					_ = controlConn.SetDeadline(time.Time{})
+					return none, werr
+				}
+				continue
+			}
+			if aok.Hop > 0 && len(hops) > 0 {
+				if err := completeChainAuth(controlConn, a, cfg, hops, cfg.Destination, msg.Auth, reply); err != nil {
+					_ = controlConn.SetDeadline(time.Time{})
+					return none, err
+				}
+				continue
+			}
+			ch := auth.Challenge{
+				SessionID:   sessionID,
+				Destination: cfg.Destination,
+				ClientNonce: nonce,
+				Canonical:   fr.Payload,
+				Offer:       msg.Auth,
+			}
+			if err := completeClientAuth(controlConn, a, ch, reply); err != nil {
+				_ = controlConn.SetDeadline(time.Time{})
+				return none, err
+			}
+		case proto.TypeChainOK:
+			continue
+		default:
+			goto resumeDone
 		}
 	}
+resumeDone:
 	_ = controlConn.SetDeadline(time.Time{})
 	switch reply.Type {
 	case proto.TypeResumeFail, proto.TypeErr:

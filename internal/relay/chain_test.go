@@ -750,6 +750,281 @@ func TestChainHalfClosePropagation(t *testing.T) {
 	}
 }
 
+func invalidateResumeTokens(s *Server) {
+	s.livesMu.Lock()
+	ids := make([]string, 0, len(s.lives))
+	for id := range s.lives {
+		ids = append(ids, id)
+	}
+	s.livesMu.Unlock()
+	for _, id := range ids {
+		_, _ = s.store.ForceResumeToken(id)
+		s.store.ConfirmToken(id)
+		_, _ = s.store.ForceResumeToken(id)
+		s.store.ConfirmToken(id)
+	}
+}
+
+func TestChainResumeInnerHopOnly(t *testing.T) {
+	const n = 256 << 10
+	upWant := makePattern(n)
+	gotUpCh := make(chan []byte, 1)
+	destLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer destLn.Close()
+	go func() {
+		c, err := destLn.Accept()
+		if err != nil {
+			gotUpCh <- nil
+			return
+		}
+		defer c.Close()
+		b, _ := io.ReadAll(c)
+		gotUpCh <- b
+	}()
+
+	dest := destLn.Addr().String()
+	head, srvs := startChain(t, 2, dest)
+	ccfg := chainClientCfg(srvs[1].Addr(), dest, []string{head})
+
+	inR, inW := io.Pipe()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	errc := make(chan error, 1)
+	go func() {
+		errc <- RunClient(ctx, ccfg, inR, io.Discard, logging.New(io.Discard, "error", "text"))
+	}()
+
+	if _, err := inW.Write(upWant[:len(upWant)/2]); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, 5*time.Second, func() bool { return srvs[0].sessionCount() == 1 && srvs[1].sessionCount() == 1 })
+	relays0 := srvs[0].chainAuthRelays.Load()
+	srvs[1].dropLiveTransports()
+	if _, err := inW.Write(upWant[len(upWant)/2:]); err != nil {
+		t.Fatal(err)
+	}
+	_ = inW.Close()
+
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatalf("client: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("timeout")
+	}
+	gotUp := <-gotUpCh
+	if !bytes.Equal(gotUp, upWant) {
+		t.Fatalf("inner-kill mismatch got=%d want=%d", len(gotUp), len(upWant))
+	}
+	if srvs[0].chainAuthRelays.Load() != relays0 {
+		t.Fatalf("Case B must not relay signatures, relays=%d", srvs[0].chainAuthRelays.Load()-relays0)
+	}
+}
+
+func TestChainStaleTokenInnerRelaysSignature(t *testing.T) {
+	const n = 256 << 10
+	upWant := makePattern(n)
+	gotUpCh := make(chan []byte, 1)
+	destLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer destLn.Close()
+	go func() {
+		c, err := destLn.Accept()
+		if err != nil {
+			gotUpCh <- nil
+			return
+		}
+		defer c.Close()
+		b, _ := io.ReadAll(c)
+		gotUpCh <- b
+	}()
+
+	dest := destLn.Addr().String()
+	head, srvs := startChain(t, 2, dest)
+	ccfg := chainClientCfg(srvs[1].Addr(), dest, []string{head})
+
+	inR, inW := io.Pipe()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	errc := make(chan error, 1)
+	go func() {
+		errc <- RunClient(ctx, ccfg, inR, io.Discard, logging.New(io.Discard, "error", "text"))
+	}()
+
+	if _, err := inW.Write(upWant[:len(upWant)/2]); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, 5*time.Second, func() bool { return srvs[0].sessionCount() == 1 && srvs[1].sessionCount() == 1 })
+	relays0 := srvs[0].chainAuthRelays.Load()
+	invalidateResumeTokens(srvs[1])
+	srvs[1].dropLiveTransports()
+	if _, err := inW.Write(upWant[len(upWant)/2:]); err != nil {
+		t.Fatal(err)
+	}
+	_ = inW.Close()
+
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatalf("client: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("timeout")
+	}
+	gotUp := <-gotUpCh
+	if !bytes.Equal(gotUp, upWant) {
+		t.Fatalf("Case C mismatch got=%d want=%d", len(gotUp), len(upWant))
+	}
+	if srvs[0].chainAuthRelays.Load() <= relays0 {
+		t.Fatal("expected at least one relayed inner signature")
+	}
+}
+
+func TestChainCaseCDuringSwitchRejected(t *testing.T) {
+	p := &pump{}
+	p.quiesce.Store(true)
+	if p.holdChainAuth() {
+		t.Fatal("must not start Case C while SWITCH is quiescing")
+	}
+	p.quiesce.Store(false)
+	if !p.holdChainAuth() {
+		t.Fatal("Case C should start when idle")
+	}
+	if p.holdChainAuth() {
+		t.Fatal("second Case C must not interleave")
+	}
+	p.releaseChainAuth()
+	if !p.holdChainAuth() {
+		t.Fatal("Case C should start after release")
+	}
+}
+
+func TestChainHopTransportPreference(t *testing.T) {
+	if got := chainHopTransport(proto.HopSpec{}, nil); got != nil {
+		t.Fatalf("empty: %v", got)
+	}
+	got := chainHopTransport(proto.HopSpec{Transport: []string{"kcp"}}, nil)
+	if strings.Join(got, ",") != "kcp" {
+		t.Fatalf("kcp: %v", got)
+	}
+	got = chainHopTransport(proto.HopSpec{Transport: []string{"quic"}}, nil)
+	if strings.Join(got, ",") != "quic,kcp" {
+		t.Fatalf("quic expands: %v", got)
+	}
+}
+
+func TestChainPerHopTransport(t *testing.T) {
+	// Hop 1 upgrades to KCP (originator SWITCH, not the nested bridge).
+	// Hop 2 stays TCP: nested upgrade across io.Pipe is a separate risk.
+	dest := echoDest(t)
+	termCfg := chainServerCfg(dest)
+	_, termAddr, _ := startRelayCfg(t, termCfg)
+
+	jCfg := chainServerCfg(dest)
+	jCfg.Transports = []string{"kcp"}
+	jCfg.UDPListen = "127.0.0.1:0"
+	jCfg.ProbeTimeout = config.Duration(400 * time.Millisecond)
+	jCfg.ProbeAttempts = 2
+	jCfg.KeepaliveInterval = config.Duration(200 * time.Millisecond)
+	jCfg.AllowRelayHops = []string{termAddr}
+	jCfg.MaxChainDepth = 2
+	j, head, _ := startRelayCfg(t, jCfg)
+
+	ccfg := chainClientCfg(termAddr, dest, []string{head + "?transport=kcp"})
+	ccfg.Transport = "kcp"
+	ccfg.ProbeTimeout = config.Duration(400 * time.Millisecond)
+
+	payload := makePattern(256 << 10)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	inR, inW := io.Pipe()
+	var out bytes.Buffer
+	errc := make(chan error, 1)
+	go func() {
+		errc <- RunClient(ctx, ccfg, inR, &out, logging.New(io.Discard, "error", "text"))
+	}()
+	waitUntil(t, 5*time.Second, func() bool { return j.sessionCount() == 1 })
+	waitKind(t, j, transport.KindKCP, 8*time.Second)
+	if _, err := inW.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	_ = inW.Close()
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatalf("client: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("timeout")
+	}
+	if !bytes.Equal(out.Bytes(), payload) {
+		t.Fatalf("echo mismatch got=%d want=%d", out.Len(), len(payload))
+	}
+}
+
+func TestChainResumeBothHops(t *testing.T) {
+	const n = 256 << 10
+	upWant := makePattern(n)
+	gotUpCh := make(chan []byte, 1)
+	destLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer destLn.Close()
+	go func() {
+		c, err := destLn.Accept()
+		if err != nil {
+			gotUpCh <- nil
+			return
+		}
+		defer c.Close()
+		b, _ := io.ReadAll(c)
+		gotUpCh <- b
+	}()
+
+	dest := destLn.Addr().String()
+	head, srvs := startChain(t, 2, dest)
+	ccfg := chainClientCfg(srvs[1].Addr(), dest, []string{head})
+
+	inR, inW := io.Pipe()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	errc := make(chan error, 1)
+	go func() {
+		errc <- RunClient(ctx, ccfg, inR, io.Discard, logging.New(io.Discard, "error", "text"))
+	}()
+
+	if _, err := inW.Write(upWant[:len(upWant)/2]); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, 5*time.Second, func() bool { return srvs[0].sessionCount() == 1 && srvs[1].sessionCount() == 1 })
+	srvs[1].dropLiveTransports()
+	srvs[0].dropLiveTransports()
+	if _, err := inW.Write(upWant[len(upWant)/2:]); err != nil {
+		t.Fatal(err)
+	}
+	_ = inW.Close()
+
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatalf("client: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("timeout")
+	}
+	gotUp := <-gotUpCh
+	if !bytes.Equal(gotUp, upWant) {
+		t.Fatalf("both-hops mismatch got=%d want=%d", len(gotUp), len(upWant))
+	}
+}
+
 func TestChainResumeOuterHopOnly(t *testing.T) {
 	const n = 256 << 10
 	upWant := makePattern(n)
@@ -917,6 +1192,7 @@ func TestChainConcurrencyLeak(t *testing.T) {
 	upWant := makePattern(payload)
 	var wg sync.WaitGroup
 	var fail atomic.Int32
+	ready := make(chan *io.PipeWriter, nSessions)
 
 	for i := 0; i < nSessions; i++ {
 		wg.Add(1)
@@ -931,11 +1207,13 @@ func TestChainConcurrencyLeak(t *testing.T) {
 			go func() {
 				errc <- RunClient(ctx, ccfg, inR, &out, logging.New(io.Discard, "error", "text"))
 			}()
-			if _, err := inW.Write(upWant); err != nil {
+			if _, err := inW.Write(upWant[:len(upWant)/2]); err != nil {
 				fail.Add(1)
 				t.Errorf("write: %v", err)
+				_ = inW.Close()
+				return
 			}
-			_ = inW.Close()
+			ready <- inW
 			if err := <-errc; err != nil {
 				fail.Add(1)
 				t.Errorf("client: %v", err)
@@ -948,8 +1226,26 @@ func TestChainConcurrencyLeak(t *testing.T) {
 		}()
 	}
 
-	waitUntil(t, 10*time.Second, func() bool { return j.sessionCount() >= 1 })
+	writers := make([]*io.PipeWriter, 0, nSessions)
+	deadline := time.Now().Add(10 * time.Second)
+	for len(writers) < nSessions && time.Now().Before(deadline) {
+		select {
+		case w := <-ready:
+			writers = append(writers, w)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	if len(writers) != nSessions {
+		t.Fatalf("only %d/%d sessions started", len(writers), nSessions)
+	}
+	waitUntil(t, 5*time.Second, func() bool { return j.sessionCount() >= nSessions })
 	j.dropLiveTransports()
+	for _, w := range writers {
+		if _, err := w.Write(upWant[len(upWant)/2:]); err != nil {
+			t.Errorf("write after drop: %v", err)
+		}
+		_ = w.Close()
+	}
 	wg.Wait()
 	if fail.Load() != 0 {
 		t.Fatalf("%d sessions failed", fail.Load())
@@ -959,12 +1255,12 @@ func TestChainConcurrencyLeak(t *testing.T) {
 		t.Fatalf("buffer leak: %d", used)
 	}
 
-	deadline := time.Now().Add(4 * time.Second)
+	leakDeadline := time.Now().Add(4 * time.Second)
 	var got int
 	for {
 		runtime.GC()
 		got = runtime.NumGoroutine()
-		if got <= base+32 || time.Now().After(deadline) {
+		if got <= base+32 || time.Now().After(leakDeadline) {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
