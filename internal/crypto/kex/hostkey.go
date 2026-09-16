@@ -87,6 +87,58 @@ func FingerprintSHA256(pub ed25519.PublicKey) string {
 	return ssh.FingerprintSHA256(sshPub)
 }
 
+// RawEd25519ToAuthorizedKeysLine renders a raw 32-byte Ed25519 public key in
+// OpenSSH wire form ("ssh-ed25519 AAAA…"). KexReply carries the raw key while
+// known_hosts matching and operator-facing fingerprints use the wire form.
+func RawEd25519ToAuthorizedKeysLine(pub []byte) (string, error) {
+	if len(pub) != ed25519.PublicKeySize {
+		return "", fmt.Errorf("kex: %w: invalid ed25519 public key size %d", ErrHostKey, len(pub))
+	}
+	sshPub, err := ssh.NewPublicKey(ed25519.PublicKey(pub))
+	if err != nil {
+		return "", fmt.Errorf("kex: %w: invalid host key: %v", ErrHostKey, err)
+	}
+	return strings.TrimSpace(string(ssh.MarshalAuthorizedKey(sshPub))), nil
+}
+
+// VerifyAttestation validates a KEX transcript relayed by an intermediate
+// (FEAT-UTL-05 J-D3). kexInit is the 48-byte payload the dialling relay sent
+// (clientEph ‖ clientNonce) and kexReply the 144-byte reply it received
+// (serverEph ‖ serverNonce ‖ hostKey ‖ sig).
+//
+// It recomputes ExchangeHash over the transcript, checks the host-key signature,
+// then matches the host key against a pin or known_hosts under addr — the
+// address the *verifier* asked for, never one chosen by the relaying party.
+//
+// The returned serverNonce is the value covered by the host-key signature; per
+// J-D16 a server reuses it as its auth-challenge nonce, so callers must compare
+// it against AUTH_OK.serverNonce before signing a relayed challenge.
+func VerifyAttestation(kexInit, kexReply []byte, knownHostsPath, addr, pinnedFingerprint, strictChecking string) ([]byte, error) {
+	if len(kexInit) != KexInitLen {
+		return nil, fmt.Errorf("kex: %w: attestation KEX_INIT length %d, expected %d", ErrHostKey, len(kexInit), KexInitLen)
+	}
+	if len(kexReply) != KexReplyLen {
+		return nil, fmt.Errorf("kex: %w: attestation KEX_REPLY length %d, expected %d", ErrHostKey, len(kexReply), KexReplyLen)
+	}
+	clientEph := kexInit[:32]
+	clientNonce := kexInit[32:48]
+	serverEph := kexReply[:32]
+	serverNonce := kexReply[32:48]
+	hostKey := kexReply[48:80]
+	sig := kexReply[80:144]
+
+	hash := ExchangeHash(clientEph, serverEph, clientNonce, serverNonce, hostKey)
+	if !ed25519.Verify(ed25519.PublicKey(hostKey), hash, sig) {
+		return nil, fmt.Errorf("kex: %w: attested transcript has no valid host key signature", ErrHostKey)
+	}
+	if err := VerifyKnownHosts(knownHostsPath, addr, ed25519.PublicKey(hostKey), pinnedFingerprint, strictChecking); err != nil {
+		return nil, err
+	}
+	out := make([]byte, len(serverNonce))
+	copy(out, serverNonce)
+	return out, nil
+}
+
 // ErrHostKey is returned when host key verification fails (mismatch, untrusted, MITM).
 var ErrHostKey = errors.New("host key verification failed")
 

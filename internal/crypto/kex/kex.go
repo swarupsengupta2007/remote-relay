@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
 	"io"
 
@@ -125,6 +126,9 @@ func (c *ClientSession) ProcessReply(reply []byte, verifyHostKey func(pub ed2551
 type ServerSession struct {
 	hostPriv ed25519.PrivateKey
 	hostPub  ed25519.PublicKey
+
+	nonce    [NonceLen]byte
+	nonceSet bool
 }
 
 func NewServerSession(hostPriv ed25519.PrivateKey) (*ServerSession, error) {
@@ -140,6 +144,36 @@ func NewServerSession(hostPriv ed25519.PrivateKey) (*ServerSession, error) {
 
 func (s *ServerSession) HostPublicKey() ed25519.PublicKey {
 	return s.hostPub
+}
+
+// ServerNonce returns the server nonce committed into the most recent
+// ProcessInit reply, i.e. the value a peer sees at KexReply[32:48].
+//
+// Callers reuse it as the auth-challenge serverNonce (FEAT-UTL-05 J-D16).
+// ExchangeHash covers the nonce and is signed by the host key, and
+// auth.DeriveChallenge covers it too, so making both roles the same 16 bytes
+// binds a relayed KEX attestation to the challenge the originator signs. Both
+// roles are public values: a nonce only needs freshness and uniqueness, so the
+// reuse costs nothing cryptographically.
+//
+// It returns nil before ProcessInit has run.
+func (s *ServerSession) ServerNonce() []byte {
+	if !s.nonceSet {
+		return nil
+	}
+	out := make([]byte, NonceLen)
+	copy(out, s.nonce[:])
+	return out
+}
+
+// AttestationNonce is the base64 form of ServerNonce, ready to be placed in an
+// auth challenge or HELLO_OK.
+func (s *ServerSession) AttestationNonce() string {
+	n := s.ServerNonce()
+	if n == nil {
+		return ""
+	}
+	return base64.StdEncoding.EncodeToString(n)
 }
 
 func (s *ServerSession) ProcessInit(init []byte) (reply []byte, c2sKey, s2cKey []byte, err error) {
@@ -160,6 +194,8 @@ func (s *ServerSession) ProcessInit(init []byte) (reply []byte, c2sKey, s2cKey [
 	if _, err := io.ReadFull(rand.Reader, serverNonce[:]); err != nil {
 		return nil, nil, nil, fmt.Errorf("kex: generate server nonce: %w", err)
 	}
+	s.nonce = serverNonce
+	s.nonceSet = true
 
 	// 2. Compute exchange hash and sign with host key
 	hash := ExchangeHash(clientEphBytes, serverPub.Bytes(), clientNonce, serverNonce[:], s.hostPub)
