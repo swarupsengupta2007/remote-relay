@@ -88,6 +88,17 @@ type Server struct {
 	HostKey            string   `toml:"host_key"`
 	Splice             bool     `toml:"splice"`
 	AdaptiveKCP        bool     `toml:"adaptive_kcp"`
+
+	// FEAT-UTL-05 jumphost chaining. Chaining is default-deny: an empty
+	// AllowRelayHops refuses every CHAIN with ERR_HOP_FORBIDDEN (J-D8).
+	AllowRelayHops             []string `toml:"allow_relay_hops"`
+	MaxChainDepth              int      `toml:"max_chain_depth"`
+	MaxChainConnsPerPeer       int      `toml:"max_chain_conns_per_peer"`
+	ChainAuthTimeout           Duration `toml:"chain_auth_timeout"`
+	ChainAuthRelaysMax         int      `toml:"chain_auth_relays_max"`
+	ChainMaxSessions           int      `toml:"chain_max_sessions"`
+	RelayKnownHosts            string   `toml:"relay_known_hosts"`
+	RelayStrictHostKeyChecking string   `toml:"relay_strict_host_key_checking"`
 }
 
 type Client struct {
@@ -119,6 +130,13 @@ type Client struct {
 	AdaptiveKCP           bool     `toml:"adaptive_kcp"`
 	Interfaces            []string `toml:"interfaces"`
 	SourceIPs             []string `toml:"source_ips"`
+
+	// FEAT-UTL-05 jumphost chaining. Jumphost holds the raw -J entries; parse
+	// them with ParseJumphost. SSHDAliveBudget bounds the summed worst-case
+	// hold across all hops (§2.7): exceeding it means sshd's own
+	// ClientAliveInterval×ClientAliveCountMax will kill a parked session first.
+	Jumphost        []string `toml:"jumphost"`
+	SSHDAliveBudget Duration `toml:"sshd_alive_budget"`
 
 	TCPInterface string `toml:"-"`
 	UDPInterface string `toml:"-"`
@@ -176,6 +194,12 @@ func DefaultServer() Server {
 		HostKey:            "/etc/relay/ssh_host_ed25519_key",
 		Splice:             defaultSplice(),
 		AdaptiveKCP:        true,
+
+		MaxChainDepth:              4,
+		MaxChainConnsPerPeer:       256,
+		ChainAuthTimeout:           Duration(10 * time.Second),
+		ChainAuthRelaysMax:         8,
+		RelayStrictHostKeyChecking: "yes",
 	}
 }
 
@@ -205,6 +229,7 @@ func DefaultClient() Client {
 		HappyEyeballsDelay:    Duration(250 * time.Millisecond),
 		Splice:                defaultSplice(),
 		AdaptiveKCP:           true,
+		SSHDAliveBudget:       Duration(2 * time.Minute),
 	}
 }
 
@@ -244,6 +269,8 @@ type ClientOptions struct {
 	AdaptiveKCP           *bool
 	Interfaces            []string
 	SourceIPs             []string
+	Jumphost              []string
+	JumphostSet           bool
 }
 
 func LoadServer(opts ServerOptions) (Server, error) {
@@ -356,6 +383,9 @@ func LoadClient(opts ClientOptions) (Client, error) {
 	if opts.AdaptiveKCP != nil {
 		cfg.AdaptiveKCP = *opts.AdaptiveKCP
 	}
+	if opts.JumphostSet {
+		cfg.Jumphost = opts.Jumphost
+	}
 	tcpIface, udpIface, tcpIP, udpIP, err := ResolveClientBindings(cfg.Interfaces, cfg.SourceIPs, opts.Interfaces, opts.SourceIPs)
 	if err != nil {
 		return Client{}, err
@@ -446,7 +476,7 @@ func (s Server) Validate() error {
 	if s.DeadPeerThreshold <= 0 {
 		return fmt.Errorf("dead_peer_threshold must be positive")
 	}
-	return nil
+	return s.validateChain()
 }
 
 func (c Client) Validate() error {
@@ -515,7 +545,7 @@ func (c Client) Validate() error {
 			}
 		}
 	}
-	return nil
+	return c.validateChain()
 }
 
 func validStrictHostKeyChecking(s string) error {
@@ -549,7 +579,13 @@ func validTransport(t string) bool {
 
 // TransportPreference is the HELLO/RESUME preference list (§8.5).
 func (c Client) TransportPreference() []string {
-	switch strings.ToLower(strings.TrimSpace(c.Transport)) {
+	return TransportPreferenceList(c.Transport)
+}
+
+// TransportPreferenceList maps a single transport name to its HELLO/RESUME
+// preference list (§8.5). It is shared with the per-hop -J query suffix (J-D4).
+func TransportPreferenceList(t string) []string {
+	switch strings.ToLower(strings.TrimSpace(t)) {
 	case "tcp":
 		return []string{"tcp"}
 	case "kcp":
