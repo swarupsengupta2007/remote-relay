@@ -13,6 +13,10 @@ const (
 	CodeAuth           = "ERR_AUTH"
 	CodeShutdown       = "ERR_SHUTDOWN"
 	CodeInternal       = "ERR_INTERNAL"
+	// FEAT-UTL-05 jumphost chaining.
+	CodeChainTooLong = "ERR_CHAIN_TOO_LONG"
+	CodeChainLoop    = "ERR_CHAIN_LOOP"
+	CodeHopForbidden = "ERR_HOP_FORBIDDEN"
 )
 
 // Error is a protocol-level failure carrying a wire error code.
@@ -53,4 +57,8 @@ var (
 	ErrAuth           = &Error{Code: CodeAuth, Msg: "auth failed"}
 	ErrShutdown       = &Error{Code: CodeShutdown, Msg: "shutting down"}
 	ErrInternal       = &Error{Code: CodeInternal, Msg: "internal error"}
+
+	ErrChainTooLong = &Error{Code: CodeChainTooLong, Msg: "chain too long"}
+	ErrChainLoop    = &Error{Code: CodeChainLoop, Msg: "chain loop detected"}
+	ErrHopForbidden = &Error{Code: CodeHopForbidden, Msg: "relay hop not allowed"}
 )

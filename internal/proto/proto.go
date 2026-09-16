@@ -30,13 +30,23 @@ const (
 	TypeKexInit   Type = 0x0B
 	TypeKexReply  Type = 0x0C
 	TypeEncrypted Type = 0x0D
-	TypeData      Type = 0x10
-	TypeAck       Type = 0x11
-	TypeCloseDir  Type = 0x12
-	TypeProbe     Type = 0x13
-	TypeProbeOK   Type = 0x14
-	TypePing      Type = 0x15
-	TypePong      Type = 0x16
+	// TypeChain (0x0E) and TypeChainOK (0x0F) are FEAT-UTL-05 multi-hop
+	// jumphost chaining frames. They are new frame types rather than optional
+	// HELLO fields on purpose: ReadFrame rejects an unknown type with ErrProto,
+	// so a server that predates chaining fails closed. An optional HELLO field
+	// would be silently dropped by encoding/json and such a server would dial
+	// its own default destination instead — a fail-open (J-D10).
+	//   CHAIN     C→S  ChainHello    replaces HELLO when -J is non-empty
+	//   CHAIN_OK  S→C  ChainHelloOK  one per completed onward hop, then HELLO_OK
+	TypeChain    Type = 0x0E
+	TypeChainOK  Type = 0x0F
+	TypeData     Type = 0x10
+	TypeAck      Type = 0x11
+	TypeCloseDir Type = 0x12
+	TypeProbe    Type = 0x13
+	TypeProbeOK  Type = 0x14
+	TypePing     Type = 0x15
+	TypePong     Type = 0x16
 )
 
 const (
@@ -50,6 +60,7 @@ func (t Type) Known() bool {
 	case TypeHello, TypeHelloOK, TypeResume, TypeResumeOK, TypeResumeFail,
 		TypeSwitch, TypeBye, TypeErr, TypeAuth, TypeAuthOK,
 		TypeKexInit, TypeKexReply, TypeEncrypted,
+		TypeChain, TypeChainOK,
 		TypeData, TypeAck, TypeCloseDir,
 		TypeProbe, TypeProbeOK, TypePing, TypePong:
 		return true
@@ -86,6 +97,10 @@ func (t Type) String() string {
 		return "AUTH"
 	case TypeAuthOK:
 		return "AUTH_OK"
+	case TypeChain:
+		return "CHAIN"
+	case TypeChainOK:
+		return "CHAIN_OK"
 	case TypeData:
 		return "DATA"
 	case TypeAck:

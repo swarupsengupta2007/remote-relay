@@ -81,12 +81,25 @@ func TestUnknownFrameType(t *testing.T) {
 }
 
 func TestUnknownTypeGap(t *testing.T) {
-	var buf bytes.Buffer
-	buf.WriteByte(0x0E)
-	buf.Write([]byte{0, 0, 0, 0})
-	_, err := ReadFrame(&buf)
-	if !errors.Is(err, ErrProto) {
-		t.Fatalf("got %v, want ErrProto", err)
+	// 0x0E/0x0F were the unassigned gap between ENCRYPTED and DATA until
+	// FEAT-UTL-05 allocated them to CHAIN/CHAIN_OK. A server that predates that
+	// allocation must still reject them, which is what makes the chained
+	// handshake fail closed instead of being silently ignored (J-D10).
+	if !TypeChain.Known() || TypeChain != 0x0E {
+		t.Fatalf("TypeChain = 0x%02x known=%v, want 0x0e known=true", uint8(TypeChain), TypeChain.Known())
+	}
+	if !TypeChainOK.Known() || TypeChainOK != 0x0F {
+		t.Fatalf("TypeChainOK = 0x%02x known=%v, want 0x0f known=true", uint8(TypeChainOK), TypeChainOK.Known())
+	}
+
+	for _, typ := range []byte{0x00, 0x17, 0x99} {
+		var buf bytes.Buffer
+		buf.WriteByte(typ)
+		buf.Write([]byte{0, 0, 0, 0})
+		_, err := ReadFrame(&buf)
+		if !errors.Is(err, ErrProto) {
+			t.Fatalf("type 0x%02x: got %v, want ErrProto", typ, err)
+		}
 	}
 }
 
@@ -140,11 +153,25 @@ func TestControlRoundTrip(t *testing.T) {
 			},
 		},
 		{name: "fail", typ: TypeErr, v: Fail{Code: CodeProto, Msg: "nope"}},
-		{name: "auth", typ: TypeAuth, v: Auth{Sig: "AAAA"}},
+		{name: "auth", typ: TypeAuth, v: Auth{Sig: "AAAA", Hop: 2}},
 		{
 			name: "auth_ok",
 			typ:  TypeAuthOK,
 			v:    AuthOK{SessionID: "s-1", ServerNonce: "n", Challenge: "c", Destination: "127.0.0.1:22"},
+		},
+		{
+			name: "chain_hello",
+			typ:  TypeChain,
+			v: ChainHello{
+				V: 1, ChainID: "cid", Hops: []HopSpec{{Addr: "s.example.com:7443", Transport: []string{"tcp"}}},
+				Destination: "127.0.0.1:22", OriginIP: "203.0.113.9",
+				Transport: []string{"tcp"}, ClientNonce: "n", Window: 4194304,
+			},
+		},
+		{
+			name: "chain_hello_ok",
+			typ:  TypeChainOK,
+			v:    ChainHelloOK{V: 1, Hop: 2, Addr: "s.example.com:7443", SessionID: "s-2", Transport: "tcp", SetupMs: 12},
 		},
 		{name: "switch", typ: TypeSwitch, v: Switch{Dir: DirBoth, From: "tcp", Offset: SwitchOffset{Up: 1, Down: 2}}},
 		{name: "bye", typ: TypeBye, v: Bye{Code: CodeShutdown, Msg: "bye"}},
@@ -224,6 +251,14 @@ func cloneEmpty(v any) any {
 		return &Auth{}
 	case AuthOK:
 		return &AuthOK{}
+	case ChainHello:
+		return &ChainHello{}
+	case ChainHelloOK:
+		return &ChainHelloOK{}
+	case HopSpec:
+		return &HopSpec{}
+	case HopAttestation:
+		return &HopAttestation{}
 	default:
 		return nil
 	}
@@ -310,6 +345,18 @@ func TestProtoErrors(t *testing.T) {
 	}
 	if errors.Is(pe, errors.New("other")) {
 		t.Fatalf("did not expect generic error match")
+	}
+	for _, pair := range []struct {
+		got  *Error
+		want *Error
+	}{
+		{NewError(CodeChainTooLong, "too long"), ErrChainTooLong},
+		{NewError(CodeChainLoop, "loop"), ErrChainLoop},
+		{NewError(CodeHopForbidden, "nope"), ErrHopForbidden},
+	} {
+		if !errors.Is(pair.got, pair.want) {
+			t.Fatalf("errors.Is(%v, %v) = false", pair.got, pair.want)
+		}
 	}
 }
 
