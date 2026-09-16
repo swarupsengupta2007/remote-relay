@@ -456,6 +456,43 @@ Implementation & Verification Summary:
 
 ---
 
+## Grok — FEAT-UTL-05 Phase 1: Multi-Hop Jumphost Chaining (`-J`)
+
+Date: 2026-09-15.
+Picked up from `jump_todo.md` after a previous agent stopped mid-implementation
+(J-D16, proto, kex attestation, config structs, and a first `handleChain` were
+already in the tree; the package did not compile).
+
+### 1. Crypto gate (J-D16)
+- KEX `serverNonce` is reused as the auth challenge nonce (`kex.ServerSession.AttestationNonce`, `authServerNonce` in `helloAuth`/`resumeAuth`/`chainAuth`).
+- `TestNonceBindingKexEqualsAuth` covers HELLO and RESUME-fallback paths.
+
+### 2. Server-side chaining
+- `internal/relay/chain.go` + `chain_nested.go`: policy (default-deny, depth, loops), hop-1 challenge with `Hop`/`HelloJSON`, onward KEX + attestation relay, nested `sessionIO` pipes (no splice), nested resume loop clamped to the next hop's hold, `OriginIP` + `max_chain_conns_per_peer` accounting.
+- `challengeAndVerify` generalises `issueChallenge` for CHAIN hop 1.
+- Chain-policy errors are not reconnectable. Expvars: `chain_sessions`, `chain_hops_total`, `chain_auth_relays`, `chain_refused`, `chain_attest_failures`.
+
+### 3. Originator + CLI
+- `clientHello` sends `TypeChain` when `-J` is set; `verifyRelayedChallenge` checks destination, attestation, J-D16 nonce binding, and `DeriveChallenge` over `helloJson`.
+- Resume always redials hop 1, not `--server` (the terminal).
+- Phase 1 forces TCP on every hop; per-hop `transport=`/`ha=` is parsed and warned.
+- `-J` / `--jumphost` / `--chain` on `relay client`.
+
+### 4. Tests
+- `internal/relay/chain_test.go`: e2e both directions, 3 hops, policy denials, attestation replay / host-key mismatch / destination mismatch, version-skew fail-closed, half-close, outer-hop resume, origin-IP accounting, splice disabled, concurrency leak.
+- Config `ParseJumphost` + Validate rules; kex `VerifyAttestation`; `cmd/relay` `-J` parsing.
+
+### 5. Deferred (as agreed in `jump_todo.md`)
+- Phase 2.4 Case C (mid-session `TypeAuthOK` in `netReader`).
+- Phase 2.5 Case D (rebuild-on-resume of a dead nested session).
+- Per-hop QUIC/KCP/HA and nested `splice(2)`.
+- Phase 3 NATed terminal (`HopSpec.Target`).
+
+### 6. Docs
+- `.feat-impl/FEAT-UTL-05.md`, `features.md` Tier 2, `design.md` D11–D16 / I6 / JR1–JR11, README jumphost section, `scripts/test_jumphost_netns.py`.
+
+---
+
 ## Next agent
 
 Append a new `## <Agent>` heading below this line. Write what you changed,

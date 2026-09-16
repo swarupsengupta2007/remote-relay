@@ -30,6 +30,7 @@ See **Authentication** and **Security** below.
 | FEAT-ROB-03 Dual-Stack Happy Eyeballs v2 (RFC 8305) | yes |
 | FEAT-PERF-01 Linux Kernel Zero-Copy Stream Splicing (`splice(2)`) | yes |
 | FEAT-PERF-02 Adaptive KCP Dynamic ARQ & Congestion Tuning | yes |
+| FEAT-UTL-05 Multi-Hop Jumphost Chaining (`-J`) | yes (Phase 1: TCP hops; inner stale-token re-auth deferred) |
 | Single-Session KCP Repeated-Kills Soak & Netns Harness | yes |
 
 ### Netem & BFD Benchmarks (dual-netns veth)
@@ -110,6 +111,15 @@ expvar_listen       = ""               # empty = disabled
 auth_method         = "ssh-publickey"  # mandatory (none deprecated & removed)
 authorized_keys     = ""               # empty = ~/.ssh/authorized_keys of the relay user
 auth_fail_delay     = "200ms"          # fixed delay on ERR_AUTH (no oracle)
+
+# FEAT-UTL-05 jumphost chaining. Empty allow_relay_hops refuses every CHAIN.
+allow_relay_hops         = []           # literal host:port as clients write them; ["*"] needs max_chain_depth = 1
+max_chain_depth          = 4
+max_chain_conns_per_peer = 256          # per upstream relay address
+chain_auth_timeout       = "10s"
+chain_max_sessions       = 0            # 0 ⇒ max_sessions / 4
+relay_known_hosts        = ""           # optional; originator still verifies every hop
+relay_strict_host_key_checking = "yes"
 ```
 
 ## Client
@@ -118,7 +128,7 @@ Logs go to **stderr**. stdout is the relayed byte stream and must stay clean
 (it is the SSH transport).
 
 ```
-./relay client --server HOST:PORT [-i|--identity PATH] [--auth-sock PATH] [--dest HOST:PORT] [--tcp|--kcp] [--allow-ha] [--server-fingerprint FP] [--known-hosts PATH] [--strict-host-key-checking yes|no|ask|accept-new] [--heartbeat-interval 750ms] [--dead-peer-threshold 3] [--config PATH] [--log-level warn] [%h %p]
+./relay client --server HOST:PORT [-J|--jumphost|--chain HOST:PORT] [-i|--identity PATH] [--auth-sock PATH] [--dest HOST:PORT] [--tcp|--kcp] [--allow-ha] [--server-fingerprint FP] [--known-hosts PATH] [--strict-host-key-checking yes|no|ask|accept-new] [--heartbeat-interval 750ms] [--dead-peer-threshold 3] [--config PATH] [--log-level warn] [%h %p]
 ```
 
 Default client config path: `$HOME/.config/relay/client.toml` (optional).
@@ -157,6 +167,8 @@ log_format            = "text"
 auth_method           = "ssh-publickey" # mandatory (none deprecated & removed)
 auth_user             = ""              # empty = current user
 identity_files        = []              # empty = try ~/.ssh/id_ed25519, id_ecdsa, id_rsa
+jumphost              = []              # same value as -J; --server is still the terminal
+sshd_alive_budget     = "2m"            # warn when Σ hold_timeout across hops exceeds this
 ```
 
 ### SSH ProxyCommand
@@ -166,6 +178,29 @@ Host via-relay
     HostName relay.example.com
     User alice
     ProxyCommand relay client --server relay.example.com:7443 -i ~/.ssh/id_ed25519
+```
+
+To reach a terminal relay through one or more intermediates, pass `-J` the
+same way OpenSSH does. `--server` is always the **terminal** (the process that
+dials `sshd`); `-J` names the hops before it:
+
+```
+Host via-jumps
+    HostName 127.0.0.1
+    User alice
+    ProxyCommand relay client --server S.example.com:7443 -J j1.example.com:7443,j2.example.com:7443 --dest %h:%p -i ~/.ssh/id_ed25519
+```
+
+Each hop is a full independent relay session (its own KEX, resume token, ring,
+BFD). The originator verifies every hop's host key; the private key never
+leaves the client. Intermediates must list permitted next hops in
+`allow_relay_hops` (empty = chaining refused). Phase 1 forces TCP on every hop;
+per-hop `?transport=kcp` / `?ha=1` is parsed but not yet honoured.
+
+A hop can be pinned inline to skip `known_hosts`:
+
+```
+-J 'j1.example.com:7443#SHA256:AbCd…'
 ```
 
 The server dials its own `default_destination` (`127.0.0.1:22`), so `sshd` on
@@ -252,6 +287,13 @@ process comes back within `hold_timeout`, but they cannot; start a new SSH
 session. "Clean restart" means no leaked goroutines or sockets, not that
 sessions survive process death.
 
+On a **chained** session this is sharper (JR3): an intermediate ACKs hop-1 bytes
+once they are in its nested ring, not once the next hop (or `sshd`) has them.
+If that intermediate process exits, ACKed bytes are lost and the client sees
+`ERR_UNKNOWN_SESSION`. Same operational rule as a direct hop — restart `ssh` —
+plus the extra exposure that the crash is of a hop the originator is not
+directly talking to.
+
 ### `hold_timeout` vs `sshd` `ClientAliveInterval` (R7)
 
 A resumed SSH session that was held for minutes may still die because
@@ -260,12 +302,19 @@ socket was unread. That is outside the relay's control. Set `hold_timeout`
 **below** the deployment's `sshd` alive-interval budget. Resume logs include
 `heldMs` so you can see how long a session sat in hold.
 
+Across a chain the worst-case park is the **sum** of each hop's `hold_timeout`.
+A 3-hop path with 5 m holds can stall 15 m, which will exceed most `sshd`
+alive budgets (JR8). The client logs a warning when that sum exceeds
+`sshd_alive_budget` (default 2 m).
+
 ## Limits
 
 | Knob | Default | Effect |
 |---|---|---|
 | `max_sessions` | 1024 | Extra HELLO is refused with `ERR_NO_CAPACITY`. |
-| `max_conns_per_ip` | 8 | Extra HELLO from the same client IP is refused with `ERR_NO_CAPACITY`. RESUME of an existing session is still allowed. |
+| `max_conns_per_ip` | 8 | Extra HELLO from the same client IP is refused with `ERR_NO_CAPACITY`. RESUME of an existing session is still allowed. Chained sessions count the originator (`OriginIP`), not the upstream relay. |
+| `max_chain_conns_per_peer` | 256 | Cap on chained sessions from one upstream relay address. |
+| `chain_max_sessions` | `max_sessions/4` | Extra CHAIN is refused with `ERR_NO_CAPACITY`. A chained session holds two rings on the intermediate. |
 | `total_buffer_bytes` | 512 MiB | Global ring occupancy. New sessions are refused with `ERR_NO_CAPACITY`; existing sessions backpressure instead of being killed. |
 | `buffer_bytes` | 64 MiB | Per-session per-direction cap, clipped to remaining global headroom. |
 
@@ -286,7 +335,9 @@ include `resumeToken` or payload bytes.
 
 - pprof: `http://<pprof_listen>/debug/pprof/`
 - expvar: `http://<expvar_listen>/debug/vars` — `sessions`, `held`,
-  `buffer_used`, `accepts`, `refused` (plus the usual process expvars)
+  `buffer_used`, `accepts`, `refused`, `chain_sessions`, `chain_hops_total`,
+  `chain_auth_relays`, `chain_refused`, `chain_attest_failures` (plus the usual
+  process expvars)
 
 If both are set to the same address, one HTTP server serves both.
 

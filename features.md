@@ -26,6 +26,7 @@ Each proposal includes:
 | **FEAT-UTL-02** | Terminal Reconnection HUD & Desktop Notifications | Tier 2: Utility | **P1** | Low | Clear visual feedback and status during link drops |
 | **FEAT-UTL-03** | SOCKS5 Dynamic Forwarding Mode (`relay socks`) | Tier 2: Utility | **P2** | Medium | Expands relay beyond SSH to generic browser/DB proxy |
 | **FEAT-UTL-04** | Reverse Relay & NAT Gateway Mode (Inverted Tunnel) | Tier 2: Utility | **P2** | High | Reaches home labs and private VPCs behind NAT |
+| [**FEAT-UTL-05**](.feat-impl/FEAT-UTL-05.md) | Multi-Hop Jumphost Chaining (`-J`) | Tier 2: Utility | **P1** | Complete (Phase 1) | Server-side chaining with per-hop resume, relayed signatures, and KEX attestation |
 | [**FEAT-SEC-01**](.feat-impl/FEAT-SEC-01.md) | Encrypted Handshake Control Plane (X25519 / ChaCha20-Poly1305) | Tier 3: Security | **P1** | Complete | SSH-style X25519 ECDH + Ed25519 host keys + ChaCha20-Poly1305 control encryption |
 | **FEAT-SEC-02** | WebSocket & HTTPS Port 443 Fallback Transport | Tier 3: Security | **P3** | High | Bypasses restrictive enterprise firewalls & DPI |
 | **FEAT-SEC-03** | Per-User RBAC & Live `SIGHUP` Configuration Reload | Tier 3: Security | **P2** | Medium | Hot updates to `authorized_keys` & destination ACLs |
@@ -203,6 +204,7 @@ Because stdout is reserved exclusively for the raw SSH byte stream, the client p
 #### 3. Benefits & Verification
 - Converts `remote-relay` into an unbreakable mobile proxy for all TCP application traffic.
 - **Verification**: Point `curl --socks5 127.0.0.1:1080 https://example.com` through the proxy while injecting link breaks, verify HTTP request completes successfully.
+- **Related**: [FEAT-UTL-05](.feat-impl/FEAT-UTL-05.md) is the *static* analogue of this *dynamic* forwarding — a named path of relay servers rather than a SOCKS5 multiplexer.
 
 ---
 
@@ -221,7 +223,7 @@ The current architecture assumes the server has a public IP address and the dest
 >     -o ProxyCommand="relay client --server jump.example:7443 --kcp -i ~/.ssh/id_ed25519"
 > ```
 > The relay transparently carries the opaque SSH session across NAT with full KCP resilience, BFD dead-peer detection, and hot-standby failover. OpenSSH on the jump host owns the port listener and enforces `authorized_keys` `permitlisten=` restrictions.
-> `FEAT-UTL-04` specifically provides a dedicated agent/client rendezvous protocol (`relay agent` / `--target`) for environments where operators do not want OpenSSH reverse listeners or multi-session forward ports on the relay host.
+> `FEAT-UTL-04` specifically provides a dedicated agent/client rendezvous protocol (`relay agent` / `--target`) for environments where operators do not want OpenSSH reverse listeners or multi-session forward ports on the relay host. Phase 3 of [FEAT-UTL-05](.feat-impl/FEAT-UTL-05.md) jumphost chaining depends on this rendezvous so a NATed terminal can be named by `HopSpec.Target` instead of a dialable `addr`.
 
 #### 2. Technical Specification
 - **Agent Subcommand (`relay agent`)**:
@@ -240,6 +242,27 @@ The current architecture assumes the server has a public IP address and the dest
 #### 3. Benefits & Verification
 - Enables secure, resilient inbound SSH access to machines behind NAT without port forwarding.
 - **Verification**: Place agent in a private netns with default drop on incoming traffic; client connects via public server and maintains session across link resets.
+
+---
+
+### [FEAT-UTL-05](.feat-impl/FEAT-UTL-05.md): Multi-Hop Jumphost Chaining (`-J`)
+* **Priority**: `P1` (High)
+* **Status**: Implemented (Phase 1 + cheap Phase 2). Case C/D, per-hop QUIC/KCP/HA, nested splice deferred.
+* **Target Package**: `cmd/relay`, `internal/relay`, `internal/proto`, `internal/config`, `internal/crypto/kex`
+
+#### 1. Problem Statement
+The relay is strictly two-party: `client → server → destination`. Reaching a relay that is not directly dialable today means wrapping an opaque `ssh -R` inside the session, which gives the inner hop no resume, no KCP, and no BFD of its own.
+
+#### 2. Technical Implementation
+- **Server-side chaining (J-D1)**: each intermediate embeds a relay client toward the next hop and fully terminates that hop's data plane. `-J` is OpenSSH-compatible; `--server` remains the terminal that dials `sshd`.
+- **Relayed signature (J-D2)** plus **KEX attestation (J-D3)**: the private key never leaves the originator; every hop's host key is verified by the originator. J-D16 reuses the KEX `serverNonce` as the auth nonce so a rogue intermediate cannot pair a genuine attestation with a fabricated challenge.
+- **Default-deny `allow_relay_hops` (J-D8/J-D9)**, `max_chain_depth` (default 4), loop detection, `OriginIP` accounting, `chain_max_sessions`.
+- **New frames** `TypeChain` (0x0E) / `TypeChainOK` (0x0F) so a v1 peer fails closed (`ERR_PROTO`) instead of silently dialing its own destination (J-D10).
+- Phase 1 forces TCP on every hop. A stale nested resume token tears the chain down (Case C/D are Phase 2).
+
+#### 3. Verification
+- In-process tests in `internal/relay/chain_test.go` (byte-exact e2e, 3 hops, policy denials, attestation replay, outer-hop resume, splice disabled, origin-IP accounting).
+- Netns harness `scripts/test_jumphost_netns.py` (not in CI; needs root + netns + sshd).
 
 ---
 

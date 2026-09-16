@@ -49,6 +49,12 @@ Status: design draft, pre-implementation. Go ≥ 1.23, Linux/macOS.
 | D8 | Control-plane payloads are **JSON**; data-plane frames are **fixed binary**. | Handshake/resume happens a handful of times per session and is worth being able to read in a hexdump; DATA is the hot path. |
 | D9 | Only **one active data path at a time** per direction; switching is an explicit, quiesced `SWITCH` handshake. | Prevents reordering/duplication that two simultaneously-live paths would cause. |
 | D10 | Shared UDP socket disambiguates stacks with a **1-byte tag prefix** managed by an internal `udpMux`. | Deterministic; avoids heuristic first-byte sniffing between QUIC headers and KCP `conv`. |
+| D11 | **Server-side jumphost chaining (J-D1).** Each intermediate embeds a relay client toward the next hop and fully terminates that hop's data plane. | Per-hop resume, KCP, BFD/HA. Client-side nesting would make hop 2 TCP-only forever. |
+| D12 | **Relayed signature (J-D2).** The next hop's challenge travels back over the already-authenticated inbound channel; the originator signs; the intermediate forwards. The private key never leaves the client. | A shared inter-server secret would let a compromised j1 impersonate any client to j2. |
+| D13 | **The originator verifies every hop's host key via a KEX attestation relay (J-D3).** | A rogue j1 must not MITM hop 2 or redirect the client into signing for a different server. |
+| D14 | **Chaining is default-deny (J-D8/J-D9).** `allow_relay_hops` must name every remaining hop; empty ⇒ `ERR_HOP_FORBIDDEN`. `allow_relay_hops = ["*"]` requires `max_chain_depth = 1`. | Without this, any authenticated client could turn a relay into an open chaining proxy. |
+| D15 | **New frame types `TypeChain` 0x0E / `TypeChainOK` 0x0F (J-D10), not optional HELLO fields.** `V` stays 1. | `ReadFrame` returns `ErrProto` on an unknown type, so a v1 peer fails closed. An optional HELLO field would be silently ignored and the old server would dial its own destination. |
+| D16 | **Reuse the KEX `serverNonce` as the auth `serverNonce` (J-D16).** Both values are public; uniqueness still holds. | Binds the attested `ExchangeHash` to `DeriveChallenge` with no format change. Without this, a rogue intermediate can pair a genuine KEX_REPLY with a fabricated AUTH_OK (JR1). |
 
 ---
 
@@ -93,7 +99,7 @@ internal/config/               # TOML load, defaults, validation, flag overlay
 internal/proto/                # frame codec, control message types, error codes
 internal/transport/            # Conn interface; tcp / quic / kcp adapters; udpMux
 internal/session/              # state machine, offsets, dedupe, ringbuf, store
-internal/relay/                # client & server pumps (stdio↔conn, dest↔conn)
+internal/relay/                # client & server pumps (stdio↔conn, dest↔conn); chain.go jumphost bridging
 internal/auth/                 # Authenticator iface: none (v1), sshpubkey (M5)
 internal/logging/              # slog setup, per-session fields
 ```
@@ -143,6 +149,13 @@ Frame := Type uint8 | PayloadLen uint32 (big-endian) | Payload [PayloadLen]byte
 | `0x06` | `SWITCH` | JSON `Switch{dir,from,offset}` | both |
 | `0x07` | `BYE` | JSON `Bye{code,msg}` | both |
 | `0x08` | `ERR` | JSON `Fail{code,msg}` | both |
+| `0x09` | `AUTH` | JSON `Auth{sig,hop?}` | C→S |
+| `0x0A` | `AUTH_OK` | JSON `AuthOK{…,hop?,helloJson?,attest?}` | S→C |
+| `0x0B` | `KEX_INIT` | 48B clientEph ‖ clientNonce | C→S |
+| `0x0C` | `KEX_REPLY` | 144B serverEph ‖ serverNonce ‖ hostKey ‖ sig | S→C |
+| `0x0D` | `ENCRYPTED` | AEAD blob wrapping a control frame | both |
+| `0x0E` | `CHAIN` | JSON `ChainHello` | C→S |
+| `0x0F` | `CHAIN_OK` | JSON `ChainHelloOK` | S→C |
 | `0x10` | `DATA` | `Seq uint64 BE` + bytes | both |
 | `0x11` | `ACK` | `AckedThrough uint64 BE` | both |
 | `0x12` | `CLOSE_DIR` | JSON `CloseDir{dir,finalOffset}` | both |
@@ -295,6 +308,13 @@ error.
   silently paper over a gap.
 - **I5 — One writer per sink.** Exactly one goroutine writes to stdout, one to
   the destination, per session. Network readers never block on sink writes.
+- **I6 — Chain composition.** A chained relay delivers exactly-once into `sshd`
+  if and only if every hop independently satisfies I1–I3. The bridge at an
+  intermediate is a straight copy between two `sessionIO` seams; it adds no
+  reordering, no deduplication and no loss of its own. I1 weakens at an
+  intermediate: ACK means the bytes are in the nested ring, not that the next
+  hop (or `sshd`) has them. An intermediate crash therefore loses ACKed bytes
+  (JR3).
 
 ### 7.2 Dedupe detail
 
@@ -736,6 +756,17 @@ server stands in for `sshd`)
 | R6 | `SWITCH` quiescing could stall if a path is silently black-holed. | `switch_timeout` (5s): on expiry abort the switch, keep the old path, and let the idle timer trigger the normal resume path. |
 | R7 | A resumed SSH session that was held for minutes may still die because `sshd`'s own `ClientAliveInterval` fired while its socket was unread. | Real, and outside our control. `hold_timeout` should be set below the deployment's `sshd` alive-interval budget; document this in `README.md` and surface `heldMs` in logs so operators can tune. |
 | R8 | Offset bookkeeping bugs are silent stream corruption — the worst failure mode for SSH. | I1–I5 as explicit invariants, the positional payload pattern in tests (§13), `-race` on all tests, and `ERR_PROTO` on any gap rather than best-effort recovery. |
+| JR1 | Attestation freshness: without J-D16 a rogue intermediate can pair a genuine `KexReply` with a fabricated `AuthOK` and harvest a signature valid against any peer sharing `authorized_keys`. | **Resolved by D16.** `TestChainAttestationReplay` / `TestNonceBindingKexEqualsAuth` are the regression tests. |
+| JR2 | Inner-hop stale-token fallback needs the outer control channel live. If both hops break at once, the inner hop cannot re-authenticate. | Phase 2 Case D: rebuild the onward chain during the hop-1 resume. Phase 1 tears the chain down. |
+| JR3 | I1 weakens at an intermediate: bytes ACKed into the nested ring are lost if the intermediate crashes. | Inherent to D11. Documented in README next to "hold is in-process". |
+| JR4 | `max_conns_per_ip` false positives — all chained traffic arrives from one peer IP. | `OriginIP` accounting plus `max_chain_conns_per_peer` (default 256). OriginIP is trusted for accounting only, never for policy. |
+| JR5 | 4 rings and ~12 goroutines per chained session; `max_sessions` overstates chained capacity ~2×. | `chain_max_sessions` (default `max_sessions/4`); nested rings on the shared `Budget`. |
+| JR6 | +2 RTT per hop at setup. | Acceptable; PERF-03 removes it on resume. `chainSetupMs` is logged per hop. |
+| JR7 | No `splice(2)` on a nested leg. | Phase 1 disables it (`rawSrc`/`rawSink` nil). Phase 2 may re-enable when the nested carrier is TCP. |
+| JR8 | Σ `hold_timeout` across hops exceeds `sshd` `ClientAliveInterval`. | Warn at handshake when the sum exceeds `sshd_alive_budget` (default 2m). |
+| JR9 | Loop / hairpin: `-J` naming this process, or two intermediates pointing at each other. | `Visited` + self-address check + `max_chain_depth`. `TestChainLoopDetected`. |
+| JR10 | `allow_relay_hops = ["*"]` turns a relay into an open chaining amplifier. | Rejected in `Validate()` unless `max_chain_depth == 1`; warned at startup. |
+| JR11 | Mid-session `TypeAuthOK` (Case C) requires quiescing a pump. | Deferred to Phase 2; a stale nested token currently tears the chain down. |
 
 Open questions to settle during implementation (not blocking M0/M1):
 1. Should `--keep-tcp` retain the TCP conn as a control plane after upgrade
