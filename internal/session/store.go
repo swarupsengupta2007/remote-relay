@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
+	"fmt"
 	"sync"
 	"time"
 
@@ -257,4 +258,91 @@ func (s *Store) ConfirmToken(id string) {
 		sess.PrevHash = [32]byte{}
 		sess.hasPrev = false
 	}
+}
+
+type SessionSnapshot struct {
+	ID           string    `json:"id"`
+	TokenHashHex string    `json:"token_hash"`
+	PrevHashHex  string    `json:"prev_hash,omitempty"`
+	HasPrev      bool      `json:"has_prev"`
+	CurrentPlain string    `json:"current_plain,omitempty"`
+	Destination  string    `json:"destination"`
+	CreatedAt    time.Time `json:"created_at"`
+	AuthMethod   string    `json:"auth_method,omitempty"`
+	AuthUser     string    `json:"auth_user,omitempty"`
+	Fingerprint  string    `json:"fingerprint,omitempty"`
+	PublicKey    []byte    `json:"public_key,omitempty"`
+}
+
+func (s *Session) Snapshot() SessionSnapshot {
+	var prevHex string
+	if s.hasPrev {
+		prevHex = hex.EncodeToString(s.PrevHash[:])
+	}
+	return SessionSnapshot{
+		ID:           s.ID,
+		TokenHashHex: hex.EncodeToString(s.TokenHash[:]),
+		PrevHashHex:  prevHex,
+		HasPrev:      s.hasPrev,
+		CurrentPlain: s.currentPlain,
+		Destination:  s.Destination,
+		CreatedAt:    s.CreatedAt,
+		AuthMethod:   s.AuthMethod,
+		AuthUser:     s.AuthUser,
+		Fingerprint:  s.Fingerprint,
+		PublicKey:    s.PublicKey,
+	}
+}
+
+func RestoreSession(snap SessionSnapshot) (*Session, error) {
+	var tokHash [32]byte
+	b, err := hex.DecodeString(snap.TokenHashHex)
+	if err != nil || len(b) != 32 {
+		return nil, fmt.Errorf("invalid token hash: %w", err)
+	}
+	copy(tokHash[:], b)
+
+	var prevHash [32]byte
+	if snap.HasPrev && snap.PrevHashHex != "" {
+		pb, err := hex.DecodeString(snap.PrevHashHex)
+		if err != nil || len(pb) != 32 {
+			return nil, fmt.Errorf("invalid prev hash: %w", err)
+		}
+		copy(prevHash[:], pb)
+	}
+
+	return &Session{
+		ID:           snap.ID,
+		TokenHash:    tokHash,
+		PrevHash:     prevHash,
+		hasPrev:      snap.HasPrev,
+		currentPlain: snap.CurrentPlain,
+		Destination:  snap.Destination,
+		CreatedAt:    snap.CreatedAt,
+		AuthMethod:   snap.AuthMethod,
+		AuthUser:     snap.AuthUser,
+		Fingerprint:  snap.Fingerprint,
+		PublicKey:    snap.PublicKey,
+	}, nil
+}
+
+func (s *Store) Snapshot() []SessionSnapshot {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]SessionSnapshot, 0, len(s.byID))
+	for _, sess := range s.byID {
+		out = append(out, sess.Snapshot())
+	}
+	return out
+}
+
+func (s *Store) Restore(sess *Session) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.byID[sess.ID] = sess
+	s.byHash[sess.TokenHash] = sess.ID
+	if sess.hasPrev {
+		s.byHash[sess.PrevHash] = sess.ID
+	}
+	delete(s.expired, sess.ID)
 }

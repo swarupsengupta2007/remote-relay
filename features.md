@@ -19,7 +19,7 @@ Each proposal includes:
 | Feature ID | Feature Name | Tier | Priority | Complexity | Target Impact |
 |:---|:---|:---:|:---:|:---:|:---|
 | [**FEAT-ROB-01**](.feat-impl/FEAT-ROB-01.md) | Sub-Second Dead-Peer Detection & Dual-Path BFD | Tier 1: Robustness | **P1** | Complete | RFC 5880 BFD engine, sub-second drop detection & instant hot-standby failover |
-| **FEAT-ROB-02** | Zero-Downtime Server Restart & Socket Handover | Tier 1: Robustness | **P1** | High | Upgrades server without dropping active SSH sessions |
+| [**FEAT-ROB-02**](.feat-impl/FEAT-ROB-02.md) | Zero-Downtime Server Restart & Socket Handover | Tier 1: Robustness | **P1** | Complete | Upgrades server without dropping active SSH sessions via SIGUSR2 & SCM_RIGHTS |
 | [**FEAT-ROB-03**](.feat-impl/FEAT-ROB-03.md) | Dual-Stack Happy Eyeballs v2 (RFC 8305) | Tier 1: Robustness | **P2** | Complete | Instant connection racing across IPv4/IPv6 networks |
 | **FEAT-ROB-04** | Tiered Disk-Spill Storage for Ring Buffers | Tier 1: Robustness | **P3** | High | Prevents buffer exhaustion during prolonged outages |
 | [**FEAT-UTL-01**](.feat-impl/FEAT-UTL-01.md) | Native OpenSSH Agent (`SSH_AUTH_SOCK`) Support | Tier 2: Utility | **P1** | Complete | Passphrase-protected keys & FIDO2/YubiKey support |
@@ -59,19 +59,19 @@ WAN links drop unpredictably due to Wi-Fi roaming, cell-tower handoffs, and inte
 
 ---
 
-### FEAT-ROB-02: Zero-Downtime Server Restarts & Socket Handover (`LISTEN_FDS` / `SCM_RIGHTS`)
+### [FEAT-ROB-02](.feat-impl/FEAT-ROB-02.md): Zero-Downtime Server Restarts & Socket Handover (`LISTEN_FDS` / `SCM_RIGHTS`)
 * **Priority**: `P1` (High)
-* **Status**: Proposed
+* **Status**: Complete ([`.feat-impl/FEAT-ROB-02.md`](.feat-impl/FEAT-ROB-02.md))
 * **Target Package**: `internal/relay`, `cmd/relay`, `internal/session`
 
 #### 1. Problem Statement
-As documented in [`README.md`](file:///root/remote-relay/README.md), session hold state and destination TCP sockets live strictly in memory inside [`Server`](file:///root/remote-relay/internal/relay/server.go). If the relay server process restarts (for software updates or configuration changes), all active destination sockets are closed immediately. When clients reconnect, they receive `ERR_UNKNOWN_SESSION` and all SSH sessions terminate.
+As documented in [`README.md`](README.md), session hold state and destination TCP sockets live strictly in memory inside [`Server`](internal/relay/server.go). If the relay server process restarts (for software updates or configuration changes), all active destination sockets are closed immediately. When clients reconnect, they receive `ERR_UNKNOWN_SESSION` and all SSH sessions terminate.
 
 #### 2. Technical Specification
 - **Socket Passing via `SCM_RIGHTS`**: Support hot re-exec on `SIGUSR2`:
   1. The existing server process listens for `SIGUSR2`.
   2. The parent process forks and executes the updated `relay server` binary.
-  3. The parent serializes active session metadata from [`Store`](file:///root/remote-relay/internal/session/store.go) (session IDs, token hashes, stream offsets, and unacknowledged ring buffers) into an IPC stream.
+  3. The parent serializes active session metadata from [`Store`](internal/session/store.go) (session IDs, token hashes, stream offsets, and unacknowledged ring buffers) into an IPC stream.
   4. The parent passes listening file descriptors (`listen_tcp`, `udp_listen`) and connected destination TCP socket FDs to the child process via Unix domain socket `SCM_RIGHTS`.
   5. The child initializes its internal state from the serialized data, resumes destination polling, and takes over incoming traffic.
   6. The parent exits cleanly without sending `BYE{ERR_SHUTDOWN}` or closing destination sockets.
@@ -79,7 +79,7 @@ As documented in [`README.md`](file:///root/remote-relay/README.md), session hol
 
 #### 3. Benefits & Verification
 - Server updates, patches, and reboots can be performed with zero disruption to long-running developer SSH sessions and tunnels.
-- **Verification**: Run continuous `rsync` over `ProxyCommand`, send `SIGUSR2` to the server process PID, and verify the file transfer completes with matching SHA-256 and zero dropped sessions.
+- **Verification**: Verified via unit tests (`internal/session`, `internal/relay`) and end-to-end multi-process `SIGUSR2` hot re-exec test (`TestServerZeroDowntimeHotRestartProcess`) transferring 256 KiB continuous data with matching SHA-256 byte-for-byte.
 
 ---
 

@@ -304,6 +304,48 @@ func (r *Ring) Slice(from uint64, max int) (uint64, []byte) {
 	return from, out
 }
 
+// Snapshot returns the current base offset, a copy of all unacknowledged bytes,
+// and the ring's maximum capacity.
+func (r *Ring) Snapshot() (base uint64, data []byte, capMax int) {
+	if r == nil {
+		return 0, nil, 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	base = r.base
+	capMax = r.capMax
+	if r.length > 0 && len(r.buf) > 0 {
+		data = make([]byte, r.length)
+		copyOut(data, r.buf, r.start, r.length)
+	}
+	return base, data, capMax
+}
+
+// RestoreRing reconstructs a Ring buffer from a previously snapshotted state.
+func RestoreRing(base uint64, data []byte, capMax int, budget *Budget) *Ring {
+	if capMax <= 0 {
+		capMax = 1
+	}
+	r := &Ring{
+		capMax: capMax,
+		budget: budget,
+		notify: make(chan struct{}, 1),
+		base:   base,
+	}
+	r.cond = sync.NewCond(&r.mu)
+	if len(data) > 0 {
+		r.buf = make([]byte, len(data))
+		copy(r.buf, data)
+		r.length = len(data)
+		r.start = 0
+		if budget != nil {
+			budget.AcquireDirect(int64(len(data)))
+			r.budgeted = len(data)
+		}
+	}
+	return r
+}
+
 func nextSize(cur, need, capMax int) int {
 	if capMax <= 0 {
 		capMax = need

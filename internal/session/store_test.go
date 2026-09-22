@@ -118,3 +118,83 @@ func TestForceResumeToken(t *testing.T) {
 		t.Fatalf("forced token should verify: %v", err)
 	}
 }
+
+func TestSessionSnapshotRestore(t *testing.T) {
+	st := NewStore(10)
+	sess, token, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess.Destination = "127.0.0.1:2222"
+	sess.AuthMethod = "ssh-publickey"
+	sess.AuthUser = "alice"
+	sess.Fingerprint = "SHA256:test"
+	sess.PublicKey = []byte("test-key")
+
+	if err := st.Add(sess); err != nil {
+		t.Fatal(err)
+	}
+
+	// Rotate token once
+	rotToken, err := st.ResumeToken(sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify both current and previous token verify
+	if err := st.VerifyToken(sess.ID, rotToken); err != nil {
+		t.Fatalf("rotToken should verify: %v", err)
+	}
+	if err := st.VerifyToken(sess.ID, token); err != nil {
+		t.Fatalf("old token should verify: %v", err)
+	}
+
+	// Snapshot all sessions
+	snaps := st.Snapshot()
+	if len(snaps) != 1 {
+		t.Fatalf("expected 1 snap, got %d", len(snaps))
+	}
+	snap := snaps[0]
+	if snap.ID != sess.ID {
+		t.Fatalf("snap ID: got %s want %s", snap.ID, sess.ID)
+	}
+	if snap.Destination != "127.0.0.1:2222" {
+		t.Fatalf("snap dest: got %s want 127.0.0.1:2222", snap.Destination)
+	}
+	if !snap.HasPrev {
+		t.Fatal("expected snap.HasPrev to be true")
+	}
+
+	// Restore into a brand new store
+	st2 := NewStore(10)
+	restoredSess, err := RestoreSession(snap)
+	if err != nil {
+		t.Fatalf("RestoreSession failed: %v", err)
+	}
+	st2.Restore(restoredSess)
+
+	if st2.Len() != 1 {
+		t.Fatalf("st2 len: got %d want 1", st2.Len())
+	}
+	// Verify both current and previous token still verify in restored store!
+	if err := st2.VerifyToken(sess.ID, rotToken); err != nil {
+		t.Fatalf("restored rotToken verify: %v", err)
+	}
+	if err := st2.VerifyToken(sess.ID, token); err != nil {
+		t.Fatalf("restored old token verify: %v", err)
+	}
+	// Verify metadata preserved
+	s2 := st2.Get(sess.ID)
+	if s2.Destination != "127.0.0.1:2222" || s2.AuthUser != "alice" || string(s2.PublicKey) != "test-key" {
+		t.Fatalf("metadata mismatch: %+v", s2)
+	}
+
+	// Confirm token drops previous
+	st2.ConfirmToken(sess.ID)
+	if err := st2.VerifyToken(sess.ID, token); err == nil {
+		t.Fatal("old token should fail after confirm")
+	}
+	if err := st2.VerifyToken(sess.ID, rotToken); err != nil {
+		t.Fatalf("rotToken should still verify after confirm: %v", err)
+	}
+}

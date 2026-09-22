@@ -238,3 +238,66 @@ func TestRingConcurrentAppendAdvance(t *testing.T) {
 		t.Fatalf("base=%d", r.Base())
 	}
 }
+
+func TestRingSnapshotRestore(t *testing.T) {
+	budget := NewBudget(1024)
+	r := NewRing(512, budget)
+	ctx := context.Background()
+
+	// Append initial data
+	if err := r.Append(ctx, []byte("0123456789")); err != nil {
+		t.Fatal(err)
+	}
+	// Advance past first 4 bytes
+	r.AdvanceTo(4)
+
+	// Append more data
+	if err := r.Append(ctx, []byte("abcdefghij")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Snapshot
+	base, data, capMax := r.Snapshot()
+	if base != 4 {
+		t.Fatalf("expected base 4, got %d", base)
+	}
+	expectedData := []byte("456789abcdefghij")
+	if !bytes.Equal(data, expectedData) {
+		t.Fatalf("expected %q, got %q", expectedData, data)
+	}
+	if capMax != 512 {
+		t.Fatalf("expected capMax 512, got %d", capMax)
+	}
+
+	// Restore into a new ring
+	restoredBudget := NewBudget(1024)
+	r2 := RestoreRing(base, data, capMax, restoredBudget)
+
+	if r2.Base() != 4 {
+		t.Fatalf("r2 base: got %d want 4", r2.Base())
+	}
+	if r2.End() != 4+uint64(len(expectedData)) {
+		t.Fatalf("r2 end: got %d want %d", r2.End(), 4+len(expectedData))
+	}
+	if r2.Len() != len(expectedData) {
+		t.Fatalf("r2 len: got %d want %d", r2.Len(), len(expectedData))
+	}
+	if restoredBudget.Used() != int64(len(expectedData)) {
+		t.Fatalf("restored budget used: got %d want %d", restoredBudget.Used(), len(expectedData))
+	}
+
+	// Verify slicing from restored ring
+	_, sliced := r2.Slice(4, len(expectedData))
+	if !bytes.Equal(sliced, expectedData) {
+		t.Fatalf("r2 slice: got %q want %q", sliced, expectedData)
+	}
+
+	// Verify advancing on restored ring releases budget
+	r2.AdvanceTo(10)
+	if r2.Base() != 10 {
+		t.Fatalf("r2 base after advance: got %d want 10", r2.Base())
+	}
+	if restoredBudget.Used() != int64(len(expectedData)-6) {
+		t.Fatalf("budget after advance: got %d want %d", restoredBudget.Used(), len(expectedData)-6)
+	}
+}

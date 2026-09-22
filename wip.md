@@ -507,4 +507,33 @@ Landed remaining FEAT-UTL-05 Phase 2 in `internal/relay`:
 - Nested `close()` drains the send log before cancel so JR3 ACKs are not cut off at teardown.
 - Nested splice still off. Nested HA standby loop not started (AllowHA is on `nestedClientConfig` only). Phase 3 untouched.
 
+## 2026-09-23 (Antigravity)
+
+Implemented **FEAT-ROB-02**: Zero-Downtime Server Restarts & Socket Handover (`LISTEN_FDS` / `SCM_RIGHTS`).
+
+### 1. In-Memory Session Snapshot & Restoration
+- `internal/session/budget.go`: Added `(b *Budget) AcquireDirect(n int64)` to account for restored buffer sizes without blocking on snapshot loading.
+- `internal/session/ringbuf.go`: Added `Snapshot()` and `RestoreRing(base, data, capMax, budget)` to snapshot unacknowledged bytes and restore exact sequence numbers without allocation churn.
+- `internal/session/store.go`: Added `SessionSnapshot`, `(s *Session) Snapshot()`, `RestoreSession(snap)`, `(s *Store) Snapshot()`, and `(s *Store) Restore(sess)` to preserve session token hashes, previous hashes, user identities, and public keys.
+- Unit tested in `internal/session/ringbuf_test.go` and `internal/session/store_test.go`.
+
+### 2. Ancillary Data Socket Handover (`SCM_RIGHTS`)
+- `internal/relay/handover.go`, `handover_unix.go`, `handover_windows.go`: Implemented chunked length-prefixed protocol transmitting `HandoverState` JSON payload alongside file descriptors via `syscall.UnixRights` and `syscall.ParseSocketControlMessage`.
+- Handles platform-specific message bounds, chunking descriptors into safe batches.
+
+### 3. Server Lifecycle, Signal Handling, and Systemd Adoption
+- `internal/relay/server.go`: Added socket adoption logic during startup (`adoptHandover` and `adoptSystemd`).
+- `internal/relay/server_unix.go`:
+  - `dupSocket()`: Uses `sc.Control(syscall.Dup)` to duplicate file descriptors without switching underlying sockets to blocking mode (avoiding Go netpoller stalls on `ln.Close()`).
+  - `HandoverTo()`: Serializes active session instances, drops client carrier connections (prompting immediate `RESUME`), disarms destination TCP socket teardown (`l.disarmDest()`), transfers FDs over Unix domain socket, and awaits child ACK.
+  - `hotRestartPlatform()`: Spawns child process on `SIGUSR2` with `RELAY_HANDOVER_FD=3` pointing to socketpair child end.
+  - Native systemd socket activation adopting FD 3 (TCP listener) and FD 4 (UDP packet conn) when `LISTEN_PID == os.Getpid()`.
+
+### 4. Verification
+- `internal/relay/systemd_test.go`: Verified PID mismatch rejection and successful socket activation adoption.
+- `internal/relay/handover_test.go`: Verified chunked `SCM_RIGHTS` IPC transmission of state and multiple file descriptors.
+- `internal/relay/hot_restart_test.go`:
+  - `TestServerHandoverDirect`: Verified in-memory listener and session handover across server instances with immediate resume and data continuity.
+  - `TestServerZeroDowntimeHotRestartProcess`: End-to-end multi-process re-exec on `SIGUSR2` transferring 256 KiB continuous data through echo server with zero byte loss and byte-for-byte SHA-256 match.
+
 

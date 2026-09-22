@@ -39,6 +39,18 @@ func (s *Server) decIPConn(ip string) {
 	}
 }
 
+func (s *Server) incIPSess(ip string) {
+	if ip == "" {
+		return
+	}
+	s.ipMu.Lock()
+	defer s.ipMu.Unlock()
+	if s.ipSess == nil {
+		s.ipSess = make(map[string]int)
+	}
+	s.ipSess[ip]++
+}
+
 func (s *Server) decIPSess(ip string) {
 	s.ipMu.Lock()
 	defer s.ipMu.Unlock()

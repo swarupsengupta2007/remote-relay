@@ -94,6 +94,12 @@ func NewUDPMux(conn net.PacketConn) *UDPMux {
 
 func (m *UDPMux) QUIC() net.PacketConn { return m.quic }
 func (m *UDPMux) KCP() net.PacketConn  { return m.kcp }
+func (m *UDPMux) PacketConn() net.PacketConn {
+	if m == nil {
+		return nil
+	}
+	return m.conn
+}
 
 func (m *UDPMux) LocalAddr() net.Addr {
 	if m == nil || m.conn == nil {

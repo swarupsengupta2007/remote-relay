@@ -7,11 +7,13 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -86,6 +88,12 @@ type Server struct {
 
 	histMu   sync.Mutex
 	pathHist []pathInfo
+
+	restarting      atomic.Bool
+	restartingDone  chan struct{}
+	noExitOnRestart bool
+	reexecPath      string
+	reexecArgs      []string
 }
 
 func NewServer(cfg config.Server, log *slog.Logger) *Server {
@@ -128,8 +136,9 @@ func NewServer(cfg config.Server, log *slog.Logger) *Server {
 		probeBySess: make(map[string][16]byte),
 		ipConns:     make(map[string]int),
 		ipSess:      make(map[string]int),
-		runCtx:      runCtx,
-		runCancel:   runCancel,
+		runCtx:         runCtx,
+		runCancel:      runCancel,
+		restartingDone: make(chan struct{}),
 	}
 }
 
@@ -164,7 +173,311 @@ func (s *Server) Close() error {
 	return nil
 }
 
+func (s *Server) SetNoExitOnRestart(v bool) {
+	s.noExitOnRestart = v
+}
+
+func (s *Server) SetReexec(path string, args []string) {
+	s.reexecPath = path
+	s.reexecArgs = args
+}
+
+func (s *Server) HotRestart() error {
+	return s.hotRestartPlatform()
+}
+
+func systemdListeners() (net.Listener, net.PacketConn, error) {
+	pidStr := os.Getenv("LISTEN_PID")
+	if pidStr == "" || pidStr != strconv.Itoa(os.Getpid()) {
+		return nil, nil, nil
+	}
+	fdsStr := os.Getenv("LISTEN_FDS")
+	if fdsStr == "" {
+		return nil, nil, nil
+	}
+	nfds, err := strconv.Atoi(fdsStr)
+	if err != nil || nfds < 1 {
+		return nil, nil, nil
+	}
+
+	f3 := os.NewFile(3, "systemd-listen-tcp")
+	ln, err := net.FileListener(f3)
+	_ = f3.Close()
+	if err != nil {
+		return nil, nil, fmt.Errorf("systemd listen tcp (fd 3): %w", err)
+	}
+
+	var pc net.PacketConn
+	if nfds >= 2 {
+		f4 := os.NewFile(4, "systemd-listen-udp")
+		pc, err = net.FilePacketConn(f4)
+		_ = f4.Close()
+		if err != nil {
+			_ = ln.Close()
+			return nil, nil, fmt.Errorf("systemd listen udp (fd 4): %w", err)
+		}
+	}
+
+	_ = os.Unsetenv("LISTEN_PID")
+	_ = os.Unsetenv("LISTEN_FDS")
+	_ = os.Unsetenv("LISTEN_FDNAMES")
+
+	return ln, pc, nil
+}
+
+func (s *Server) adoptSystemd() (bool, error) {
+	ln, pc, err := systemdListeners()
+	if err != nil {
+		return false, err
+	}
+	if ln == nil && pc == nil {
+		return false, nil
+	}
+	if ln != nil {
+		s.mu.Lock()
+		s.ln = ln
+		s.mu.Unlock()
+		s.log.Info("systemd socket activation: adopted tcp listener", "addr", ln.Addr().String())
+	}
+	if pc != nil {
+		mux := transport.NewUDPMux(pc)
+		mux.SetProbeHandler(s.handleProbe)
+		s.udpMu.Lock()
+		s.udp = &udpEndpoint{mux: mux}
+		s.udpMu.Unlock()
+		s.log.Info("systemd socket activation: adopted udp packetconn", "addr", pc.LocalAddr().String())
+		s.startQUICLocked()
+		s.startKCPLocked()
+	}
+	return true, nil
+}
+
+func (s *Server) adoptHandover() (bool, error) {
+	handoverEnv := os.Getenv("RELAY_HANDOVER_FD")
+	if handoverEnv == "" {
+		return false, nil
+	}
+	fd, err := strconv.Atoi(handoverEnv)
+	if err != nil {
+		return false, fmt.Errorf("invalid RELAY_HANDOVER_FD %q: %w", handoverEnv, err)
+	}
+
+	f := os.NewFile(uintptr(fd), "relay-handover")
+	fc, err := net.FileConn(f)
+	_ = f.Close()
+	if err != nil {
+		return false, fmt.Errorf("wrap handover fd %d: %w", fd, err)
+	}
+	unixConn, ok := fc.(*net.UnixConn)
+	if !ok {
+		_ = fc.Close()
+		return false, fmt.Errorf("handover fd %d is not a unix domain socket", fd)
+	}
+	defer unixConn.Close()
+
+	state, files, err := ReceiveHandover(unixConn)
+	if err != nil {
+		return false, fmt.Errorf("receive handover state: %w", err)
+	}
+
+	nextFD := 0
+	if state.HasListenTCP {
+		if nextFD >= len(files) {
+			return false, errors.New("missing TCP listener FD in handover")
+		}
+		lnFile := files[nextFD]
+		nextFD++
+		ln, err := net.FileListener(lnFile)
+		_ = lnFile.Close()
+		if err != nil {
+			return false, fmt.Errorf("adopt TCP listener from handover: %w", err)
+		}
+		s.mu.Lock()
+		s.ln = ln
+		s.mu.Unlock()
+		s.log.Info("handover: adopted tcp listener", "addr", ln.Addr().String())
+	}
+
+	if state.HasListenUDP {
+		if nextFD >= len(files) {
+			return false, errors.New("missing UDP listener FD in handover")
+		}
+		udpFile := files[nextFD]
+		nextFD++
+		pc, err := net.FilePacketConn(udpFile)
+		_ = udpFile.Close()
+		if err != nil {
+			return false, fmt.Errorf("adopt UDP listener from handover: %w", err)
+		}
+		mux := transport.NewUDPMux(pc)
+		mux.SetProbeHandler(s.handleProbe)
+		s.udpMu.Lock()
+		s.udp = &udpEndpoint{mux: mux}
+		s.udpMu.Unlock()
+		s.log.Info("handover: adopted udp listener", "addr", pc.LocalAddr().String())
+		s.startQUICLocked()
+		s.startKCPLocked()
+	}
+
+	for _, hSess := range state.Sessions {
+		sess, err := session.RestoreSession(hSess.Session)
+		if err != nil {
+			s.log.Error("failed to restore session metadata", "sessionId", hSess.Session.ID, "err", err)
+			continue
+		}
+		s.store.Restore(sess)
+
+		var dtcp *net.TCPConn
+		if hSess.HasDestFD {
+			if nextFD >= len(files) {
+				s.log.Error("missing dest FD for session", "sessionId", hSess.Session.ID)
+				continue
+			}
+			destFile := files[nextFD]
+			nextFD++
+			conn, err := net.FileConn(destFile)
+			_ = destFile.Close()
+			if err != nil {
+				s.log.Error("failed to restore dest TCP socket", "sessionId", hSess.Session.ID, "err", err)
+				continue
+			}
+			var ok bool
+			dtcp, ok = conn.(*net.TCPConn)
+			if !ok {
+				_ = conn.Close()
+				s.log.Error("restored dest socket is not TCP", "sessionId", hSess.Session.ID)
+				continue
+			}
+		}
+
+		sendLog := session.RestoreRing(hSess.SendLogBase, hSess.SendLogData, hSess.SendLogCap, s.budget)
+		window := s.cfg.SendWindow
+		if window <= 0 {
+			window = 64
+		}
+		log := logging.WithSession(s.log, hSess.Session.ID)
+		var closeWrite func() error
+		var closeSrc func() error
+		if dtcp != nil {
+			closeWrite = dtcp.CloseWrite
+			closeSrc = func() error { return dtcp.Close() }
+		}
+		p := newPump(s.sessionContext(), sessionIO{
+			src:        dtcp,
+			sink:       dtcp,
+			rawSrc:     dtcp,
+			rawSink:    dtcp,
+			closeWrite: closeWrite,
+			closeSrc:   closeSrc,
+			outDir:     proto.DirDown,
+			inDir:      proto.DirUp,
+		}, pumpConfig{
+			chunk:         s.cfg.DataChunkBytes,
+			window:        window,
+			buffer:        hSess.SendLogCap,
+			keepalive:     s.cfg.KeepaliveInterval.Duration(),
+			idle:          s.cfg.IdleTimeout.Duration(),
+			switchTimeout: s.cfg.SwitchTimeout.Duration(),
+			heartbeat:     s.cfg.HeartbeatInterval.Duration(),
+			deadThreshold: s.cfg.DeadPeerThreshold,
+			log:           log,
+			splice:        s.cfg.Splice,
+		}, sendLog)
+
+		p.delivered.Store(hSess.UpAcked)
+		p.expected.Store(hSess.UpAcked)
+		if hSess.UpClosed {
+			p.inGotClose.Store(true)
+			p.inFinal.Store(hSess.UpAcked)
+		}
+		if hSess.DownClosed {
+			p.outEOF.Store(true)
+			p.outFinal.Store(hSess.DownNext)
+		}
+
+		holdDuration := s.cfg.HoldTimeout.Duration()
+		if hSess.RemainingHoldMs > 0 {
+			holdDuration = time.Duration(hSess.RemainingHoldMs) * time.Millisecond
+		}
+
+		l := &live{
+			pump:           p,
+			id:             hSess.Session.ID,
+			srv:            s,
+			store:          s.store,
+			cfg:            s.cfg,
+			window:         window,
+			holdTimeout:    holdDuration,
+			dest:           dtcp,
+			log:            log,
+			clientIP:       hSess.ClientIP,
+			heldAt:         time.Now(),
+			deadCh:         make(chan struct{}),
+			attachCh:       make(chan attachReq, 4),
+			standbyPromote: make(chan struct{}, 1),
+		}
+		l.onPeerFrame = func() { l.store.ConfirmToken(l.id) }
+
+		if hSess.ClientIP != "" {
+			s.incIPSess(hSess.ClientIP)
+		}
+
+		s.livesMu.Lock()
+		s.lives[l.id] = l
+		s.livesMu.Unlock()
+
+		go func(sessID string, liveSession *live) {
+			defer func() {
+				s.livesMu.Lock()
+				delete(s.lives, sessID)
+				s.livesMu.Unlock()
+				liveSession.cleanup(false)
+			}()
+			liveSession.run(s.sessionContext(), nil)
+		}(hSess.Session.ID, l)
+
+		s.log.Info("handover: restored active session", "sessionId", hSess.Session.ID)
+	}
+
+	for i := nextFD; i < len(files); i++ {
+		_ = files[i].Close()
+	}
+
+	if _, err := unixConn.Write([]byte("OK\n")); err != nil {
+		s.log.Error("failed to write handover ack to parent", "err", err)
+	}
+	_ = os.Unsetenv("RELAY_HANDOVER_FD")
+	return true, nil
+}
+
+func (s *Server) tryAdoptSockets() bool {
+	if ok, err := s.adoptHandover(); ok {
+		return true
+	} else if err != nil {
+		s.log.Error("handover adoption failed", "err", err)
+	}
+
+	if ok, err := s.adoptSystemd(); ok {
+		return true
+	} else if err != nil {
+		s.log.Error("systemd adoption failed", "err", err)
+	}
+
+	return false
+}
+
 func (s *Server) Listen() error {
+	s.mu.Lock()
+	if s.ln != nil {
+		s.mu.Unlock()
+		return nil
+	}
+	s.mu.Unlock()
+
+	if s.tryAdoptSockets() {
+		return nil
+	}
+
 	ln, err := transport.ListenTCP(s.cfg.ListenTCP)
 	if err != nil {
 		return err
@@ -184,6 +497,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	s.mu.Lock()
 	s.serveCtx = ctx
 	s.mu.Unlock()
+	s.setupHotRestartSignal(ctx)
 	if config.AllowAll(s.cfg.AllowDestinations) {
 		s.log.Warn("allow_destinations includes \"*\": this process is an open TCP proxy")
 	}
@@ -218,6 +532,10 @@ func (s *Server) Serve(ctx context.Context) error {
 	for {
 		c, err := ln.Accept()
 		if err != nil {
+			if s.restarting.Load() {
+				<-s.restartingDone
+				return nil
+			}
 			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) || s.shutting() {
 				shutCtx, cancel := context.WithTimeout(context.Background(), shutdownDrain)
 				_ = s.Shutdown(shutCtx)
@@ -996,14 +1314,33 @@ func (l *live) takeStandbyForPromotion() (transport.Conn, *bfd.Session, []proto.
 	return conn, sess, prefetched, doneCh, true
 }
 
+func (l *live) disarmDest() {
+	l.mu.Lock()
+	dest := l.dest
+	l.dest = nil
+	l.mu.Unlock()
+	if dest != nil {
+		_ = dest.Close()
+	}
+	if l.pump != nil {
+		l.pump.sessCancel()
+	}
+}
+
 func (l *live) run(ctx context.Context, first transport.Conn) {
-	first = unwrapConn(first)
-	l.startIO()
-	l.notePath(first)
-	err := l.serveConn(l.sessCtx, first, 0)
-	if l.releaseHelloTCP != nil {
-		l.releaseHelloTCP()
-		l.releaseHelloTCP = nil
+	var err error
+	if first != nil {
+		first = unwrapConn(first)
+		l.startIO()
+		l.notePath(first)
+		err = l.serveConn(l.sessCtx, first, 0)
+		if l.releaseHelloTCP != nil {
+			l.releaseHelloTCP()
+			l.releaseHelloTCP = nil
+		}
+	} else {
+		l.startIO()
+		err = errors.New("carrier dropped for handover")
 	}
 	for reconnectable(err) && ctx.Err() == nil && l.sessionErr() == nil {
 		if promotedConn, bfdSess, prefetched, doneCh, ok := l.takeStandbyForPromotion(); ok {
@@ -1072,7 +1409,9 @@ func (l *live) holdWait(ctx context.Context) (attachReq, bool) {
 		return attachReq{}, false
 	}
 	l.mu.Lock()
-	l.heldAt = time.Now()
+	if l.heldAt.IsZero() {
+		l.heldAt = time.Now()
+	}
 	l.mu.Unlock()
 	l.sendLog.SetSoftLimit(0)
 	l.log.Info("session held", "heldMs", 0)

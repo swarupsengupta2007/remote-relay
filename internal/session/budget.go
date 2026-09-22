@@ -74,6 +74,15 @@ func (b *Budget) TryAcquire(n int64) int64 {
 	return n
 }
 
+func (b *Budget) AcquireDirect(n int64) {
+	if b == nil || n <= 0 {
+		return
+	}
+	b.mu.Lock()
+	b.used += n
+	b.mu.Unlock()
+}
+
 func (b *Budget) Release(n int64) {
 	if b == nil || n <= 0 {
 		return

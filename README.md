@@ -31,6 +31,7 @@ See **Authentication** and **Security** below.
 | FEAT-PERF-01 Linux Kernel Zero-Copy Stream Splicing (`splice(2)`) | yes |
 | FEAT-PERF-02 Adaptive KCP Dynamic ARQ & Congestion Tuning | yes |
 | FEAT-UTL-05 Multi-Hop Jumphost Chaining (`-J`) | yes (Phase 1: TCP hops; inner stale-token re-auth deferred) |
+| FEAT-ROB-02 Zero-Downtime Server Restarts & Socket Handover (`SIGUSR2` / `SCM_RIGHTS` / `LISTEN_FDS`) | yes |
 | Single-Session KCP Repeated-Kills Soak & Netns Harness | yes |
 
 ### Netem & BFD Benchmarks (dual-netns veth)
@@ -282,18 +283,30 @@ Configuration follows strict precedence: **CLI flag > TOML config > `~/.ssh` def
 socket and buffers after a link break. The client retry budget
 (`reconnect_max_elapsed`, default 5m) should match it.
 
-**Hold is in-process.** A server process exit (including a restart) drops
-every session: dest sockets are closed, tokens are gone, and a client that
+**Zero-Downtime Restarts (`SIGUSR2` & `SCM_RIGHTS`):** Under `SIGUSR2`, the server
+performs a zero-downtime hot re-exec without dropping active SSH sessions. The parent
+process forks/executes the updated binary, serializes active session state (`Store`
+tokens/keys, stream offsets, and unacknowledged `Ring` sendLog buffers), and passes
+listening FDs (`listen_tcp`, `udp_listen`) and connected destination TCP sockets (`l.dest`)
+to the child process via Unix domain socket ancillary data (`SCM_RIGHTS`). Active client
+carriers drop cleanly without sending `BYE`, prompting clients to trigger fast `RESUME`
+against the child. Destination TCP sockets remain open and untouched, allowing sessions
+to continue transparently with zero byte loss.
+
+Systemd socket activation (`LISTEN_FDS`) is also supported natively when `LISTEN_PID == os.Getpid()`.
+
+**Cold Process Exit:** A cold server process exit (e.g. `SIGINT`/`SIGTERM` or power cut)
+drops every session: dest sockets are closed, tokens are gone, and a client that
 reconnects gets `ERR_UNKNOWN_SESSION`. Clients will try to resume if the
 process comes back within `hold_timeout`, but they cannot; start a new SSH
-session. "Clean restart" means no leaked goroutines or sockets, not that
-sessions survive process death.
+session. "Clean restart" via `SIGINT`/`SIGTERM` means no leaked goroutines or sockets,
+not that sessions survive cold process termination.
 
 On a **chained** session this is sharper (JR3): an intermediate ACKs hop-1 bytes
 once they are in its nested ring, not once the next hop (or `sshd`) has them.
-If that intermediate process exits, ACKed bytes are lost and the client sees
-`ERR_UNKNOWN_SESSION`. Same operational rule as a direct hop — restart `ssh` —
-plus the extra exposure that the crash is of a hop the originator is not
+If that intermediate process exits without a `SIGUSR2` handover, ACKed bytes are lost
+and the client sees `ERR_UNKNOWN_SESSION`. Same operational rule as a direct hop —
+restart `ssh` — plus the extra exposure that the crash is of a hop the originator is not
 directly talking to.
 
 ### `hold_timeout` vs `sshd` `ClientAliveInterval` (R7)
