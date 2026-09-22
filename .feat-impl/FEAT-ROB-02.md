@@ -123,3 +123,17 @@ The IPC stream transmits a JSON header followed by file descriptors passed via `
 2. **Integration / E2E Tests**:
    - Continuous bidirectional data transfer across server hot restart.
    - Send `SIGUSR2` during active session; verify child takes over, destination TCP connection is preserved, client resumes cleanly, and SHA-256 of transferred payload matches byte-for-byte.
+3. **Real-World Live Integration Test (`scripts/test_live_hot_restart.py`)**:
+   - Verified against a real `/usr/sbin/sshd` server daemon, real `/tmp/relay-live` binary, and real `/usr/bin/ssh` client with `ProxyCommand`.
+   - **Test 1 (Live Interactive Shell Continuity)**:
+     - Opened interactive OpenSSH shell through relay server on port 7443.
+     - Executed pre-restart commands.
+     - Sent `kill -SIGUSR2 <parent_pid>`.
+     - Parent transferred listeners & destination TCP socket connected to sshd via `SCM_RIGHTS` IPC and exited with code 0.
+     - Executed post-restart commands (`uname -s`, token echo) on the **same active SSH shell** without disconnection or reconnection.
+   - **Test 2 (16 MiB In-Flight Streaming Transfer)**:
+     - Streamed a 16 MiB pseudo-random binary payload across `ProxyCommand`.
+     - Triggered `SIGUSR2` mid-transfer. Child adopted listeners and preserved destination TCP socket.
+     - Transfer completed in 0.86s (18.57 MiB/s) with returncode 0 and SHA-256 byte-exact match (`78c0664962b1ff4ce0880d435fe9a3acb6ebf64bdbbf9ab8c7c95b4fcfdd6b5f`).
+   - **Test 3 (Handover Protocol Log Verification)**:
+     - Verified IPC handshake logs: `received signal for zero-downtime hot restart`, `spawned child process for hot restart`, `handover: adopted tcp listener`, `handover complete and acknowledged by child`, `exiting parent process cleanly after hot restart`, and `session resumed`.
