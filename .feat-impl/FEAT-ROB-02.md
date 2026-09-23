@@ -137,3 +137,11 @@ The IPC stream transmits a JSON header followed by file descriptors passed via `
      - Transfer completed in 0.86s (18.57 MiB/s) with returncode 0 and SHA-256 byte-exact match (`78c0664962b1ff4ce0880d435fe9a3acb6ebf64bdbbf9ab8c7c95b4fcfdd6b5f`).
    - **Test 3 (Handover Protocol Log Verification)**:
      - Verified IPC handshake logs: `received signal for zero-downtime hot restart`, `spawned child process for hot restart`, `handover: adopted tcp listener`, `handover complete and acknowledged by child`, `exiting parent process cleanly after hot restart`, and `session resumed`.
+4. **Live SCP Stalled Connection & Hot Upgrade (`scripts/test_live_scp_stall_upgrade.py`)**:
+   - Client connected over TCP; initiated 16 MiB transfer using real OpenSSH `scp` through `ProxyCommand`.
+   - Mid-transfer, connection stalled via packet drop injection on loopback port 7443.
+   - Client send window filled, causing client to buffer incoming data chunks into its `sendLog` ring buffer backlog.
+   - Hot upgrade triggered via `SIGUSR2` while client was stalled and buffering.
+   - Parent server transferred listening socket and destination TCP socket connected to `sshd` via `SCM_RIGHTS`, exiting 0.
+   - Child adopted sockets; network un-stalled.
+   - Client reconnected via `RESUME`, flushed its entire buffered backlog to child, and completed `scp` with return code 0 and exact SHA-256 match.
