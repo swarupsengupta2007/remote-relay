@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -138,6 +139,14 @@ type Client struct {
 	Jumphost        []string `toml:"jumphost"`
 	SSHDAliveBudget Duration `toml:"sshd_alive_budget"`
 
+	// FEAT-UTL-02 terminal reconnection HUD and desktop notifications.
+	HUD                 bool     `toml:"hud"`
+	NoHUD               bool     `toml:"no_hud"`
+	NotificationTimeout Duration `toml:"notification_timeout"`
+
+	HUDWriter     io.Writer `toml:"-"`
+	HUDIsTerminal *bool     `toml:"-"`
+
 	TCPInterface string `toml:"-"`
 	UDPInterface string `toml:"-"`
 	TCPSourceIP  string `toml:"-"`
@@ -230,6 +239,9 @@ func DefaultClient() Client {
 		Splice:                defaultSplice(),
 		AdaptiveKCP:           true,
 		SSHDAliveBudget:       Duration(2 * time.Minute),
+		HUD:                   true,
+		NoHUD:                 false,
+		NotificationTimeout:   Duration(5 * time.Second),
 	}
 }
 
@@ -271,6 +283,10 @@ type ClientOptions struct {
 	SourceIPs             []string
 	Jumphost              []string
 	JumphostSet           bool
+	HUD                   *bool
+	NotificationTimeout   time.Duration
+	HUDWriter             io.Writer
+	HUDIsTerminal         *bool
 }
 
 func LoadServer(opts ServerOptions) (Server, error) {
@@ -399,6 +415,21 @@ func LoadClient(opts ClientOptions) (Client, error) {
 	}
 	if len(opts.SourceIPs) > 0 {
 		cfg.SourceIPs = opts.SourceIPs
+	}
+	if opts.HUD != nil {
+		cfg.HUD = *opts.HUD
+	}
+	if cfg.NoHUD {
+		cfg.HUD = false
+	}
+	if opts.NotificationTimeout > 0 {
+		cfg.NotificationTimeout = Duration(opts.NotificationTimeout)
+	}
+	if opts.HUDWriter != nil {
+		cfg.HUDWriter = opts.HUDWriter
+	}
+	if opts.HUDIsTerminal != nil {
+		cfg.HUDIsTerminal = opts.HUDIsTerminal
 	}
 	if err := cfg.Validate(); err != nil {
 		return Client{}, err

@@ -48,7 +48,7 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `usage: relay <server|client|version> [flags]
 
   relay server [--config PATH] [--listen HOST:PORT] [--host-key PATH] [--splice|--no-splice] [--adaptive-kcp|--no-adaptive-kcp] [--log-level LVL]
-  relay client --server HOST:PORT [-J|--jumphost|--chain HOST:PORT] [--dest HOST:PORT] [--tcp|--kcp] [--allow-ha] [--splice|--no-splice] [--adaptive-kcp|--no-adaptive-kcp] [--interface NAME[@proto]] [--source-ip IP[@proto]] [--auth-sock PATH] [--server-fingerprint FP] [--known-hosts PATH] [--config PATH] [--log-level LVL] [%%h %%p]
+  relay client --server HOST:PORT [-J|--jumphost|--chain HOST:PORT] [--dest HOST:PORT] [--tcp|--kcp] [--allow-ha] [--splice|--no-splice] [--adaptive-kcp|--no-adaptive-kcp] [--hud|--no-hud] [--interface NAME[@proto]] [--source-ip IP[@proto]] [--auth-sock PATH] [--server-fingerprint FP] [--known-hosts PATH] [--config PATH] [--log-level LVL] [%%h %%p]
   relay version
 `)
 }
@@ -166,6 +166,8 @@ func runClient(args []string) int {
 	noSplice := fs.Bool("no-splice", false, "disable Linux kernel zero-copy stream splicing")
 	adaptiveKCP := fs.Bool("adaptive-kcp", false, "enable dynamic adaptive ARQ and congestion tuning for KCP")
 	noAdaptiveKCP := fs.Bool("no-adaptive-kcp", false, "disable dynamic adaptive ARQ and congestion tuning for KCP")
+	hud := fs.Bool("hud", false, "enable terminal reconnection HUD on interactive stderr")
+	noHUD := fs.Bool("no-hud", false, "disable terminal reconnection HUD")
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return 0
@@ -189,6 +191,15 @@ func runClient(args []string) int {
 	} else if *adaptiveKCP {
 		t := true
 		adaptiveKCPOpt = &t
+	}
+
+	var hudOpt *bool
+	if *noHUD {
+		f := false
+		hudOpt = &f
+	} else if *hud {
+		t := true
+		hudOpt = &t
 	}
 
 	destSet := false
@@ -255,6 +266,7 @@ func runClient(args []string) int {
 		SourceIPs:             sourceIPs,
 		Jumphost:              jumphost,
 		JumphostSet:           jumphostSet,
+		HUD:                   hudOpt,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "relay client: %v\n", err)

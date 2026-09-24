@@ -536,4 +536,33 @@ Implemented **FEAT-ROB-02**: Zero-Downtime Server Restarts & Socket Handover (`L
   - `TestServerHandoverDirect`: Verified in-memory listener and session handover across server instances with immediate resume and data continuity.
   - `TestServerZeroDowntimeHotRestartProcess`: End-to-end multi-process re-exec on `SIGUSR2` transferring 256 KiB continuous data through echo server with zero byte loss and byte-for-byte SHA-256 match.
 
+---
+
+## 2026-09-25 (Antigravity)
+
+Implemented **FEAT-UTL-02**: Terminal Reconnection HUD & Desktop Notifications.
+
+### 1. In-Place Terminal Reconnection HUD (`internal/relay/hud.go`)
+- In-place single-line terminal status updates rendered exclusively to `stderr` using `\r\033[K`, preserving 100% byte isolation for `stdout`.
+- Dynamic diagnostics showing attempt counters, transport protocols, elapsed duration, and unacknowledged backlog bytes (`formatBytes`: `34.2 KiB buffered`).
+- Universal terminal desktop notifications using `OSC 9` (`\033]9;<Title>: <Msg>\007`) and `OSC 777` (`\033]777;notify;<Title>;<Msg>\007`) for prolonged outages (>5s), with single-notification debouncing and restoration alerts.
+- Terminal width detection via `term.GetSize` and non-printing ANSI-aware truncation to prevent line-wrapping artifacts in narrow terminals.
+- Full `NO_COLOR` standard compliance and subtle ANSI styling (`\033[33m`, `\033[32m`, `\033[31m`).
+
+### 2. Client & CLI Integration
+- `internal/config/config.go`: Added `HUD`, `NoHUD`, `NotificationTimeout`, `HUDWriter`, `HUDIsTerminal` options to `Client` and `ClientOptions`.
+- `cmd/relay/main.go`: Added `--hud` and `--no-hud` CLI flags to `relay client`.
+- `internal/relay/client.go`: Hooked HUD into initial connection retries and reconnection backoff loop.
+
+### 3. Verification & Sad Path Testing (`internal/relay/hud_test.go`)
+- 17 comprehensive unit & integration tests covering happy paths, quick resumes, backlog reporting, and extensive sad paths:
+  - Non-TTY output (`IsTerminal=false`) completely silent.
+  - Disabled config (`Enabled=false`), `RELAY_HUD=0`, and `TERM=dumb` auto-detection.
+  - Reconnect budget exhaustion and fatal auth errors (`ERR_AUTH`).
+  - User cancellation (Ctrl+C / `ctx.Done()`).
+  - Narrow terminal window truncation (45 columns).
+  - Broken pipe / writer error resilience.
+  - High concurrency stress testing (50 concurrent goroutines under `-race`).
+  - End-to-end integration test asserting byte-exact stdout purity with zero HUD byte leakage during carrier drops.
+
 

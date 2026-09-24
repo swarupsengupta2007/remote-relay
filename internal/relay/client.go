@@ -56,6 +56,14 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 		// use resumeDialAddr.
 	}
 
+	hud := NewHUD(HUDConfig{
+		Enabled:             cfg.HUD,
+		Out:                 cfg.HUDWriter,
+		IsTerminal:          cfg.HUDIsTerminal,
+		NotificationTimeout: cfg.NotificationTimeout.Duration(),
+	})
+	defer hud.Clear()
+
 	schedule := parseBackoff(cfg.ReconnectBackoff)
 	maxElapsed := cfg.ReconnectMaxElapsed.Duration()
 	if maxElapsed <= 0 {
@@ -72,13 +80,22 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 		conn, helloOK, err = clientHello(helloCtx, cfg)
 		helloCancel()
 		if err == nil {
+			if attempt > 0 {
+				hud.OnRestored(helloOK.Transport, 0)
+			}
 			break
 		}
+		if attempt == 0 {
+			hud.OnDisrupted(cfg.Transport)
+		}
+		hud.OnAttempt(attempt+1, len(schedule)+1, cfg.Transport, err)
 		if (!reconnectable(err) && !errors.Is(err, context.DeadlineExceeded)) || time.Now().After(helloDeadline) || ctx.Err() != nil {
+			hud.OnFailed(err.Error(), err)
 			return err
 		}
 		log.Debug("handshake failed, retrying", "attempt", attempt, "err", err)
 		if serr := sleepBackoff(ctx, schedule, attempt, helloDeadline); serr != nil {
+			hud.OnAborted("canceled by user")
 			return err
 		}
 		attempt++
@@ -228,10 +245,15 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 		}
 
 		if se := p.sessionErr(); se != nil {
+			hud.OnFailed(se.Error(), se)
 			return se
 		}
 		if !reconnectable(err) {
-			return p.classify(err)
+			classifiedErr := p.classify(err)
+			if classifiedErr != nil {
+				hud.OnFailed(classifiedErr.Error(), classifiedErr)
+			}
+			return classifiedErr
 		}
 
 		// In HA mode, check if warm standby channel is ready for instant zero-latency promotion
@@ -249,16 +271,22 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 		deadline := time.Now().Add(maxElapsed)
 		attempt := 0
 		resumed := false
+		maxAttempts := len(schedule) + 1
+		disruptedTransport := current.Kind().String()
+		hud.OnDisrupted(disruptedTransport)
 		for reconnectable(err) && time.Now().Before(deadline) {
+			hud.OnAttempt(attempt+1, maxAttempts, disruptedTransport, err)
 			dialCtx, dialCancel := context.WithDeadline(ctx, deadline)
 			nconn, rok, rerr := clientResume(dialCtx, pathCfg, sessionID, token, p.delivered.Load())
 			dialCancel()
 			if rerr != nil {
 				if !reconnectable(rerr) && !errors.Is(rerr, context.DeadlineExceeded) {
+					hud.OnFailed(rerr.Error(), rerr)
 					return rerr
 				}
 				err = rerr
 				if serr := sleepBackoff(ctx, schedule, attempt, deadline); serr != nil {
+					hud.OnAborted("canceled by user")
 					break
 				}
 				attempt++
@@ -287,15 +315,19 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 			}
 			if !pathCfg.AllowHA && !pathCfg.IsTCP() && (target == "tcp" || udp == nil) {
 				_ = nconn.Close()
-				return fmt.Errorf("udp route unavailable and --allow-ha not specified: server does not provide udp transport")
+				failErr := fmt.Errorf("udp route unavailable and --allow-ha not specified: server does not provide udp transport")
+				hud.OnFailed(failErr.Error(), failErr)
+				return failErr
 			}
 			if perr := checkStrictUDPProbe(ctx, pathCfg, nconn, udp); perr != nil {
 				_ = nconn.Close()
 				if ctx.Err() != nil {
+					hud.OnAborted("canceled by user")
 					return ctx.Err()
 				}
 				err = perr
 				if serr := sleepBackoff(ctx, schedule, attempt, deadline); serr != nil {
+					hud.OnAborted("canceled by user")
 					break
 				}
 				attempt++
@@ -304,6 +336,7 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 			current = nconn
 			sendFrom = rok.UpAcked
 			resumed = true
+			hud.OnRestored(current.Kind().String(), p.sendLog.Len())
 			log.Info("session resumed", "transport", current.Kind().String())
 			break
 		}
@@ -311,9 +344,15 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 			continue
 		}
 		if reconnectable(err) || errors.Is(err, context.DeadlineExceeded) {
-			return fmt.Errorf("reconnect budget exhausted: %w", err)
+			budgetErr := fmt.Errorf("reconnect budget exhausted: %w", err)
+			hud.OnFailed("budget exhausted", budgetErr)
+			return budgetErr
 		}
-		return p.classify(err)
+		classifiedErr := p.classify(err)
+		if classifiedErr != nil {
+			hud.OnFailed(classifiedErr.Error(), classifiedErr)
+		}
+		return classifiedErr
 	}
 }
 

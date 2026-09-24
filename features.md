@@ -23,7 +23,7 @@ Each proposal includes:
 | [**FEAT-ROB-03**](.feat-impl/FEAT-ROB-03.md) | Dual-Stack Happy Eyeballs v2 (RFC 8305) | Tier 1: Robustness | **P2** | Complete | Instant connection racing across IPv4/IPv6 networks |
 | **FEAT-ROB-04** | Tiered Disk-Spill Storage for Ring Buffers | Tier 1: Robustness | **P3** | High | Prevents buffer exhaustion during prolonged outages |
 | [**FEAT-UTL-01**](.feat-impl/FEAT-UTL-01.md) | Native OpenSSH Agent (`SSH_AUTH_SOCK`) Support | Tier 2: Utility | **P1** | Complete | Passphrase-protected keys & FIDO2/YubiKey support |
-| **FEAT-UTL-02** | Terminal Reconnection HUD & Desktop Notifications | Tier 2: Utility | **P1** | Low | Clear visual feedback and status during link drops |
+| [**FEAT-UTL-02**](.feat-impl/FEAT-UTL-02.md) | Terminal Reconnection HUD & Desktop Notifications | Tier 2: Utility | **P1** | Complete | In-place status line (\r) and OSC 9/777 desktop notifications |
 | **FEAT-UTL-03** | SOCKS5 Dynamic Forwarding Mode (`relay socks`) | Tier 2: Utility | **P2** | Medium | Expands relay beyond SSH to generic browser/DB proxy |
 | **FEAT-UTL-04** | Reverse Relay & NAT Gateway Mode (Inverted Tunnel) | Tier 2: Utility | **P2** | High | Reaches home labs and private VPCs behind NAT |
 | [**FEAT-UTL-05**](.feat-impl/FEAT-UTL-05.md) | Multi-Hop Jumphost Chaining (`-J`) | Tier 2: Utility | **P1** | Complete (Phase 1) | Server-side chaining with per-hop resume, relayed signatures, and KEX attestation |
@@ -154,10 +154,10 @@ The current SSH public key authenticator in [`ssh.go`](file:///root/remote-relay
 
 ---
 
-### FEAT-UTL-02: Terminal Reconnection HUD & Desktop Notifications
+### [FEAT-UTL-02](.feat-impl/FEAT-UTL-02.md): Terminal Reconnection HUD & Desktop Notifications
 * **Priority**: `P1` (High)
-* **Status**: Proposed
-* **Target Package**: `internal/relay`, `cmd/relay`
+* **Status**: Complete ([`.feat-impl/FEAT-UTL-02.md`](.feat-impl/FEAT-UTL-02.md))
+* **Target Package**: `internal/relay`, `cmd/relay`, `internal/config`
 
 #### 1. Problem Statement
 Because stdout is reserved exclusively for the raw SSH byte stream, the client prints minimal logs to stderr. When a connection drops, the terminal becomes unresponsive with no visual cue. Users cannot tell whether the server is down, the network link is recovering, or the session has failed permanently.
