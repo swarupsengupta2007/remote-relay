@@ -100,6 +100,10 @@ type Server struct {
 	ChainMaxSessions           int      `toml:"chain_max_sessions"`
 	RelayKnownHosts            string   `toml:"relay_known_hosts"`
 	RelayStrictHostKeyChecking string   `toml:"relay_strict_host_key_checking"`
+
+	// FEAT-UTL-03 SOCKS5 dynamic proxy mode.
+	DisableSOCKS    bool `toml:"disable_socks"`
+	MaxSocksStreams int  `toml:"max_socks_streams"`
 }
 
 type Client struct {
@@ -146,6 +150,10 @@ type Client struct {
 
 	HUDWriter     io.Writer `toml:"-"`
 	HUDIsTerminal *bool     `toml:"-"`
+
+	// FEAT-UTL-03 SOCKS5 dynamic proxy mode.
+	SocksListen     string `toml:"socks_listen"`
+	MaxSocksStreams int    `toml:"max_socks_streams"`
 
 	TCPInterface string `toml:"-"`
 	UDPInterface string `toml:"-"`
@@ -209,6 +217,7 @@ func DefaultServer() Server {
 		ChainAuthTimeout:           Duration(10 * time.Second),
 		ChainAuthRelaysMax:         8,
 		RelayStrictHostKeyChecking: "yes",
+		MaxSocksStreams:            512,
 	}
 }
 
@@ -242,6 +251,8 @@ func DefaultClient() Client {
 		HUD:                   true,
 		NoHUD:                 false,
 		NotificationTimeout:   Duration(5 * time.Second),
+		SocksListen:           "127.0.0.1:1080",
+		MaxSocksStreams:       512,
 	}
 }
 
@@ -255,6 +266,8 @@ type ServerOptions struct {
 	AuthorizedKeys    string
 	Splice            *bool
 	AdaptiveKCP       *bool
+	DisableSOCKS      *bool
+	MaxSocksStreams   int
 }
 
 type ClientOptions struct {
@@ -287,6 +300,8 @@ type ClientOptions struct {
 	NotificationTimeout   time.Duration
 	HUDWriter             io.Writer
 	HUDIsTerminal         *bool
+	SocksListen           string
+	MaxSocksStreams       int
 }
 
 func LoadServer(opts ServerOptions) (Server, error) {
@@ -321,6 +336,12 @@ func LoadServer(opts ServerOptions) (Server, error) {
 	}
 	if opts.AdaptiveKCP != nil {
 		cfg.AdaptiveKCP = *opts.AdaptiveKCP
+	}
+	if opts.DisableSOCKS != nil {
+		cfg.DisableSOCKS = *opts.DisableSOCKS
+	}
+	if opts.MaxSocksStreams > 0 {
+		cfg.MaxSocksStreams = opts.MaxSocksStreams
 	}
 	if err := cfg.Validate(); err != nil {
 		return Server{}, err
@@ -431,6 +452,12 @@ func LoadClient(opts ClientOptions) (Client, error) {
 	if opts.HUDIsTerminal != nil {
 		cfg.HUDIsTerminal = opts.HUDIsTerminal
 	}
+	if opts.SocksListen != "" {
+		cfg.SocksListen = opts.SocksListen
+	}
+	if opts.MaxSocksStreams > 0 {
+		cfg.MaxSocksStreams = opts.MaxSocksStreams
+	}
 	if err := cfg.Validate(); err != nil {
 		return Client{}, err
 	}
@@ -507,10 +534,16 @@ func (s Server) Validate() error {
 	if s.DeadPeerThreshold <= 0 {
 		return fmt.Errorf("dead_peer_threshold must be positive")
 	}
+	if s.MaxSocksStreams < 0 {
+		return fmt.Errorf("max_socks_streams must not be negative")
+	}
 	return s.validateChain()
 }
 
 func (c Client) Validate() error {
+	if c.MaxSocksStreams < 0 {
+		return fmt.Errorf("max_socks_streams must not be negative")
+	}
 	if strings.TrimSpace(c.Transport) == "" {
 		return fmt.Errorf("empty transports")
 	}
@@ -658,9 +691,35 @@ func AllowAll(allow []string) bool {
 }
 
 func DestinationAllowed(dest string, allow []string) bool {
+	destHost, destPort, destErr := net.SplitHostPort(dest)
+	destIP := net.ParseIP(destHost)
+
 	for _, a := range allow {
 		if a == "*" || a == dest {
 			return true
+		}
+		// Check CIDR rule without port (e.g. "10.0.0.0/8")
+		if _, ipNet, err := net.ParseCIDR(a); err == nil {
+			if destIP != nil && ipNet.Contains(destIP) {
+				return true
+			}
+			continue
+		}
+		// Check rule with host:port
+		ruleHost, rulePort, rerr := net.SplitHostPort(a)
+		if rerr != nil {
+			continue
+		}
+		if rulePort != "*" && (destErr != nil || rulePort != destPort) {
+			continue
+		}
+		if strings.EqualFold(ruleHost, destHost) {
+			return true
+		}
+		if _, ipNet, err := net.ParseCIDR(ruleHost); err == nil {
+			if destIP != nil && ipNet.Contains(destIP) {
+				return true
+			}
 		}
 	}
 	return false

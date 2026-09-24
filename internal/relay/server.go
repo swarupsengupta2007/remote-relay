@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -124,18 +125,18 @@ func NewServer(cfg config.Server, log *slog.Logger) *Server {
 	}
 
 	return &Server{
-		cfg:         cfg,
-		log:         log,
-		auth:        auth.New(auth.Config{Method: cfg.AuthMethod, AuthorizedKeys: cfg.AuthorizedKeys, FailDelay: cfg.AuthFailDelay.Duration()}),
-		store:       session.NewStore(cfg.MaxSessions),
-		budget:      session.NewBudget(int64(cfg.TotalBufferBytes)),
-		hostKey:     hostKey,
-		hostKeyErr:  hostErr,
-		lives:       make(map[string]*live),
-		probes:      make(map[[16]byte]string),
-		probeBySess: make(map[string][16]byte),
-		ipConns:     make(map[string]int),
-		ipSess:      make(map[string]int),
+		cfg:            cfg,
+		log:            log,
+		auth:           auth.New(auth.Config{Method: cfg.AuthMethod, AuthorizedKeys: cfg.AuthorizedKeys, FailDelay: cfg.AuthFailDelay.Duration()}),
+		store:          session.NewStore(cfg.MaxSessions),
+		budget:         session.NewBudget(int64(cfg.TotalBufferBytes)),
+		hostKey:        hostKey,
+		hostKeyErr:     hostErr,
+		lives:          make(map[string]*live),
+		probes:         make(map[[16]byte]string),
+		probeBySess:    make(map[string][16]byte),
+		ipConns:        make(map[string]int),
+		ipSess:         make(map[string]int),
 		runCtx:         runCtx,
 		runCancel:      runCancel,
 		restartingDone: make(chan struct{}),
@@ -697,16 +698,24 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 	}
 
 	dest := hello.Destination
-	if dest == "" {
-		dest = s.cfg.DefaultDestination
-	}
-	if _, _, err := net.SplitHostPort(dest); err != nil {
-		writeErr(conn, proto.CodeProto, "bad destination")
-		return
-	}
-	if !config.DestinationAllowed(dest, s.cfg.AllowDestinations) {
-		writeErr(conn, proto.CodeDestForbidden, "destination not allowed")
-		return
+	isSocks := dest == proto.DestSOCKS5
+	if isSocks {
+		if s.cfg.DisableSOCKS {
+			writeErr(conn, proto.CodeDestForbidden, "socks proxy mode disabled")
+			return
+		}
+	} else {
+		if dest == "" {
+			dest = s.cfg.DefaultDestination
+		}
+		if _, _, err := net.SplitHostPort(dest); err != nil {
+			writeErr(conn, proto.CodeProto, "bad destination")
+			return
+		}
+		if !config.DestinationAllowed(dest, s.cfg.AllowDestinations) {
+			writeErr(conn, proto.CodeDestForbidden, "destination not allowed")
+			return
+		}
 	}
 
 	id, sess, token, serverNonce, ok := s.helloAuth(conn, hello, f.Payload, dest, kexNonce)
@@ -747,11 +756,49 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 		return
 	}
 
-	dtcp, derr := s.dialDestination(ctx, dest)
-	if derr != nil {
-		s.store.Remove(sess.ID)
-		writeErr(conn, derr.Code, derr.Msg)
-		return
+	var (
+		dtcp     *net.TCPConn
+		smux     *socksServerMux
+		sIO      sessionIO
+		doSplice = s.cfg.Splice
+	)
+	if isSocks {
+		toMuxR, toMuxW := io.Pipe()
+		fromMuxR, fromMuxW := io.Pipe()
+		smux = newSocksServerMux(s, sess.ID, toMuxR, toMuxW, fromMuxR, fromMuxW)
+		sIO = sessionIO{
+			src:        fromMuxR,
+			sink:       toMuxW,
+			closeWrite: toMuxW.Close,
+			closeSrc:   smux.Close,
+			outDir:     proto.DirDown,
+			inDir:      proto.DirUp,
+		}
+		doSplice = false
+	} else {
+		var derr *proto.Error
+		dtcp, derr = s.dialDestination(ctx, dest)
+		if derr != nil {
+			s.store.Remove(sess.ID)
+			writeErr(conn, derr.Code, derr.Msg)
+			return
+		}
+		var closeWrite func() error
+		var closeSrc func() error
+		if dtcp != nil {
+			closeWrite = dtcp.CloseWrite
+			closeSrc = func() error { return dtcp.Close() }
+		}
+		sIO = sessionIO{
+			src:        dtcp,
+			sink:       dtcp,
+			rawSrc:     dtcp,
+			rawSink:    dtcp,
+			closeWrite: closeWrite,
+			closeSrc:   closeSrc,
+			outDir:     proto.DirDown,
+			inDir:      proto.DirUp,
+		}
 	}
 
 	window := s.cfg.SendWindow
@@ -763,7 +810,12 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 		bufCap = int(rem)
 	}
 	if bufCap <= 0 {
-		_ = dtcp.Close()
+		if dtcp != nil {
+			_ = dtcp.Close()
+		}
+		if smux != nil {
+			_ = smux.Close()
+		}
 		s.store.Remove(sess.ID)
 		s.refused.Add(1)
 		writeErr(conn, proto.CodeNoCapacity, "buffer budget exhausted")
@@ -787,7 +839,12 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 	}
 	fr, err := proto.MarshalFrame(proto.TypeHelloOK, okMsg)
 	if err != nil {
-		_ = dtcp.Close()
+		if dtcp != nil {
+			_ = dtcp.Close()
+		}
+		if smux != nil {
+			_ = smux.Close()
+		}
 		s.store.Remove(sess.ID)
 		return
 	}
@@ -795,17 +852,8 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 	rawConn := unwrapConn(conn)
 	log := logging.WithSession(s.log, sess.ID)
 	sendLog := session.NewRing(bufCap, s.budget)
-	p := newPump(ctx, sessionIO{
-		conn:       rawConn,
-		src:        dtcp,
-		sink:       dtcp,
-		rawSrc:     dtcp,
-		rawSink:    dtcp,
-		closeWrite: dtcp.CloseWrite,
-		closeSrc:   func() error { return dtcp.Close() },
-		outDir:     proto.DirDown,
-		inDir:      proto.DirUp,
-	}, pumpConfig{
+	sIO.conn = rawConn
+	p := newPump(ctx, sIO, pumpConfig{
 		chunk:         s.cfg.DataChunkBytes,
 		window:        window,
 		buffer:        bufCap,
@@ -815,7 +863,7 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 		heartbeat:     s.cfg.HeartbeatInterval.Duration(),
 		deadThreshold: s.cfg.DeadPeerThreshold,
 		log:           log,
-		splice:        s.cfg.Splice,
+		splice:        doSplice,
 	}, sendLog)
 
 	l := &live{
@@ -827,11 +875,15 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 		window:          window,
 		holdTimeout:     s.cfg.HoldTimeout.Duration(),
 		dest:            dtcp,
+		socksMux:        smux,
 		log:             log,
 		clientIP:        ip,
 		releaseHelloTCP: releaseTCP,
 		attachCh:        make(chan attachReq, 4),
 		deadCh:          make(chan struct{}),
+	}
+	if isSocks && smux != nil {
+		go smux.Run(ctx)
 	}
 	l.onPeerFrame = func() { l.store.ConfirmToken(l.id) }
 	s.livesMu.Lock()
@@ -966,6 +1018,7 @@ type live struct {
 	holdTimeout     time.Duration
 	dest            *net.TCPConn
 	nested          *nestedHop
+	socksMux        *socksServerMux
 	releaseChain    func()
 	log             *slog.Logger
 	clientIP        string
@@ -1552,6 +1605,9 @@ func (l *live) cleanup(expired bool) {
 	}
 	if l.nested != nil {
 		l.nested.close()
+	}
+	if l.socksMux != nil {
+		_ = l.socksMux.Close()
 	}
 	if l.releaseChain != nil {
 		l.releaseChain()

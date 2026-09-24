@@ -565,4 +565,43 @@ Implemented **FEAT-UTL-02**: Terminal Reconnection HUD & Desktop Notifications.
   - High concurrency stress testing (50 concurrent goroutines under `-race`).
   - End-to-end integration test asserting byte-exact stdout purity with zero HUD byte leakage during carrier drops.
 
+Implemented **FEAT-UTL-03**: SOCKS5 Dynamic Forwarding Mode (`relay socks`).
+
+### 1. RFC 1928 Protocol Engine (`internal/socks5/socks5.go`)
+- Standard authentication negotiation (`0x05`, `0x00` No Authentication, `0xFF` No Acceptable Methods).
+- Complete RFC 1928 command and address parsing: IPv4 (`0x01`), FQDN Domain Names (`0x03`), IPv6 (`0x04`).
+- Standard SOCKS5 reply code mapping: `0x00` (`Succeeded`), `0x02` (`Connection not allowed by ruleset`), `0x04` (`Host unreachable`), `0x05` (`Connection refused`), `0x07` (`Command not supported`), `0x08` (`Address type not supported`).
+
+### 2. Stream Multiplexing Framing (`internal/socks5/mux.go`)
+- Lightweight, zero-copy binary multiplexing protocol running over the resilient relay tunnel.
+- Binary frame format: `[StreamID uint32] [FrameType uint8] [Length uint32] [Payload ...]` with 1 MiB max length protection.
+- Frame types: `StreamOpen (0x01)`, `StreamOpenOK (0x02)`, `StreamOpenFail (0x03)`, `StreamData (0x04)`, `StreamClose (0x05)`, `StreamReset (0x06)`.
+
+### 3. Server & Client Multiplexers (`internal/relay/socks_server.go`, `internal/relay/socks_client.go`)
+- **Server Multiplexer (`socksServerMux`)**:
+  - Dynamically dials destinations via `DialContext` while strictly enforcing `allow_destinations` ACL rulesets.
+  - Non-blocking per-stream writer channels preventing slow targets from head-of-line blocking the tunnel.
+  - Coordinated half-close (`CloseHalfWrite`) propagation and immediate resource cleanup on RST/error.
+- **Client Multiplexer (`clientMux`)**:
+  - Listens on local TCP address (`--listen`, default `127.0.0.1:1080`).
+  - Assigns monotonic `StreamID` and routes traffic through the resilient tunnel (`proto.DestSOCKS5`).
+  - Bounded write channels per stream to prevent slow local applications from blocking the multiplexer.
+- **Pipe Management**: Unblocks `srcReader` and `netWriter` immediately on shutdown via explicit pipe error closures.
+
+### 4. Configuration & CLI Integration (`internal/config/config.go`, `cmd/relay/main.go`)
+- Added `relay socks` subcommand with flags: `--listen`, `--server`, `--tcp`, `--kcp`, `--allow-ha`, `-i`, `-J`, `--hud`, `--no-hud`, `--max-streams`.
+- Enhanced `DestinationAllowed` in `config` to support CIDR networks (`10.0.0.0/8`) and wildcard ports (`127.0.0.1:*`).
+- Added `disable_socks` and `max_socks_streams` server/client options.
+
+### 5. Verification & Testing (`internal/socks5/socks5_test.go`, `internal/relay/socks_test.go`)
+- 9 RFC 1928 unit tests passing with `-race` (auth methods, IPv4/domain/IPv6, bad version, RSV non-zero, unsupported ATYP, framing round-trips).
+- 15 integration tests in `socks_test.go` passing with `-race`:
+  - Happy paths: IPv4 64 KiB exact byte match, FQDN domain resolution, 8-stream concurrent multiplexing.
+  - Sad paths: SOCKS4 / HTTP GET rejected, no acceptable auth (0xFF), BIND/UDP rejected (0x07), unsupported ATYP (0x08), ruleset forbidden (0x02), host unreachable / DNS failure (0x04), connection refused (0x05), abrupt client disconnect, abrupt server disconnect, max streams limit (0x01), server `disable_socks` enforcement.
+  - Resilience: 256 KiB stream surviving active carrier severance (`dropLiveTransports`) via hold and resume with 100% SHA256 integrity match.
+- Live real-world verification:
+  - Real `curl --socks5-hostname` downloaded 5 MiB test file through `relay socks` with 100% SHA256 match.
+  - Carrier TCP socket killed with `ss -K` during live streaming; transfer resumed and completed with 100% SHA256 match.
+
+
 

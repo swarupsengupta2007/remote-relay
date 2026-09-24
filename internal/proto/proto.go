@@ -53,6 +53,10 @@ const (
 	DirUp   = "up"
 	DirDown = "down"
 	DirBoth = "both"
+
+	// DestSOCKS5 is the sentinel destination in Hello indicating that the session
+	// is a dynamic multiplexed SOCKS5 proxy session (FEAT-UTL-03).
+	DestSOCKS5 = "socks5"
 )
 
 func (t Type) Known() bool {

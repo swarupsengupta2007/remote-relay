@@ -24,7 +24,7 @@ Each proposal includes:
 | **FEAT-ROB-04** | Tiered Disk-Spill Storage for Ring Buffers | Tier 1: Robustness | **P3** | High | Prevents buffer exhaustion during prolonged outages |
 | [**FEAT-UTL-01**](.feat-impl/FEAT-UTL-01.md) | Native OpenSSH Agent (`SSH_AUTH_SOCK`) Support | Tier 2: Utility | **P1** | Complete | Passphrase-protected keys & FIDO2/YubiKey support |
 | [**FEAT-UTL-02**](.feat-impl/FEAT-UTL-02.md) | Terminal Reconnection HUD & Desktop Notifications | Tier 2: Utility | **P1** | Complete | In-place status line (\r) and OSC 9/777 desktop notifications |
-| **FEAT-UTL-03** | SOCKS5 Dynamic Forwarding Mode (`relay socks`) | Tier 2: Utility | **P2** | Medium | Expands relay beyond SSH to generic browser/DB proxy |
+| [**FEAT-UTL-03**](.feat-impl/FEAT-UTL-03.md) | SOCKS5 Dynamic Forwarding Mode (`relay socks`) | Tier 2: Utility | **P2** | Complete | RFC 1928 dynamic proxy with multiplexed stream hold and resume |
 | **FEAT-UTL-04** | Reverse Relay & NAT Gateway Mode (Inverted Tunnel) | Tier 2: Utility | **P2** | High | Reaches home labs and private VPCs behind NAT |
 | [**FEAT-UTL-05**](.feat-impl/FEAT-UTL-05.md) | Multi-Hop Jumphost Chaining (`-J`) | Tier 2: Utility | **P1** | Complete (Phase 1) | Server-side chaining with per-hop resume, relayed signatures, and KEX attestation |
 | [**FEAT-SEC-01**](.feat-impl/FEAT-SEC-01.md) | Encrypted Handshake Control Plane (X25519 / ChaCha20-Poly1305) | Tier 3: Security | **P1** | Complete | SSH-style X25519 ECDH + Ed25519 host keys + ChaCha20-Poly1305 control encryption |
@@ -182,10 +182,10 @@ Because stdout is reserved exclusively for the raw SSH byte stream, the client p
 
 ---
 
-### FEAT-UTL-03: SOCKS5 Dynamic Forwarding Mode (`relay socks`)
+### [FEAT-UTL-03](.feat-impl/FEAT-UTL-03.md): SOCKS5 Dynamic Forwarding Mode (`relay socks`)
 * **Priority**: `P2` (Medium)
-* **Status**: Proposed
-* **Target Package**: `cmd/relay`, `internal/relay`, `internal/proto`
+* **Status**: Implemented (Complete)
+* **Target Package**: `cmd/relay`, `internal/relay`, `internal/proto`, `internal/socks5`
 
 #### 1. Problem Statement
 `remote-relay` is currently limited to 1:1 stdio↔TCP socket bridging. Users who want resilient, zero-drop connectivity for web browsers, database GUIs, or multiple microservices must either configure complex SSH `-D` tunnels or run external proxies.
