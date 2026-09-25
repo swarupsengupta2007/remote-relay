@@ -617,14 +617,14 @@ func (p *pump) srcReader() error {
 			}
 		}
 		if err != nil {
-			if errors.Is(err, io.EOF) {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) {
 				p.outFinal.Store(p.sendLog.End())
 				p.outEOF.Store(true)
 				p.sendLog.Close()
 				p.nudge()
 				return nil
 			}
-			if errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) || errors.Is(err, io.ErrClosedPipe) {
+			if errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) {
 				return nil
 			}
 			return err

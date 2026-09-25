@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -955,7 +956,7 @@ max_sessions = 128
 	wg.Wait()
 }
 
-// 9. Real OS SIGHUP signal test using syscall.Kill.
+// 9. Real OS SIGHUP signal test using syscall.Kill on a dedicated server process.
 func TestRBAC_OS_SIGHUP_SignalDispatch(t *testing.T) {
 	dir := t.TempDir()
 
@@ -964,7 +965,6 @@ func TestRBAC_OS_SIGHUP_SignalDispatch(t *testing.T) {
 
 	priv1, pub1 := writeEd25519Key(t, dir, "id_sig1")
 	priv2, pub2 := writeEd25519Key(t, dir, "id_sig2")
-	_ = priv1
 
 	akPath := filepath.Join(dir, "authorized_keys")
 	if err := os.WriteFile(akPath, []byte(pub1+"\n"), 0o600); err != nil {
@@ -983,44 +983,105 @@ authorized_keys = %q
 		t.Fatal(err)
 	}
 
-	scfg, err := config.LoadServer(config.ServerOptions{ConfigPath: cfgPath})
+	// Find an open port for the relay server
+	testLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
+	relayAddr := testLn.Addr().String()
+	_ = testLn.Close()
 
-	_, srvAddr, cancel := startRelayCfg(t, scfg)
-	defer cancel()
+	// Compile relay binary
+	binPath := filepath.Join(dir, "relay-test-bin")
+	buildCmd := exec.Command("go", "build", "-o", binPath, "../../cmd/relay")
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, string(out))
+	}
+
+	// Launch relay server process
+	serverCmd := exec.Command(binPath, "server",
+		"--config", cfgPath,
+		"--listen", relayAddr,
+		"--authorized-keys", akPath,
+		"--log-level", "debug",
+	)
+	if err := serverCmd.Start(); err != nil {
+		t.Fatalf("start server: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = syscall.Kill(serverCmd.Process.Pid, syscall.SIGKILL)
+		_ = serverCmd.Wait()
+	})
+
+	// Wait until server is listening
+	for i := 0; i < 50; i++ {
+		conn, dialErr := net.DialTimeout("tcp", relayAddr, 100*time.Millisecond)
+		if dialErr == nil {
+			_ = conn.Close()
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Verify key1 connects successfully
+	ctx1, c1Cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer c1Cancel()
+	ccfg1 := config.DefaultClient()
+	ccfg1.StrictHostKeyChecking = "no"
+	ccfg1.Server = relayAddr
+	ccfg1.Destination = destAddr
+	ccfg1.Transport = "tcp"
+	ccfg1.AuthMethod = auth.MethodPublicKey
+	ccfg1.AuthUser = "sig_user1"
+	ccfg1.IdentityFiles = []string{priv1}
+
+	out1 := &bytes.Buffer{}
+	if err := RunClient(ctx1, ccfg1, bytes.NewBuffer([]byte("hello key1")), out1, logging.New(io.Discard, "error", "text")); err != nil {
+		t.Fatalf("client1 initial connect failed: %v", err)
+	}
+	if out1.String() != "hello key1" {
+		t.Fatalf("unexpected echo from client1: %q", out1.String())
+	}
+
+	// Verify key2 is rejected before reload
+	ctx2Pre, c2PreCancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer c2PreCancel()
+	ccfg2 := config.DefaultClient()
+	ccfg2.StrictHostKeyChecking = "no"
+	ccfg2.Server = relayAddr
+	ccfg2.Destination = destAddr
+	ccfg2.Transport = "tcp"
+	ccfg2.AuthMethod = auth.MethodPublicKey
+	ccfg2.AuthUser = "sig_user2"
+	ccfg2.IdentityFiles = []string{priv2}
+
+	err2Pre := RunClient(ctx2Pre, ccfg2, bytes.NewReader(nil), io.Discard, logging.New(io.Discard, "error", "text"))
+	if !errors.Is(err2Pre, proto.ErrAuth) {
+		t.Fatalf("expected ErrAuth for key2 before reload, got: %v", err2Pre)
+	}
 
 	// Append key2 to authorized_keys
 	if err := os.WriteFile(akPath, []byte(pub1+"\n"+pub2+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	// Dispatch real SIGHUP to current process
-	if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
+	// Dispatch real SIGHUP to the dedicated server subprocess
+	if err := syscall.Kill(serverCmd.Process.Pid, syscall.SIGHUP); err != nil {
 		t.Fatalf("syscall.Kill SIGHUP failed: %v", err)
 	}
 
-	// Wait briefly for asynchronous signal handler goroutine to execute ReloadConfig
-	time.Sleep(200 * time.Millisecond)
+	// Wait briefly for asynchronous signal handler goroutine in server to execute ReloadConfig
+	time.Sleep(300 * time.Millisecond)
 
 	// Verify key2 can now connect!
-	ctx, cCancel := context.WithTimeout(context.Background(), 4*time.Second)
-	defer cCancel()
-	ccfg := config.DefaultClient()
-	ccfg.StrictHostKeyChecking = "no"
-	ccfg.Server = srvAddr
-	ccfg.Destination = destAddr
-	ccfg.Transport = "tcp"
-	ccfg.AuthMethod = auth.MethodPublicKey
-	ccfg.AuthUser = "sig_user2"
-	ccfg.IdentityFiles = []string{priv2}
+	ctx2Post, c2PostCancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer c2PostCancel()
 
-	out := &bytes.Buffer{}
-	if err := RunClient(ctx, ccfg, bytes.NewBuffer([]byte("signal reload ok")), out, logging.New(io.Discard, "error", "text")); err != nil {
+	out2 := &bytes.Buffer{}
+	if err := RunClient(ctx2Post, ccfg2, bytes.NewBuffer([]byte("signal reload ok")), out2, logging.New(io.Discard, "error", "text")); err != nil {
 		t.Fatalf("client2 failed after real OS SIGHUP signal: %v", err)
 	}
-	if out.String() != "signal reload ok" {
-		t.Fatalf("unexpected echo: %q", out.String())
+	if out2.String() != "signal reload ok" {
+		t.Fatalf("unexpected echo: %q", out2.String())
 	}
 }
