@@ -26,7 +26,8 @@ Each proposal includes:
 | [**FEAT-UTL-02**](.feat-impl/FEAT-UTL-02.md) | Terminal Reconnection HUD & Desktop Notifications | Tier 2: Utility | **P1** | Complete | In-place status line (\r) and OSC 9/777 desktop notifications |
 | [**FEAT-UTL-03**](.feat-impl/FEAT-UTL-03.md) | SOCKS5 Dynamic Forwarding Mode (`relay socks`) | Tier 2: Utility | **P2** | Complete | RFC 1928 dynamic proxy with multiplexed stream hold and resume |
 | **FEAT-UTL-04** | Reverse Relay & NAT Gateway Mode (Inverted Tunnel) | Tier 2: Utility | **P2** | High | Reaches home labs and private VPCs behind NAT |
-| [**FEAT-UTL-05**](.feat-impl/FEAT-UTL-05.md) | Multi-Hop Jumphost Chaining (`-J`) | Tier 2: Utility | **P1** | Complete (Phase 1) | Server-side chaining with per-hop resume, relayed signatures, and KEX attestation |
+| [**FEAT-UTL-05**](.feat-impl/FEAT-UTL-05.md) | Multi-Hop Jumphost Chaining (`-J`) | Tier 2: Utility | **P1** | Complete | Server-side chaining with per-hop resume, relayed signatures, and KEX attestation |
+| **FEAT-UTL-06** | Chained Jumphost Rendezvous to NATed Terminal (`HopSpec.Target`) | Tier 2: Utility | **P2** | High | Traverses NAT/CGNAT terminals via reverse agent rendezvous (depends on FEAT-UTL-04) |
 | [**FEAT-SEC-01**](.feat-impl/FEAT-SEC-01.md) | Encrypted Handshake Control Plane (X25519 / ChaCha20-Poly1305) | Tier 3: Security | **P1** | Complete | SSH-style X25519 ECDH + Ed25519 host keys + ChaCha20-Poly1305 control encryption |
 | **FEAT-SEC-02** | WebSocket & HTTPS Port 443 Fallback Transport | Tier 3: Security | **P3** | High | Bypasses restrictive enterprise firewalls & DPI |
 | [**FEAT-SEC-03**](.feat-impl/FEAT-SEC-03.md) | Per-User RBAC & Live `SIGHUP` Configuration Reload | Tier 3: Security | **P2** | Complete | Hot updates to `authorized_keys` & destination ACLs |
@@ -247,7 +248,7 @@ The current architecture assumes the server has a public IP address and the dest
 
 ### [FEAT-UTL-05](.feat-impl/FEAT-UTL-05.md): Multi-Hop Jumphost Chaining (`-J`)
 * **Priority**: `P1` (High)
-* **Status**: Implemented (Phase 1 + Case C/D + per-hop transport). Nested splice deferred; Phase 3 NATed terminal blocked on UTL-04.
+* **Status**: Implemented (Complete; Phase 3 split into [FEAT-UTL-06](#feat-utl-06-chained-jumphost-rendezvous-to-nated-terminal-hopspectarget))
 * **Target Package**: `cmd/relay`, `internal/relay`, `internal/proto`, `internal/config`, `internal/crypto/kex`
 
 #### 1. Problem Statement
@@ -264,6 +265,36 @@ The relay is strictly two-party: `client → server → destination`. Reaching a
 #### 3. Verification
 - In-process tests in `internal/relay/chain_test.go` (byte-exact e2e, 3 hops, policy denials, attestation replay, Cases A–D resume, per-hop KCP on hop 1, splice disabled, origin-IP accounting).
 - Netns harness `scripts/test_jumphost_netns.py` JUMP-01..07 (not in CI; needs root + netns + sshd).
+
+---
+
+### FEAT-UTL-06: Chained Jumphost Rendezvous to NATed Terminal (`HopSpec.Target`)
+* **Priority**: `P2` (Medium)
+* **Status**: Proposed (Blocked on [FEAT-UTL-04](#feat-utl-04-reverse-relay--nat-gateway-mode-inverted-tunnel))
+* **Target Package**: `cmd/relay`, `internal/relay`, `internal/proto`, `internal/config`
+
+#### 1. Problem Statement
+[FEAT-UTL-05](.feat-impl/FEAT-UTL-05.md) enables arbitrary multi-hop jumphost chaining (`relay client -J j1,j2 --server S`), but requires every intermediate hop to directly dial the outbound IP/hostname and port of the subsequent hop (`HopSpec.Addr`). When the terminal server (or an intermediate hop) is located behind NAT, CGNAT, or firewall (such as an internal home lab server or private VPC instance), direct inbound dialing from the preceding relay fails because the node has no public routable address or listening ports.
+
+#### 2. Technical Specification
+- **Rendezvous-Based Hop Resolution**:
+  - Integrate with the reverse relay agent registration protocol from [**FEAT-UTL-04**](#feat-utl-04-reverse-relay--nat-gateway-mode-inverted-tunnel).
+  - In `proto.HopSpec`, utilize the wire-reserved `Target` field (e.g. `{ "target": "homelab" }`) rather than a direct network address (`Addr`).
+  - When the final intermediate hop processes the onward hop spec, it checks whether `Target` is specified. Instead of calling `net.Dial` / `transport.DialTCP`, it matches the registered reverse connection from `relay agent` identified by that target name.
+  - The intermediate issues a `BIND_REQUEST` over the registered agent's reverse control channel.
+  - The agent opens a local connection to `127.0.0.1:22` (`sshd`) and bridges data back through the intermediate relay.
+- **End-to-End Cryptographic Security**:
+  - Retains full cryptographic KEX attestation and relayed challenge signing across the entire chain.
+  - Per-hop resume, ring buffers, and BFD heartbeats function seamlessly over the inverted leg.
+- **CLI Syntax**:
+  ```bash
+  # Client connects through public jumphost to private NATed target:
+  relay client -J jump.example.com:7443 --target homelab --dest 127.0.0.1:22
+  ```
+
+#### 3. Benefits & Verification
+- Extends jumphost chaining to zero-port-forwarding environments; developers can jump into private servers behind NAT without running external VPNs or exposing public ports.
+- **Verification**: Run `relay agent --name homelab` in a network namespace with no incoming routes; client connects via `relay client -J jump --target homelab` and verifies data transfer, active carrier drops, and session hold/resume.
 
 ---
 
@@ -457,19 +488,21 @@ However, with the completion of [**FEAT-SEC-01**](.feat-impl/FEAT-SEC-01.md), ev
 Phase 1: Usability & Resiliency Quick-Wins (1–2 weeks)
 ├── FEAT-UTL-01: Native OpenSSH Agent (SSH_AUTH_SOCK) [COMPLETED] (.feat-impl/FEAT-UTL-01.md)
 ├── FEAT-PERF-03: Fast 3-RTT Token-Authorized Resumption (AEAD Plane) [COMPLETED] (.feat-impl/FEAT-PERF-03.md)
-├── FEAT-UTL-02: Terminal Reconnection HUD (stderr)
+├── FEAT-UTL-02: Terminal Reconnection HUD (stderr) [COMPLETED] (.feat-impl/FEAT-UTL-02.md)
 └── FEAT-ROB-01: Sub-Second Dead-Peer Detection (Fast Heartbeats) [COMPLETED] (.feat-impl/FEAT-ROB-01.md)
 
 Phase 2: Enterprise Operations, Zero-Downtime & Security (2–4 weeks)
-├── FEAT-ROB-02: Zero-Downtime Server Restarts (SCM_RIGHTS) [PRIORITY ELEVATED]
+├── FEAT-ROB-02: Zero-Downtime Server Restarts (SCM_RIGHTS) [COMPLETED] (.feat-impl/FEAT-ROB-02.md)
 ├── FEAT-OBS-01: Prometheus Metrics Endpoint
-├── FEAT-SEC-03: Per-User RBAC & SIGHUP Reload
+├── FEAT-SEC-03: Per-User RBAC & SIGHUP Reload [COMPLETED] (.feat-impl/FEAT-SEC-03.md)
 ├── FEAT-SEC-01: Encrypted Handshake Control Plane [COMPLETED] (.feat-impl/FEAT-SEC-01.md)
+├── FEAT-UTL-05: Multi-Hop Jumphost Chaining (-J) [COMPLETED] (.feat-impl/FEAT-UTL-05.md)
 └── FEAT-ROB-03: Dual-Stack Happy Eyeballs v2 [COMPLETED] (.feat-impl/FEAT-ROB-03.md)
 
 Phase 3: Expanded Utility & High Availability (4–6 weeks)
-├── FEAT-UTL-03: SOCKS5 Dynamic Forwarding Mode
+├── FEAT-UTL-03: SOCKS5 Dynamic Forwarding Mode [COMPLETED] (.feat-impl/FEAT-UTL-03.md)
 ├── FEAT-UTL-04: Reverse Relay & NAT Gateway Mode
+├── FEAT-UTL-06: Chained Jumphost Rendezvous to NATed Terminal (depends on FEAT-UTL-04)
 └── FEAT-SEC-02: WebSocket & HTTPS Port 443 Fallback
 
 Phase 4: Advanced Optimizations (Ongoing)

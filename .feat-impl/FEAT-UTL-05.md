@@ -1,6 +1,6 @@
 # FEAT-UTL-05: Multi-Hop Jumphost Chaining (`-J`)
 
-**Status:** Implemented (Phase 1 + Phase 2 Case C/D + J-D4). Nested `splice(2)` is deferred indefinitely (R-D4). Phase 3 (NATed terminal) remains blocked on FEAT-UTL-04.
+**Status:** Implemented (Phase 1 + Phase 2 Case C/D + J-D4). Nested `splice(2)` is deferred indefinitely (R-D4). Phase 3 (NATed terminal rendezvous) is tracked as separate feature FEAT-UTL-06 (dependent on FEAT-UTL-04).
 **Target packages:** `cmd/relay`, `internal/relay`, `internal/proto`, `internal/auth`, `internal/config`, `internal/crypto/kex`
 **Date:** 2026-09-15
 
@@ -637,9 +637,9 @@ Phase 2
 40 ms / 2 % on the cli↔j1 leg, repeated `iptables` kills on **each** leg
 independently and simultaneously, SHA-256 byte-exact, zero goroutine/fd leaks.
 
-### Phase 3 — NATed terminal (depends on FEAT-UTL-04)
+### Phase 3 — NATed terminal (FEAT-UTL-06, depends on FEAT-UTL-04)
 
-Out of scope here beyond reserving the wire format. When `relay agent` exists
+Tracked as **FEAT-UTL-06**. When `relay agent` exists
 (`features.md:209-244`), a `HopSpec` gains a `target` name so an intermediate can
 resolve the next hop by **rendezvous** rather than by dial:
 
