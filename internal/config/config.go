@@ -56,6 +56,7 @@ func (d *Duration) UnmarshalText(text []byte) error {
 }
 
 type Server struct {
+	ConfigPath         string   `toml:"config_path,omitempty"`
 	ListenTCP          string   `toml:"listen_tcp"`
 	UDPListen          string   `toml:"udp_listen"`
 	UDPAnnounce        string   `toml:"udp_announce"`
@@ -306,12 +307,18 @@ type ClientOptions struct {
 
 func LoadServer(opts ServerOptions) (Server, error) {
 	cfg := DefaultServer()
+	cfg.ConfigPath = opts.ConfigPath
 	path, required := opts.ConfigPath, opts.ConfigPath != ""
 	if !required {
 		path = DefaultServerConfigPath
 	}
 	if err := mergeTOML(path, required, &cfg); err != nil {
 		return Server{}, err
+	}
+	if cfg.ConfigPath == "" {
+		if _, err := os.Stat(path); err == nil {
+			cfg.ConfigPath = path
+		}
 	}
 	if opts.Listen != "" {
 		cfg.ListenTCP = opts.Listen
@@ -713,7 +720,10 @@ func DestinationAllowed(dest string, allow []string) bool {
 		if rulePort != "*" && (destErr != nil || rulePort != destPort) {
 			continue
 		}
-		if strings.EqualFold(ruleHost, destHost) {
+		if ruleHost == "*" || strings.EqualFold(ruleHost, destHost) {
+			return true
+		}
+		if matched, err := filepath.Match(ruleHost, destHost); err == nil && matched {
 			return true
 		}
 		if _, ipNet, err := net.ParseCIDR(ruleHost); err == nil {

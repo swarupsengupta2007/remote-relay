@@ -124,8 +124,9 @@ func registerPprof(mux *http.ServeMux) {
 }
 
 func (s *Server) startDebug() error {
-	pprofAddr := strings.TrimSpace(s.cfg.PprofListen)
-	expvarAddr := strings.TrimSpace(s.cfg.ExpvarListen)
+	cfg := s.Config()
+	pprofAddr := strings.TrimSpace(cfg.PprofListen)
+	expvarAddr := strings.TrimSpace(cfg.ExpvarListen)
 	if pprofAddr == "" && expvarAddr == "" {
 		return nil
 	}

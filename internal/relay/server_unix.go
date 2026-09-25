@@ -40,6 +40,30 @@ func (s *Server) setupHotRestartSignal(ctx context.Context) {
 	}()
 }
 
+func (s *Server) setupSIGHUPSignal(ctx context.Context) {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGHUP)
+	go func() {
+		defer signal.Stop(sigCh)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-s.runCtx.Done():
+				return
+			case sig, ok := <-sigCh:
+				if !ok {
+					return
+				}
+				s.log.Info("received signal for live configuration reload", "signal", sig.String())
+				if err := s.ReloadConfig(); err != nil {
+					s.log.Error("live configuration reload failed", "err", err)
+				}
+			}
+		}
+	}()
+}
+
 func dupSocket(s interface {
 	SyscallConn() (syscall.RawConn, error)
 }, name string) (*os.File, error) {
@@ -125,11 +149,12 @@ func (s *Server) HandoverTo(unixConn *net.UnixConn) error {
 			}
 		}
 
-		remHold := int64(s.cfg.HoldTimeout.Duration() / time.Millisecond)
+		cfg := s.Config()
+		remHold := int64(cfg.HoldTimeout.Duration() / time.Millisecond)
 		l.mu.Lock()
 		if !l.heldAt.IsZero() {
 			elapsed := time.Since(l.heldAt)
-			rem := s.cfg.HoldTimeout.Duration() - elapsed
+			rem := cfg.HoldTimeout.Duration() - elapsed
 			if rem < 0 {
 				rem = 0
 			}

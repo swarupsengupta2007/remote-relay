@@ -603,5 +603,52 @@ Implemented **FEAT-UTL-03**: SOCKS5 Dynamic Forwarding Mode (`relay socks`).
   - Real `curl --socks5-hostname` downloaded 5 MiB test file through `relay socks` with 100% SHA256 match.
   - Carrier TCP socket killed with `ss -K` during live streaming; transfer resumed and completed with 100% SHA256 match.
 
+---
+
+Implemented **FEAT-SEC-03**: Per-User RBAC & Live `SIGHUP` Configuration Reload.
+
+### 1. Per-User RBAC & OpenSSH Options Parsing (`internal/auth/ssh.go`, `internal/auth/auth.go`)
+- Extended `Identity` with `PortForwardingBlocked bool` and `PermittedDestinations []string`.
+- Implemented RFC / OpenSSH authorized_keys options parser supporting:
+  - `permitopen="host:port"` (accumulates multiple allowlist rules).
+  - `permitopen="none"` (disables port forwarding).
+  - `no-port-forwarding` (disables port forwarding).
+  - `restrict` (disables all capabilities, including port forwarding).
+  - `port-forwarding` (re-enables port forwarding when following `restrict`).
+- Caches parsed `AuthorizedKeyEntry` in `PublicKey` in-memory structures to eliminate filesystem I/O on client handshakes and ensure atomic hot reload safety.
+
+### 2. Destination Matching Engine (`internal/config/config.go`)
+- Enhanced `DestinationAllowed` with:
+  - Wildcard ports: `127.0.0.1:*`, `10.0.0.0/8:*`.
+  - Wildcard hosts: `*:8080`.
+  - Glob matching: `filepath.Match` for hostnames like `*.internal.net:443`.
+  - Full CIDR support: `192.168.0.0/16:22`.
+
+### 3. Server Policy Enforcement Points (`internal/relay/server.go`, `socks_server.go`, `chain.go`)
+- **Direct HELLO**: Enforces per-user `PortForwardingBlocked` and `PermittedDestinations` during `handleHello` prior to dialing destination.
+- **SOCKS5 Dynamic Forwarding**: Validates that port forwarding is not blocked at initial tunnel HELLO, and strictly enforces per-user `PermittedDestinations` on every individual logical stream open (`TypeStreamOpen`), returning RFC 1928 `0x02` (`Connection not allowed by ruleset`) on violations.
+- **Jumphost Chaining**: Validates each hop's target address against the user's `PermittedDestinations` during `handleChain`.
+- **Session Store**: Persists RBAC restrictions in `session.Session` across resumes.
+
+### 4. Zero-Downtime Atomic Live `SIGHUP` Reload (`internal/relay/server.go`, `server_unix.go`)
+- Intercepts `syscall.SIGHUP` in Unix server runner.
+- Atomic configuration pointer swapping via `atomic.Pointer[config.Server]`.
+- Re-reads and validates `server.toml` and `authorized_keys`.
+- Fail-closed error handling: invalid TOML syntax, malformed keys, or empty key files log errors and retain running configuration without interrupting or dropping active sessions.
+- Socket listeners and active in-flight session data streams remain completely undisturbed.
+
+### 5. Verification & Testing Matrix (`internal/relay/rbac_test.go`)
+- 9 test suites passing 100% with race detector (`go test -race ./internal/relay -run TestRBAC`):
+  - Direct permitopen allowed and forbidden targets.
+  - Restrictions: `no-port-forwarding`, `permitopen="none"`, `restrict`, and `restrict,port-forwarding,permitopen="..."`.
+  - SOCKS5 stream-level RBAC: permitted stream transfer vs forbidden stream 0x02 rejection.
+  - SOCKS5 handshake rejection when key has port forwarding disabled.
+  - SIGHUP live reload: adding new key and expanding allowed destinations with active session running uninterrupted.
+  - SIGHUP key revocation: immediate rejection of subsequent handshakes for removed keys.
+  - SIGHUP sad paths: corrupt TOML syntax and empty authorized_keys fail closed while keeping existing sessions and keys operational.
+  - Chained jumphost hop policy enforcement.
+  - High concurrency stress test: 10 concurrent clients performing multiple transfers while SIGHUP reload runs repeatedly.
+  - Real OS SIGHUP signal dispatch via `syscall.Kill(os.Getpid(), syscall.SIGHUP)`.
+
 
 

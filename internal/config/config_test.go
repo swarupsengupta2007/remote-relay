@@ -483,3 +483,74 @@ func TestStrictHostKeyCheckingConfig(t *testing.T) {
 		t.Fatalf("expected CLI override 'no', got %q", loaded2.StrictHostKeyChecking)
 	}
 }
+
+func TestDestinationAllowedWildcardsAndGlobs(t *testing.T) {
+	rules := []string{
+		"127.0.0.1:22",
+		"*:8080",
+		"10.0.1.*:22",
+		"*.internal.net:443",
+		"192.168.1.0/24:80",
+		"172.16.0.0/16:*",
+		"10.50.0.0/16",
+	}
+
+	cases := []struct {
+		dest    string
+		allowed bool
+	}{
+		// Exact match
+		{"127.0.0.1:22", true},
+		{"127.0.0.1:23", false},
+
+		// Wildcard host (*:8080)
+		{"example.com:8080", true},
+		{"192.168.99.1:8080", true},
+		{"example.com:8081", false},
+
+		// Host glob (10.0.1.*:22)
+		{"10.0.1.5:22", true},
+		{"10.0.1.100:22", true},
+		{"10.0.2.1:22", false},
+		{"10.0.1.5:2222", false},
+
+		// Domain glob (*.internal.net:443)
+		{"db.internal.net:443", true},
+		{"web.internal.net:443", true},
+		{"external.net:443", false},
+		{"db.internal.net:8443", false},
+
+		// CIDR with port (192.168.1.0/24:80)
+		{"192.168.1.50:80", true},
+		{"192.168.1.254:80", true},
+		{"192.168.2.1:80", false},
+		{"192.168.1.50:8081", false},
+
+		// CIDR with wildcard port (172.16.0.0/16:*)
+		{"172.16.5.10:22", true},
+		{"172.16.200.1:9000", true},
+		{"172.17.1.1:22", false},
+
+		// CIDR without port (10.50.0.0/16)
+		{"10.50.1.2:22", true},
+		{"10.50.99.1:443", true},
+		{"10.51.1.1:22", false},
+
+		// Fallback/Non-matching
+		{"random.host:1234", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.dest, func(t *testing.T) {
+			got := DestinationAllowed(tc.dest, rules)
+			if got != tc.allowed {
+				t.Fatalf("DestinationAllowed(%q) = %v, want %v", tc.dest, got, tc.allowed)
+			}
+		})
+	}
+
+	// Also test AllowAll ("*")
+	if !DestinationAllowed("any.host:12345", []string{"*"}) {
+		t.Fatal("expected '*' to allow any destination")
+	}
+}

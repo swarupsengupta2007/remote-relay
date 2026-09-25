@@ -19,17 +19,19 @@ const (
 )
 
 type Session struct {
-	ID           string
-	TokenHash    [32]byte
-	PrevHash     [32]byte
-	hasPrev      bool
-	currentPlain string
-	Destination  string
-	CreatedAt    time.Time
-	AuthMethod   string
-	AuthUser     string
-	Fingerprint  string
-	PublicKey    []byte
+	ID                    string
+	TokenHash             [32]byte
+	PrevHash              [32]byte
+	hasPrev               bool
+	currentPlain          string
+	Destination           string
+	CreatedAt             time.Time
+	AuthMethod            string
+	AuthUser              string
+	Fingerprint           string
+	PublicKey             []byte
+	PortForwardingBlocked bool
+	PermittedDestinations []string
 }
 
 type Store struct {

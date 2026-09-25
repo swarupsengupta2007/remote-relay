@@ -580,4 +580,3 @@ type writerFunc func(p []byte) (n int, err error)
 func (f writerFunc) Write(p []byte) (n int, err error) {
 	return f(p)
 }
-

@@ -29,7 +29,7 @@ Each proposal includes:
 | [**FEAT-UTL-05**](.feat-impl/FEAT-UTL-05.md) | Multi-Hop Jumphost Chaining (`-J`) | Tier 2: Utility | **P1** | Complete (Phase 1) | Server-side chaining with per-hop resume, relayed signatures, and KEX attestation |
 | [**FEAT-SEC-01**](.feat-impl/FEAT-SEC-01.md) | Encrypted Handshake Control Plane (X25519 / ChaCha20-Poly1305) | Tier 3: Security | **P1** | Complete | SSH-style X25519 ECDH + Ed25519 host keys + ChaCha20-Poly1305 control encryption |
 | **FEAT-SEC-02** | WebSocket & HTTPS Port 443 Fallback Transport | Tier 3: Security | **P3** | High | Bypasses restrictive enterprise firewalls & DPI |
-| **FEAT-SEC-03** | Per-User RBAC & Live `SIGHUP` Configuration Reload | Tier 3: Security | **P2** | Medium | Hot updates to `authorized_keys` & destination ACLs |
+| [**FEAT-SEC-03**](.feat-impl/FEAT-SEC-03.md) | Per-User RBAC & Live `SIGHUP` Configuration Reload | Tier 3: Security | **P2** | Complete | Hot updates to `authorized_keys` & destination ACLs |
 | [**FEAT-PERF-01**](.feat-impl/FEAT-PERF-01.md)| Linux Kernel Zero-Copy Stream Splicing (`splice(2)`) | Tier 4: Performance | **P3** | Complete | Halves CPU & memory bus overhead on multi-gigabit links |
 | [**FEAT-PERF-02**](.feat-impl/FEAT-PERF-02.md)| Adaptive KCP Dynamic ARQ & Congestion Tuning | Tier 4: Performance | **P3** | Complete | Dynamic packet retransmission on fluctuating mobile links |
 | [**FEAT-PERF-03**](.feat-impl/FEAT-PERF-03.md)| Fast 3-RTT Token-Authorized Resumption in AEAD Plane | Tier 4: Performance | **P1** | Complete | Cuts 1 RTT per resume, eliminates flaky link RTO stalls & enables silent standby |
@@ -325,9 +325,9 @@ Strict enterprise firewalls, corporate proxies, and public Wi-Fi portals (e.g. h
 
 ---
 
-### FEAT-SEC-03: Per-User RBAC & Live `SIGHUP` Configuration Reload
+### [FEAT-SEC-03](.feat-impl/FEAT-SEC-03.md): Per-User RBAC & Live `SIGHUP` Configuration Reload
 * **Priority**: `P2` (Medium)
-* **Status**: Proposed
+* **Status**: Implemented (Complete)
 * **Target Package**: `internal/auth`, `internal/config`, `internal/relay`
 
 #### 1. Problem Statement

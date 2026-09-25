@@ -34,10 +34,12 @@ type Challenge struct {
 }
 
 type Identity struct {
-	Method      string
-	Name        string
-	Fingerprint string
-	RawPubKey   []byte
+	Method                string
+	Name                  string
+	Fingerprint           string
+	RawPubKey             []byte
+	PortForwardingBlocked bool
+	PermittedDestinations []string
 }
 
 type Authenticator interface {

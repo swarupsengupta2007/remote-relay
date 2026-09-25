@@ -44,13 +44,21 @@ type PublicKey struct {
 	mu        sync.Mutex
 	signers   []ssh.Signer
 	agentConn io.Closer
+	entries   []AuthorizedKeyEntry
 }
 
 func NewPublicKey(cfg Config) *PublicKey {
 	if len(cfg.IdentityFiles) > 0 {
 		cfg.IdentityFiles = append([]string(nil), cfg.IdentityFiles...)
 	}
-	return &PublicKey{cfg: cfg}
+	p := &PublicKey{cfg: cfg}
+	akPath := p.authorizedKeysPath()
+	if akPath != "" {
+		if entries, err := LoadAuthorizedKeyEntries(akPath); err == nil && len(entries) > 0 {
+			p.entries = entries
+		}
+	}
+	return p
 }
 
 func (p *PublicKey) Close() error {
@@ -150,7 +158,8 @@ func (p *PublicKey) Verify(ch Challenge, raw json.RawMessage) (Identity, error) 
 	if ch.BoundFP != "" && !fingerprintEqual(fp, ch.BoundFP) {
 		return Identity{}, errAuth
 	}
-	if !p.keyAuthorized(pub) {
+	entry, ok := p.findAuthorizedEntry(pub)
+	if !ok {
 		return Identity{}, errAuth
 	}
 	var msg authMsg
@@ -167,11 +176,17 @@ func (p *PublicKey) Verify(ch Challenge, raw json.RawMessage) (Identity, error) 
 	if err := pub.Verify(digest, sig); err != nil {
 		return Identity{}, errAuth
 	}
+	userName := name
+	if userName == "" && entry.Comment != "" {
+		userName = entry.Comment
+	}
 	return Identity{
-		Method:      MethodPublicKey,
-		Name:        name,
-		Fingerprint: fp,
-		RawPubKey:   pub.Marshal(),
+		Method:                MethodPublicKey,
+		Name:                  userName,
+		Fingerprint:           fp,
+		RawPubKey:             pub.Marshal(),
+		PortForwardingBlocked: entry.PortForwardingBlocked,
+		PermittedDestinations: entry.PermittedDestinations,
 	}, nil
 }
 
@@ -207,22 +222,36 @@ func (p *PublicKey) authorizedKeysPath() string {
 	return DefaultAuthorizedKeys()
 }
 
-func (p *PublicKey) keyAuthorized(pub ssh.PublicKey) bool {
-	keys, err := loadAuthorizedKeys(p.authorizedKeysPath())
-	if err != nil {
-		return false
+func (p *PublicKey) findAuthorizedEntry(pub ssh.PublicKey) (*AuthorizedKeyEntry, bool) {
+	p.mu.Lock()
+	entries := p.entries
+	p.mu.Unlock()
+	if len(entries) == 0 {
+		if diskEntries, err := LoadAuthorizedKeyEntries(p.authorizedKeysPath()); err == nil && len(diskEntries) > 0 {
+			p.mu.Lock()
+			if len(p.entries) == 0 {
+				p.entries = diskEntries
+			}
+			entries = p.entries
+			p.mu.Unlock()
+		}
 	}
 	want := pub.Marshal()
-	for _, k := range keys {
-		if checkKeyPolicy(k) != nil {
+	for _, e := range entries {
+		if checkKeyPolicy(e.PublicKey) != nil {
 			continue
 		}
-		got := k.Marshal()
+		got := e.PublicKey.Marshal()
 		if len(got) == len(want) && subtle.ConstantTimeCompare(got, want) == 1 {
-			return true
+			return &e, true
 		}
 	}
-	return false
+	return nil, false
+}
+
+func (p *PublicKey) keyAuthorized(pub ssh.PublicKey) bool {
+	_, ok := p.findAuthorizedEntry(pub)
+	return ok
 }
 
 func (p *PublicKey) getSigners() ([]ssh.Signer, error) {
@@ -435,8 +464,73 @@ func parseOfferKey(raw json.RawMessage) (ssh.PublicKey, string, error) {
 	return pub, offer.User, nil
 }
 
-// LoadAuthorizedKeys reads and parses all OpenSSH public keys from path.
-func LoadAuthorizedKeys(path string) ([]ssh.PublicKey, error) {
+// AuthorizedKeyEntry represents a parsed authorized_keys entry with its key,
+// comment, raw options, and evaluated RBAC restrictions.
+type AuthorizedKeyEntry struct {
+	PublicKey             ssh.PublicKey
+	Comment               string
+	Options               []string
+	PortForwardingBlocked bool
+	PermittedDestinations []string
+}
+
+// ParseAuthorizedKeyOptions evaluates OpenSSH authorized_keys options according
+// to sshd(8) semantics:
+//   - "no-port-forwarding": blocks all destination port forwarding.
+//   - "permitopen=\"none\"" or "permitopen=\"\"": blocks all destination port forwarding.
+//   - "permitopen=\"host:port\"": specifies an allowed destination. Can appear
+//     multiple times or contain comma-separated destinations.
+//   - "restrict": disables port forwarding unless explicitly enabled via "port-forwarding".
+//   - "port-forwarding": re-enables port forwarding when preceded or paired with "restrict".
+func ParseAuthorizedKeyOptions(options []string) (blocked bool, permitted []string) {
+	var permitOpenEntries []string
+	restrict := false
+	allowPF := false
+
+	for _, opt := range options {
+		opt = strings.TrimSpace(opt)
+		if opt == "" {
+			continue
+		}
+		lower := strings.ToLower(opt)
+		if lower == "no-port-forwarding" {
+			blocked = true
+			continue
+		}
+		if lower == "restrict" {
+			restrict = true
+			continue
+		}
+		if lower == "port-forwarding" {
+			allowPF = true
+			continue
+		}
+		if strings.HasPrefix(lower, "permitopen=") {
+			val := opt[len("permitopen="):]
+			val = strings.Trim(val, `"`)
+			val = strings.TrimSpace(val)
+			if val == "" || strings.EqualFold(val, "none") {
+				blocked = true
+				continue
+			}
+			for _, part := range strings.Split(val, ",") {
+				part = strings.TrimSpace(part)
+				if part != "" {
+					permitOpenEntries = append(permitOpenEntries, part)
+				}
+			}
+		}
+	}
+
+	if restrict && !allowPF {
+		blocked = true
+	}
+
+	return blocked, permitOpenEntries
+}
+
+// LoadAuthorizedKeyEntries reads and parses all OpenSSH public keys and options from path.
+func LoadAuthorizedKeyEntries(path string) ([]AuthorizedKeyEntry, error) {
 	if path == "" {
 		return nil, errAuth
 	}
@@ -444,17 +538,37 @@ func LoadAuthorizedKeys(path string) ([]ssh.PublicKey, error) {
 	if err != nil {
 		return nil, err
 	}
-	var keys []ssh.PublicKey
+	var entries []AuthorizedKeyEntry
 	for _, line := range bytes.Split(data, []byte("\n")) {
 		line = bytes.TrimSpace(line)
 		if len(line) == 0 || line[0] == '#' {
 			continue
 		}
-		pub, _, _, _, err := ssh.ParseAuthorizedKey(line)
+		pub, comment, options, _, err := ssh.ParseAuthorizedKey(line)
 		if err != nil {
 			continue
 		}
-		keys = append(keys, pub)
+		blocked, permitted := ParseAuthorizedKeyOptions(options)
+		entries = append(entries, AuthorizedKeyEntry{
+			PublicKey:             pub,
+			Comment:               comment,
+			Options:               options,
+			PortForwardingBlocked: blocked,
+			PermittedDestinations: permitted,
+		})
+	}
+	return entries, nil
+}
+
+// LoadAuthorizedKeys reads and parses all OpenSSH public keys from path.
+func LoadAuthorizedKeys(path string) ([]ssh.PublicKey, error) {
+	entries, err := LoadAuthorizedKeyEntries(path)
+	if err != nil {
+		return nil, err
+	}
+	keys := make([]ssh.PublicKey, len(entries))
+	for i, e := range entries {
+		keys[i] = e.PublicKey
 	}
 	return keys, nil
 }

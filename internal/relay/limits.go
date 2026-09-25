@@ -70,7 +70,8 @@ func (s *Server) tryReserveIPSess(ip string) error {
 	if s.shutting() {
 		return proto.ErrShutdown
 	}
-	if s.cfg.MaxSessions > 0 && s.store.Len() >= s.cfg.MaxSessions {
+	cfg := s.Config()
+	if cfg.MaxSessions > 0 && s.store.Len() >= cfg.MaxSessions {
 		return proto.ErrNoCapacity
 	}
 	if s.budget.Exhausted() {
@@ -81,7 +82,7 @@ func (s *Server) tryReserveIPSess(ip string) error {
 	if s.ipSess == nil {
 		s.ipSess = make(map[string]int)
 	}
-	if max := s.cfg.MaxConnsPerIP; max > 0 && s.ipSess[ip] >= max {
+	if max := cfg.MaxConnsPerIP; max > 0 && s.ipSess[ip] >= max {
 		return proto.ErrNoCapacity
 	}
 	s.ipSess[ip]++

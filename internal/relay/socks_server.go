@@ -42,38 +42,42 @@ func (st *serverStream) close() {
 // socksServerMux multiplexes multiple logical TCP streams over a single
 // resilient remote-relay session on the server side (FEAT-UTL-03).
 type socksServerMux struct {
-	srv      *Server
-	sessID   string
-	log      *slog.Logger
-	toMuxR   *io.PipeReader
-	toMuxW   *io.PipeWriter
-	fromMuxR *io.PipeReader
-	fromMuxW *io.PipeWriter
-	wMu      sync.Mutex
-	streams  map[uint32]*serverStream
-	mu       sync.Mutex
-	closed   atomic.Bool
-	closeCh  chan struct{}
-	ctx      context.Context
-	cancel   context.CancelFunc
-	runDone  chan struct{}
+	srv                   *Server
+	sessID                string
+	log                   *slog.Logger
+	toMuxR                *io.PipeReader
+	toMuxW                *io.PipeWriter
+	fromMuxR              *io.PipeReader
+	fromMuxW              *io.PipeWriter
+	wMu                   sync.Mutex
+	streams               map[uint32]*serverStream
+	mu                    sync.Mutex
+	closed                atomic.Bool
+	closeCh               chan struct{}
+	ctx                   context.Context
+	cancel                context.CancelFunc
+	runDone               chan struct{}
+	portForwardingBlocked bool
+	userPermitted         []string
 }
 
-func newSocksServerMux(srv *Server, sessID string, toMuxR *io.PipeReader, toMuxW *io.PipeWriter, fromMuxR *io.PipeReader, fromMuxW *io.PipeWriter) *socksServerMux {
+func newSocksServerMux(srv *Server, sessID string, toMuxR *io.PipeReader, toMuxW *io.PipeWriter, fromMuxR *io.PipeReader, fromMuxW *io.PipeWriter, portForwardingBlocked bool, userPermitted []string) *socksServerMux {
 	ctx, cancel := context.WithCancel(srv.sessionContext())
 	return &socksServerMux{
-		srv:      srv,
-		sessID:   sessID,
-		log:      srv.log.With("component", "socks_server_mux", "session", sessID),
-		toMuxR:   toMuxR,
-		toMuxW:   toMuxW,
-		fromMuxR: fromMuxR,
-		fromMuxW: fromMuxW,
-		streams:  make(map[uint32]*serverStream),
-		closeCh:  make(chan struct{}),
-		ctx:      ctx,
-		cancel:   cancel,
-		runDone:  make(chan struct{}),
+		srv:                   srv,
+		sessID:                sessID,
+		log:                   srv.log.With("component", "socks_server_mux", "session", sessID),
+		toMuxR:                toMuxR,
+		toMuxW:                toMuxW,
+		fromMuxR:              fromMuxR,
+		fromMuxW:              fromMuxW,
+		streams:               make(map[uint32]*serverStream),
+		closeCh:               make(chan struct{}),
+		ctx:                   ctx,
+		cancel:                cancel,
+		runDone:               make(chan struct{}),
+		portForwardingBlocked: portForwardingBlocked,
+		userPermitted:         userPermitted,
 	}
 }
 
@@ -126,7 +130,7 @@ func (smux *socksServerMux) handleOpen(streamID uint32, target string) {
 		smux.mu.Unlock()
 		return
 	}
-	maxStreams := smux.srv.cfg.MaxSocksStreams
+	maxStreams := smux.srv.Config().MaxSocksStreams
 	if maxStreams <= 0 {
 		maxStreams = 512
 	}
@@ -155,8 +159,19 @@ func (smux *socksServerMux) handleOpen(streamID uint32, target string) {
 		return
 	}
 
+	// User RBAC Check: if port forwarding blocked for this key
+	if smux.portForwardingBlocked {
+		smux.log.Warn("socks destination blocked: port forwarding disabled for user", "target", target, "streamID", streamID)
+		_ = smux.sendFrame(socks5.MuxFrame{
+			StreamID: streamID,
+			Type:     socks5.TypeStreamOpenFail,
+			Payload:  socks5.EncodeOpenFail(socks5.RepConnectionNotAllowed, "port forwarding disabled for user"),
+		})
+		return
+	}
+
 	// Security ACL Check: strict enforcement of allow_destinations ruleset
-	if !config.DestinationAllowed(target, smux.srv.cfg.AllowDestinations) {
+	if !config.DestinationAllowed(target, smux.srv.Config().AllowDestinations) {
 		smux.log.Warn("socks destination forbidden by ruleset", "target", target, "streamID", streamID)
 		_ = smux.sendFrame(socks5.MuxFrame{
 			StreamID: streamID,
@@ -166,8 +181,19 @@ func (smux *socksServerMux) handleOpen(streamID uint32, target string) {
 		return
 	}
 
+	// User RBAC Check: per-key permitopen restrictions
+	if len(smux.userPermitted) > 0 && !config.DestinationAllowed(target, smux.userPermitted) {
+		smux.log.Warn("socks destination forbidden by user policy", "target", target, "streamID", streamID)
+		_ = smux.sendFrame(socks5.MuxFrame{
+			StreamID: streamID,
+			Type:     socks5.TypeStreamOpenFail,
+			Payload:  socks5.EncodeOpenFail(socks5.RepConnectionNotAllowed, "destination forbidden by user policy"),
+		})
+		return
+	}
+
 	go func(streamID uint32, target string) {
-		dialCtx, dialCancel := context.WithTimeout(smux.ctx, smux.srv.cfg.DialTimeout.Duration())
+		dialCtx, dialCancel := context.WithTimeout(smux.ctx, smux.srv.Config().DialTimeout.Duration())
 		defer dialCancel()
 
 		d := net.Dialer{KeepAlive: 15 * time.Second}
@@ -232,6 +258,19 @@ func (smux *socksServerMux) handleOpen(streamID uint32, target string) {
 						return
 					}
 				case <-st.closeWrCh:
+					for {
+						select {
+						case data, ok := <-st.dataCh:
+							if ok && len(data) > 0 {
+								if _, err := st.conn.Write(data); err != nil {
+									return
+								}
+								continue
+							}
+						default:
+						}
+						break
+					}
 					if tc, ok := st.conn.(*net.TCPConn); ok {
 						_ = tc.CloseWrite()
 					}

@@ -58,7 +58,7 @@ func (s *Server) ensureMuxLocked() error {
 	}
 	s.udpMu.Unlock()
 
-	addr := s.cfg.UDPListen
+	addr := s.Config().UDPListen
 	if addr == "" {
 		addr = "0.0.0.0:7443"
 	}
@@ -75,7 +75,8 @@ func (s *Server) ensureMuxLocked() error {
 }
 
 func (s *Server) startQUICLocked() {
-	if !s.cfg.QUICEnabled() {
+	cfg := s.Config()
+	if !cfg.QUICEnabled() {
 		return
 	}
 	s.udpMu.Lock()
@@ -89,7 +90,7 @@ func (s *Server) startQUICLocked() {
 		s.log.Warn("quic cert failed", "err", err)
 		return
 	}
-	qconf := transport.NewQUICConfig(s.cfg.IdleTimeout.Duration(), s.cfg.KeepaliveInterval.Duration(), s.cfg.SendWindow)
+	qconf := transport.NewQUICConfig(cfg.IdleTimeout.Duration(), cfg.KeepaliveInterval.Duration(), cfg.SendWindow)
 	ln, err := transport.ListenQUIC(ep.mux.QUIC(), transport.ServerTLSConfig(cert), qconf)
 	if err != nil {
 		s.log.Warn("quic listen failed", "err", err)
@@ -108,7 +109,8 @@ func (s *Server) startQUICLocked() {
 }
 
 func (s *Server) startKCPLocked() {
-	if !s.cfg.KCPEnabled() {
+	cfg := s.Config()
+	if !cfg.KCPEnabled() {
 		return
 	}
 	s.udpMu.Lock()
@@ -118,7 +120,7 @@ func (s *Server) startKCPLocked() {
 		return
 	}
 	kcpCfg := transport.DefaultAdaptiveKCPConfig()
-	kcpCfg.Enabled = s.cfg.AdaptiveKCP
+	kcpCfg.Enabled = cfg.AdaptiveKCP
 	ln, err := transport.ListenKCPWithOptions(ep.mux.KCP(), kcpCfg)
 	if err != nil {
 		s.log.Warn("kcp listen failed", "err", err)
@@ -150,7 +152,8 @@ func (s *Server) udpHasKCP() bool {
 
 func (s *Server) quicCert() (tls.Certificate, error) {
 	s.certOnce.Do(func() {
-		s.cert, s.certErr = transport.LoadOrGenerateCert(s.cfg.QUICCert, s.cfg.QUICKey)
+		cfg := s.Config()
+		s.cert, s.certErr = transport.LoadOrGenerateCert(cfg.QUICCert, cfg.QUICKey)
 	})
 	return s.cert, s.certErr
 }
@@ -267,7 +270,8 @@ func (s *Server) unregisterProbe(sessionID string) {
 }
 
 func (s *Server) pickTransport(pref []string, sessionID string, tcpLocal net.Addr) (string, *proto.UdpInfo) {
-	if !s.cfg.QUICEnabled() && !s.cfg.KCPEnabled() {
+	cfg := s.Config()
+	if !cfg.QUICEnabled() && !cfg.KCPEnabled() {
 		return "tcp", nil
 	}
 	if len(pref) == 0 {
@@ -278,7 +282,7 @@ func (s *Server) pickTransport(pref []string, sessionID string, tcpLocal net.Add
 		case "tcp":
 			return "tcp", nil
 		case "quic":
-			if !s.cfg.QUICEnabled() {
+			if !cfg.QUICEnabled() {
 				continue
 			}
 			if err := s.ensureUDP(); err != nil {
@@ -294,7 +298,7 @@ func (s *Server) pickTransport(pref []string, sessionID string, tcpLocal net.Add
 			}
 			return "quic", info
 		case "kcp":
-			if !s.cfg.KCPEnabled() {
+			if !cfg.KCPEnabled() {
 				continue
 			}
 			if err := s.ensureUDP(); err != nil {
@@ -326,11 +330,12 @@ func (s *Server) newUdpInfo(sessionID string, tcpLocal net.Addr) *proto.UdpInfo 
 		return nil
 	}
 	s.registerProbe(sessionID, tok)
-	timeout := s.cfg.ProbeTimeout.Duration()
+	cfg := s.Config()
+	timeout := cfg.ProbeTimeout.Duration()
 	if timeout <= 0 {
 		timeout = 2 * time.Second
 	}
-	attempts := s.cfg.ProbeAttempts
+	attempts := cfg.ProbeAttempts
 	if attempts <= 0 {
 		attempts = 2
 	}
@@ -343,8 +348,9 @@ func (s *Server) newUdpInfo(sessionID string, tcpLocal net.Addr) *proto.UdpInfo 
 }
 
 func (s *Server) announceAddr(tcpLocal net.Addr) string {
-	if s.cfg.UDPAnnounce != "" {
-		return s.cfg.UDPAnnounce
+	cfg := s.Config()
+	if cfg.UDPAnnounce != "" {
+		return cfg.UDPAnnounce
 	}
 	s.udpMu.Lock()
 	ep := s.udp
@@ -363,7 +369,7 @@ func (s *Server) announceAddr(tcpLocal net.Addr) string {
 			}
 		}
 		if isUnspecified(host) {
-			if h, _, err := net.SplitHostPort(s.cfg.ListenTCP); err == nil && h != "" && !isUnspecified(h) {
+			if h, _, err := net.SplitHostPort(cfg.ListenTCP); err == nil && h != "" && !isUnspecified(h) {
 				host = h
 			}
 		}

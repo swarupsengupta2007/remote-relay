@@ -648,3 +648,182 @@ func TestPublicKeySKKeyPolicy(t *testing.T) {
 		t.Fatal("expected allowedSigFormat to accept sk-ecdsa")
 	}
 }
+
+func TestParseAuthorizedKeyOptions(t *testing.T) {
+	cases := []struct {
+		name      string
+		options   []string
+		wantBlock bool
+		wantPerm  []string
+	}{
+		{
+			name:      "no options",
+			options:   nil,
+			wantBlock: false,
+			wantPerm:  nil,
+		},
+		{
+			name:      "no-port-forwarding",
+			options:   []string{"no-port-forwarding", "no-pty"},
+			wantBlock: true,
+			wantPerm:  nil,
+		},
+		{
+			name:      "restrict without port-forwarding",
+			options:   []string{"restrict"},
+			wantBlock: true,
+			wantPerm:  nil,
+		},
+		{
+			name:      "restrict with port-forwarding",
+			options:   []string{"restrict", "port-forwarding"},
+			wantBlock: false,
+			wantPerm:  nil,
+		},
+		{
+			name:      "permitopen none",
+			options:   []string{`permitopen="none"`},
+			wantBlock: true,
+			wantPerm:  nil,
+		},
+		{
+			name:      "permitopen empty",
+			options:   []string{`permitopen=""`},
+			wantBlock: true,
+			wantPerm:  nil,
+		},
+		{
+			name:      "single permitopen",
+			options:   []string{`permitopen="127.0.0.1:22"`},
+			wantBlock: false,
+			wantPerm:  []string{"127.0.0.1:22"},
+		},
+		{
+			name:      "multiple permitopen options",
+			options:   []string{`permitopen="127.0.0.1:22"`, `permitopen="10.0.0.1:80"`},
+			wantBlock: false,
+			wantPerm:  []string{"127.0.0.1:22", "10.0.0.1:80"},
+		},
+		{
+			name:      "comma-separated permitopen",
+			options:   []string{`permitopen="127.0.0.1:22,10.0.0.1:80,192.168.1.*:*"`},
+			wantBlock: false,
+			wantPerm:  []string{"127.0.0.1:22", "10.0.0.1:80", "192.168.1.*:*"},
+		},
+		{
+			name:      "restrict with port-forwarding and permitopen",
+			options:   []string{"restrict", "port-forwarding", `permitopen="10.0.1.5:22"`},
+			wantBlock: false,
+			wantPerm:  []string{"10.0.1.5:22"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			blocked, permitted := ParseAuthorizedKeyOptions(tc.options)
+			if blocked != tc.wantBlock {
+				t.Fatalf("blocked = %v, want %v", blocked, tc.wantBlock)
+			}
+			if len(permitted) != len(tc.wantPerm) {
+				t.Fatalf("permitted len = %d (%v), want %d (%v)", len(permitted), permitted, len(tc.wantPerm), tc.wantPerm)
+			}
+			for i := range permitted {
+				if permitted[i] != tc.wantPerm[i] {
+					t.Errorf("permitted[%d] = %q, want %q", i, permitted[i], tc.wantPerm[i])
+				}
+			}
+		})
+	}
+}
+
+func TestPublicKeyRBACPermitOpenAndRestrictions(t *testing.T) {
+	dir := t.TempDir()
+	privAlice, pubLineAlice := writeEd25519(t, dir, "id_alice", true)
+	privBob, pubLineBob := writeEd25519(t, dir, "id_bob", true)
+	privCharlie, pubLineCharlie := writeEd25519(t, dir, "id_charlie", true)
+	privDave, pubLineDave := writeEd25519(t, dir, "id_dave", true)
+
+	// Alice: permitopen="127.0.0.1:22,10.0.0.1:*"
+	// Bob: no-port-forwarding
+	// Charlie: restrict,port-forwarding,permitopen="192.168.1.1:443"
+	// Dave: unrestricted (no options)
+	akContent := strings.Join([]string{
+		`permitopen="127.0.0.1:22,10.0.0.1:*" ` + pubLineAlice + " alice@example",
+		`no-port-forwarding ` + pubLineBob + " bob@example",
+		`restrict,port-forwarding,permitopen="192.168.1.1:443" ` + pubLineCharlie + " charlie@example",
+		pubLineDave + " dave@example",
+	}, "\n") + "\n"
+
+	akPath := filepath.Join(dir, "authorized_keys")
+	if err := os.WriteFile(akPath, []byte(akContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	server := NewPublicKey(Config{AuthorizedKeys: akPath})
+
+	verifyClient := func(privPath, user string) (Identity, error) {
+		client := NewPublicKey(Config{User: user, IdentityFiles: []string{privPath}})
+		ch := Challenge{
+			SessionID:   "sess-test",
+			Destination: "127.0.0.1:22",
+			ClientNonce: "cnonce",
+			ServerNonce: "snonce",
+			Canonical:   []byte(`{"test":true}`),
+		}
+		offer, err := client.Respond(ch)
+		if err != nil {
+			return Identity{}, err
+		}
+		ch.Offer = offer
+		sig, err := client.Sign(ch)
+		if err != nil {
+			return Identity{}, err
+		}
+		return server.Verify(ch, sig)
+	}
+
+	// 1. Alice: should succeed with permitopen populated
+	idAlice, err := verifyClient(privAlice, "alice")
+	if err != nil {
+		t.Fatalf("alice verify failed: %v", err)
+	}
+	if idAlice.PortForwardingBlocked {
+		t.Fatalf("expected alice port forwarding to NOT be blocked")
+	}
+	if len(idAlice.PermittedDestinations) != 2 || idAlice.PermittedDestinations[0] != "127.0.0.1:22" || idAlice.PermittedDestinations[1] != "10.0.0.1:*" {
+		t.Fatalf("unexpected alice permitted destinations: %v", idAlice.PermittedDestinations)
+	}
+
+	// 2. Bob: should succeed authentication, but have PortForwardingBlocked: true
+	idBob, err := verifyClient(privBob, "bob")
+	if err != nil {
+		t.Fatalf("bob verify failed: %v", err)
+	}
+	if !idBob.PortForwardingBlocked {
+		t.Fatalf("expected bob port forwarding to be blocked")
+	}
+
+	// 3. Charlie: should have PortForwardingBlocked: false and permitopen="192.168.1.1:443"
+	idCharlie, err := verifyClient(privCharlie, "charlie")
+	if err != nil {
+		t.Fatalf("charlie verify failed: %v", err)
+	}
+	if idCharlie.PortForwardingBlocked {
+		t.Fatalf("expected charlie port forwarding to NOT be blocked")
+	}
+	if len(idCharlie.PermittedDestinations) != 1 || idCharlie.PermittedDestinations[0] != "192.168.1.1:443" {
+		t.Fatalf("unexpected charlie permitted destinations: %v", idCharlie.PermittedDestinations)
+	}
+
+	// 4. Dave: should have PortForwardingBlocked: false and empty PermittedDestinations
+	idDave, err := verifyClient(privDave, "dave")
+	if err != nil {
+		t.Fatalf("dave verify failed: %v", err)
+	}
+	if idDave.PortForwardingBlocked {
+		t.Fatalf("expected dave port forwarding to NOT be blocked")
+	}
+	if len(idDave.PermittedDestinations) != 0 {
+		t.Fatalf("expected dave permitted destinations to be empty, got: %v", idDave.PermittedDestinations)
+	}
+}

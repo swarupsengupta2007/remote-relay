@@ -318,6 +318,19 @@ func (cmux *clientMux) handleClientConn(ctx context.Context, c net.Conn) {
 					return
 				}
 			case <-st.closeWrCh:
+				for {
+					select {
+					case data, ok := <-st.dataCh:
+						if ok && len(data) > 0 {
+							if _, err := st.conn.Write(data); err != nil {
+								return
+							}
+							continue
+						}
+					default:
+					}
+					break
+				}
 				if tc, ok := st.conn.(*net.TCPConn); ok {
 					_ = tc.CloseWrite()
 				}
@@ -432,12 +445,14 @@ func RunSocks(ctx context.Context, socksCfg SocksConfig, clientCfg config.Client
 		tunnelErrCh <- err
 	}()
 
+	var tunnelErr atomic.Pointer[error]
 	go func() {
 		select {
 		case <-ctx.Done():
 			_ = ln.Close()
 		case err := <-tunnelErrCh:
 			if err != nil {
+				tunnelErr.Store(&err)
 				log.Error("socks tunnel terminated", "err", err)
 			}
 			_ = ln.Close()
@@ -447,19 +462,17 @@ func RunSocks(ctx context.Context, socksCfg SocksConfig, clientCfg config.Client
 	for {
 		c, err := ln.Accept()
 		if err != nil {
-			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			select {
-			case terr := <-tunnelErrCh:
-				if terr != nil {
-					return fmt.Errorf("socks tunnel error: %w", terr)
-				}
-				return nil
-			default:
-				log.Debug("socks accept error", "err", err)
-				continue
+			if ep := tunnelErr.Load(); ep != nil && *ep != nil {
+				return fmt.Errorf("socks tunnel error: %w", *ep)
 			}
+			if errors.Is(err, net.ErrClosed) {
+				return ctx.Err()
+			}
+			log.Debug("socks accept error", "err", err)
+			continue
 		}
 		go cmux.handleClientConn(ctx, c)
 	}

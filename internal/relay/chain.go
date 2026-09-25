@@ -76,6 +76,21 @@ func (s *Server) handleChain(ctx context.Context, conn transport.Conn, f proto.F
 	sess.AuthUser = id.Name
 	sess.Fingerprint = id.Fingerprint
 	sess.PublicKey = id.RawPubKey
+	sess.PortForwardingBlocked = id.PortForwardingBlocked
+	sess.PermittedDestinations = id.PermittedDestinations
+
+	if id.PortForwardingBlocked {
+		s.chainRefused.Add(1)
+		s.refused.Add(1)
+		writeErr(conn, proto.CodeDestForbidden, "port forwarding is disabled for this key")
+		return
+	}
+	if len(id.PermittedDestinations) > 0 && !config.DestinationAllowed(ch.Destination, id.PermittedDestinations) {
+		s.chainRefused.Add(1)
+		s.refused.Add(1)
+		writeErr(conn, proto.CodeDestForbidden, "destination not allowed by user policy")
+		return
+	}
 
 	originIP := ch.OriginIP
 	if originIP == "" {
@@ -135,16 +150,17 @@ func (s *Server) handleChain(ctx context.Context, conn transport.Conn, f proto.F
 		writeErr(conn, proto.CodeNoCapacity, "buffer budget exhausted")
 		return
 	}
-	inWindow := s.cfg.SendWindow
+	cfg := s.Config()
+	inWindow := cfg.SendWindow
 	if ch.Window > 0 && ch.Window < inWindow {
 		inWindow = ch.Window
 	}
-	outWindow := s.cfg.SendWindow
+	outWindow := cfg.SendWindow
 	if nested.limits.Window > 0 && nested.limits.Window < outWindow {
 		outWindow = nested.limits.Window
 	}
 	outChunk := clampChunk(nested.limits.DataChunkBytes)
-	outSwitch := s.cfg.SwitchTimeout.Duration()
+	outSwitch := cfg.SwitchTimeout.Duration()
 	if nested.limits.SwitchTimeoutMs > 0 {
 		outSwitch = time.Duration(nested.limits.SwitchTimeoutMs) * time.Millisecond
 	}
@@ -163,14 +179,14 @@ func (s *Server) handleChain(ctx context.Context, conn transport.Conn, f proto.F
 		outDir:     proto.DirDown,
 		inDir:      proto.DirUp,
 	}, pumpConfig{
-		chunk:         s.cfg.DataChunkBytes,
+		chunk:         cfg.DataChunkBytes,
 		window:        inWindow,
 		buffer:        inBuf,
-		keepalive:     s.cfg.KeepaliveInterval.Duration(),
-		idle:          s.cfg.IdleTimeout.Duration(),
-		switchTimeout: s.cfg.SwitchTimeout.Duration(),
-		heartbeat:     s.cfg.HeartbeatInterval.Duration(),
-		deadThreshold: s.cfg.DeadPeerThreshold,
+		keepalive:     cfg.KeepaliveInterval.Duration(),
+		idle:          cfg.IdleTimeout.Duration(),
+		switchTimeout: cfg.SwitchTimeout.Duration(),
+		heartbeat:     cfg.HeartbeatInterval.Duration(),
+		deadThreshold: cfg.DeadPeerThreshold,
 		log:           sessLog,
 		// J-D13: the bridge is an in-memory pipe, not a socket, so there is no
 		// fd to splice from or to.
@@ -197,9 +213,9 @@ func (s *Server) handleChain(ctx context.Context, conn transport.Conn, f proto.F
 		id:           sess.ID,
 		srv:          s,
 		store:        s.store,
-		cfg:          s.cfg,
+		cfg:          cfg,
 		window:       inWindow,
-		holdTimeout:  s.cfg.HoldTimeout.Duration(),
+		holdTimeout:  cfg.HoldTimeout.Duration(),
 		nested:       nested,
 		releaseChain: releaseChain,
 		log:          sessLog,
@@ -253,10 +269,10 @@ func (s *Server) handleChain(ctx context.Context, conn transport.Conn, f proto.F
 		UDP:         udp,
 		Limits: proto.Limits{
 			BufferBytes:     inBuf,
-			HoldTimeoutMs:   int(s.cfg.HoldTimeout.Duration() / time.Millisecond),
+			HoldTimeoutMs:   int(cfg.HoldTimeout.Duration() / time.Millisecond),
 			Window:          inWindow,
-			DataChunkBytes:  s.cfg.DataChunkBytes,
-			SwitchTimeoutMs: int(s.cfg.SwitchTimeout.Duration() / time.Millisecond),
+			DataChunkBytes:  cfg.DataChunkBytes,
+			SwitchTimeoutMs: int(cfg.SwitchTimeout.Duration() / time.Millisecond),
 		},
 		ServerNonce: serverNonce,
 	}
@@ -453,21 +469,21 @@ func (s *Server) chainPolicy(ch proto.ChainHello, selfAddr string) *proto.Error 
 		return proto.NewError(proto.CodeProto, "CHAIN without hops; send HELLO instead")
 	}
 	// J-D8: chaining is default-deny. Without this any authenticated client
-	// could turn a relay into an open chaining proxy and DoS amplifier.
-	if len(s.cfg.AllowRelayHops) == 0 {
+	cfg := s.Config()
+	if len(cfg.AllowRelayHops) == 0 {
 		return proto.NewError(proto.CodeHopForbidden, "chaining is not enabled on this server")
 	}
 	for _, h := range ch.Hops {
 		if _, _, err := net.SplitHostPort(h.Addr); err != nil {
 			return proto.NewError(proto.CodeProto, "bad hop address "+h.Addr)
 		}
-		if !config.HopAllowed(h.Addr, s.cfg.AllowRelayHops) {
+		if !config.HopAllowed(h.Addr, cfg.AllowRelayHops) {
 			return proto.NewError(proto.CodeHopForbidden, "relay hop not allowed: "+h.Addr)
 		}
 	}
-	if len(ch.Hops)+1 > s.cfg.MaxChainDepth {
+	if len(ch.Hops)+1 > cfg.MaxChainDepth {
 		return proto.NewError(proto.CodeChainTooLong,
-			"chain of "+strconv.Itoa(len(ch.Hops)+1)+" exceeds max_chain_depth "+strconv.Itoa(s.cfg.MaxChainDepth))
+			"chain of "+strconv.Itoa(len(ch.Hops)+1)+" exceeds max_chain_depth "+strconv.Itoa(cfg.MaxChainDepth))
 	}
 	// JR9: hairpin and mutual-reference loops.
 	self := s.chainSelfAddrs(selfAddr)
@@ -493,7 +509,8 @@ func (s *Server) chainPolicy(ch proto.ChainHello, selfAddr string) *proto.Error 
 // caught whichever form the originator used to name it.
 func (s *Server) chainSelfAddrs(selfAddr string) []string {
 	out := make([]string, 0, 4)
-	for _, a := range []string{selfAddr, s.Addr(), s.cfg.ListenTCP, s.cfg.UDPListen, s.cfg.UDPAnnounce} {
+	cfg := s.Config()
+	for _, a := range []string{selfAddr, s.Addr(), cfg.ListenTCP, cfg.UDPListen, cfg.UDPAnnounce} {
 		if a != "" {
 			out = append(out, a)
 		}
@@ -583,7 +600,8 @@ func (s *Server) negotiateOnward(
 	nextHopIndex int,
 	log *slog.Logger,
 ) (*nestedHop, *proto.Error) {
-	dialCtx, cancelDial := context.WithTimeout(ctx, s.cfg.DialTimeout.Duration())
+	cfg := s.Config()
+	dialCtx, cancelDial := context.WithTimeout(ctx, cfg.DialTimeout.Duration())
 	oconn, err := transport.DialTCPWithDelayAndBind(dialCtx, next.Addr, transport.DefaultConnectionAttemptDelay, transport.BindConfig{})
 	cancelDial()
 	if err != nil {
@@ -660,7 +678,7 @@ func (s *Server) negotiateOnward(
 			Transport:   pref,
 			ClientNonce: onwardNonce,
 			Auth:        ch.Auth,
-			Window:      s.cfg.SendWindow,
+			Window:      cfg.SendWindow,
 		})
 	} else {
 		onward, err = proto.MarshalFrame(proto.TypeHello, proto.Hello{
@@ -669,7 +687,7 @@ func (s *Server) negotiateOnward(
 			Destination: ch.Destination,
 			ClientNonce: onwardNonce,
 			Auth:        ch.Auth,
-			Window:      s.cfg.SendWindow,
+			Window:      cfg.SendWindow,
 		})
 	}
 	if err != nil {
@@ -714,7 +732,7 @@ func (s *Server) negotiateOnward(
 				aok.Attest = attest
 				aok.HelloJSON = string(canonical)
 			}
-			if relays >= s.cfg.ChainAuthRelaysMax {
+			if relays >= cfg.ChainAuthRelaysMax {
 				_ = cipher.Close()
 				return nil, proto.NewError(proto.CodeAuth, "too many relayed challenges")
 			}
@@ -802,7 +820,8 @@ func (s *Server) relayFrameInbound(conn transport.Conn, typ proto.Type, v any) e
 // intermediate. The hop tag is stripped before the signature goes onward: the
 // challenge binds the HELLO bytes, never the AUTH bytes.
 func (s *Server) readRelayedAuth(conn transport.Conn, hop int) (proto.Frame, *proto.Error) {
-	timeout := s.cfg.ChainAuthTimeout.Duration()
+	cfg := s.Config()
+	timeout := cfg.ChainAuthTimeout.Duration()
 	if timeout <= 0 {
 		timeout = 10 * time.Second
 	}
@@ -836,12 +855,13 @@ func (s *Server) readRelayedAuth(conn transport.Conn, hop int) (proto.Frame, *pr
 // anything (J-D3), so an intermediate that cannot verify locally is a defence
 // in depth, not the last line.
 func (s *Server) verifyOnwardHostKey(next proto.HopSpec, pub ed25519.PublicKey, log *slog.Logger) error {
-	if next.Fp == "" && strings.TrimSpace(s.cfg.RelayKnownHosts) == "" {
+	cfg := s.Config()
+	if next.Fp == "" && strings.TrimSpace(cfg.RelayKnownHosts) == "" {
 		log.Warn("onward hop host key not verified locally; relying on the originator's attestation check " +
 			"(set relay_known_hosts to verify here too)")
 		return nil
 	}
-	return kex.VerifyKnownHosts(s.cfg.RelayKnownHosts, next.Addr, pub, next.Fp, s.cfg.RelayStrictHostKeyChecking)
+	return kex.VerifyKnownHosts(cfg.RelayKnownHosts, next.Addr, pub, next.Fp, cfg.RelayStrictHostKeyChecking)
 }
 
 // chainHopTransport picks the onward transport preference. An empty hop
@@ -863,40 +883,42 @@ func chainHopTransport(next proto.HopSpec, log *slog.Logger) []string {
 // to the originator instead of signing here.
 func (s *Server) nestedClientConfig(next proto.HopSpec, dest string) config.Client {
 	c := config.DefaultClient()
+	cfg := s.Config()
 	c.Server = next.Addr
 	c.Destination = dest
 	c.Transport = "tcp"
 	if len(next.Transport) > 0 {
 		c.Transport = next.Transport[0]
 	}
-	c.AuthMethod = s.cfg.AuthMethod
+	c.AuthMethod = cfg.AuthMethod
 	c.AuthUser = next.User
-	c.KnownHosts = s.cfg.RelayKnownHosts
+	c.KnownHosts = cfg.RelayKnownHosts
 	c.ServerFingerprint = next.Fp
-	c.StrictHostKeyChecking = s.cfg.RelayStrictHostKeyChecking
+	c.StrictHostKeyChecking = cfg.RelayStrictHostKeyChecking
 	// Unattended intermediates cannot TOFU. If this process has neither a pin
 	// nor relay_known_hosts, skip local verification: the originator still
 	// checks every relayed transcript (J-D3), including Case C resume KEX.
-	if next.Fp == "" && strings.TrimSpace(s.cfg.RelayKnownHosts) == "" {
+	if next.Fp == "" && strings.TrimSpace(cfg.RelayKnownHosts) == "" {
 		c.StrictHostKeyChecking = "no"
 	}
-	c.HeartbeatInterval = s.cfg.HeartbeatInterval
-	c.DeadPeerThreshold = s.cfg.DeadPeerThreshold
-	c.KeepaliveInterval = s.cfg.KeepaliveInterval
-	c.IdleTimeout = s.cfg.IdleTimeout
-	c.ReconnectMaxElapsed = s.cfg.HoldTimeout
+	c.HeartbeatInterval = cfg.HeartbeatInterval
+	c.DeadPeerThreshold = cfg.DeadPeerThreshold
+	c.KeepaliveInterval = cfg.KeepaliveInterval
+	c.IdleTimeout = cfg.IdleTimeout
+	c.ReconnectMaxElapsed = cfg.HoldTimeout
 	c.AllowHA = next.AllowHA
 	c.Splice = false
-	c.AdaptiveKCP = s.cfg.AdaptiveKCP
-	c.LogLevel = s.cfg.LogLevel
-	c.LogFormat = s.cfg.LogFormat
+	c.AdaptiveKCP = cfg.AdaptiveKCP
+	c.LogLevel = cfg.LogLevel
+	c.LogFormat = cfg.LogFormat
 	return c
 }
 
 // chainBufCap sizes one ring of a chained session against the shared Budget,
 // mirroring the clipping handleHello applies to a direct session.
 func (s *Server) chainBufCap(peerLimit int) int {
-	cap := s.cfg.BufferBytes
+	cfg := s.Config()
+	cap := cfg.BufferBytes
 	if peerLimit > 0 && peerLimit < cap {
 		cap = peerLimit
 	}
@@ -914,7 +936,8 @@ func (s *Server) chainBufCap(peerLimit int) int {
 // (JR4). Without the first, every chained session arrives from the
 // intermediate's single address and trips max_conns_per_ip almost immediately.
 func (s *Server) reserveChain(peerIP, originIP string) (func(), error) {
-	if limit := s.cfg.ChainSessionLimit(); limit > 0 && int(s.chainActive.Load()) >= limit {
+	cfg := s.Config()
+	if limit := cfg.ChainSessionLimit(); limit > 0 && int(s.chainActive.Load()) >= limit {
 		return nil, proto.NewError(proto.CodeNoCapacity, "chain session limit reached")
 	}
 	acct := originIP
@@ -928,7 +951,7 @@ func (s *Server) reserveChain(peerIP, originIP string) (func(), error) {
 	if s.chainPeers == nil {
 		s.chainPeers = make(map[string]int)
 	}
-	if max := s.cfg.MaxChainConnsPerPeer; max > 0 && s.chainPeers[peerIP] >= max {
+	if max := cfg.MaxChainConnsPerPeer; max > 0 && s.chainPeers[peerIP] >= max {
 		s.ipMu.Unlock()
 		s.decIPSess(acct)
 		return nil, proto.NewError(proto.CodeNoCapacity, "too many chained sessions from this upstream relay")

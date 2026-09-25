@@ -449,7 +449,7 @@ func TestChainThreeHops(t *testing.T) {
 
 	dest := destLn.Addr().String()
 	head, srvs := startChain(t, 3, dest)
-	if len(srvs[2].cfg.AllowRelayHops) != 0 {
+	if len(srvs[2].Config().AllowRelayHops) != 0 {
 		t.Fatal("terminal must have empty allow_relay_hops")
 	}
 	ccfg := chainClientCfg(srvs[2].Addr(), dest, []string{head, srvs[1].Addr()})
@@ -485,7 +485,7 @@ func TestChainHopNotAllowed(t *testing.T) {
 	}()
 	dest := ln.Addr().String()
 	srv, addr, _ := startRelayCfg(t, chainServerCfg(dest))
-	if len(srv.cfg.AllowRelayHops) != 0 {
+	if len(srv.Config().AllowRelayHops) != 0 {
 		t.Fatal("default-deny expected")
 	}
 
@@ -674,7 +674,7 @@ func TestChainVersionSkewFailClosed(t *testing.T) {
 func TestChainTerminalHasNoChainCode(t *testing.T) {
 	dest := echoDest(t)
 	head, srvs := startChain(t, 2, dest)
-	if len(srvs[1].cfg.AllowRelayHops) != 0 {
+	if len(srvs[1].Config().AllowRelayHops) != 0 {
 		t.Fatal("terminal allow_relay_hops must be empty")
 	}
 	ccfg := chainClientCfg(srvs[1].Addr(), dest, []string{head})

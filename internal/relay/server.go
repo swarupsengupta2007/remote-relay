@@ -32,8 +32,12 @@ import (
 const shutdownDrain = 5 * time.Second
 
 type Server struct {
-	cfg    config.Server
+	cfgPtr atomic.Pointer[config.Server]
+	optsMu sync.RWMutex
+	opts   config.ServerOptions
+	logMu  sync.RWMutex
 	log    *slog.Logger
+	authMu sync.RWMutex
 	auth   auth.Authenticator
 	store  *session.Store
 	budget *session.Budget
@@ -97,6 +101,128 @@ type Server struct {
 	reexecArgs      []string
 }
 
+func (s *Server) Config() config.Server {
+	if p := s.cfgPtr.Load(); p != nil {
+		return *p
+	}
+	return config.DefaultServer()
+}
+
+func (s *Server) getAuth() auth.Authenticator {
+	s.authMu.RLock()
+	defer s.authMu.RUnlock()
+	return s.auth
+}
+
+func (s *Server) setAuth(a auth.Authenticator) {
+	s.authMu.Lock()
+	defer s.authMu.Unlock()
+	s.auth = a
+}
+
+func (s *Server) getLogger() *slog.Logger {
+	s.logMu.RLock()
+	defer s.logMu.RUnlock()
+	return s.log
+}
+
+func (s *Server) setLogger(l *slog.Logger) {
+	s.logMu.Lock()
+	defer s.logMu.Unlock()
+	s.log = l
+}
+
+func (s *Server) SetOptions(opts config.ServerOptions) {
+	s.optsMu.Lock()
+	defer s.optsMu.Unlock()
+	s.opts = opts
+}
+
+func (s *Server) getOptions() config.ServerOptions {
+	s.optsMu.RLock()
+	defer s.optsMu.RUnlock()
+	return s.opts
+}
+
+// ReloadConfig re-reads the server's configuration file (if configured) and
+// the authorized_keys file, validates the changes, and atomically updates the
+// server's active configuration and authenticator. Active sessions and listener
+// sockets continue uninterrupted (FEAT-SEC-03).
+func (s *Server) ReloadConfig() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	currentCfg := s.Config()
+	opts := s.getOptions()
+	if opts.ConfigPath == "" && currentCfg.ConfigPath != "" {
+		opts.ConfigPath = currentCfg.ConfigPath
+	}
+	if opts.AuthorizedKeys == "" && currentCfg.AuthorizedKeys != "" {
+		opts.AuthorizedKeys = currentCfg.AuthorizedKeys
+	}
+
+	var newCfg config.Server
+	if opts.ConfigPath != "" {
+		loaded, err := config.LoadServer(opts)
+		if err != nil {
+			s.log.Error("reload: failed to reload configuration file; keeping existing configuration", "path", opts.ConfigPath, "err", err)
+			return fmt.Errorf("reload config file %q: %w", opts.ConfigPath, err)
+		}
+		newCfg = loaded
+		// Sockets cannot be re-bound on live reload without restart
+		newCfg.ListenTCP = currentCfg.ListenTCP
+		newCfg.UDPListen = currentCfg.UDPListen
+	} else {
+		newCfg = currentCfg
+	}
+
+	var newAuth auth.Authenticator
+	entriesCount := 0
+	if newCfg.AuthMethod == auth.MethodPublicKey {
+		akPath := newCfg.AuthorizedKeys
+		if akPath == "" {
+			akPath = auth.DefaultAuthorizedKeys()
+		}
+
+		entries, err := auth.LoadAuthorizedKeyEntries(akPath)
+		if err != nil || len(entries) == 0 {
+			s.log.Error("reload: failed to read authorized_keys or no valid keys found; keeping existing authentication", "path", akPath, "err", err)
+			return fmt.Errorf("reload authorized_keys %q: %w", akPath, err)
+		}
+		entriesCount = len(entries)
+		newAuth = auth.New(auth.Config{
+			Method:         newCfg.AuthMethod,
+			AuthorizedKeys: akPath,
+			FailDelay:      newCfg.AuthFailDelay.Duration(),
+		})
+	} else {
+		newAuth = auth.New(auth.Config{
+			Method:    newCfg.AuthMethod,
+			FailDelay: newCfg.AuthFailDelay.Duration(),
+		})
+	}
+
+	if err := newCfg.Validate(); err != nil {
+		s.log.Error("reload: configuration validation failed; keeping existing configuration", "err", err)
+		return fmt.Errorf("validate reloaded configuration: %w", err)
+	}
+
+	s.cfgPtr.Store(&newCfg)
+	s.setAuth(newAuth)
+
+	if newCfg.LogLevel != currentCfg.LogLevel || newCfg.LogFormat != currentCfg.LogFormat {
+		s.setLogger(logging.New(nil, newCfg.LogLevel, newCfg.LogFormat))
+	}
+
+	s.log.Info("configuration reloaded successfully via SIGHUP",
+		"config_path", newCfg.ConfigPath,
+		"authorized_keys", newCfg.AuthorizedKeys,
+		"authorized_keys_count", entriesCount,
+		"allow_destinations", newCfg.AllowDestinations,
+	)
+	return nil
+}
+
 func NewServer(cfg config.Server, log *slog.Logger) *Server {
 	if log == nil {
 		log = logging.New(nil, cfg.LogLevel, cfg.LogFormat)
@@ -124,10 +250,14 @@ func NewServer(cfg config.Server, log *slog.Logger) *Server {
 		log.Error("failed to load host key", "err", hostErr)
 	}
 
-	return &Server{
-		cfg:            cfg,
+	akPath := cfg.AuthorizedKeys
+	if akPath == "" {
+		akPath = auth.DefaultAuthorizedKeys()
+	}
+
+	s := &Server{
 		log:            log,
-		auth:           auth.New(auth.Config{Method: cfg.AuthMethod, AuthorizedKeys: cfg.AuthorizedKeys, FailDelay: cfg.AuthFailDelay.Duration()}),
+		auth:           auth.New(auth.Config{Method: cfg.AuthMethod, AuthorizedKeys: akPath, FailDelay: cfg.AuthFailDelay.Duration()}),
 		store:          session.NewStore(cfg.MaxSessions),
 		budget:         session.NewBudget(int64(cfg.TotalBufferBytes)),
 		hostKey:        hostKey,
@@ -137,10 +267,14 @@ func NewServer(cfg config.Server, log *slog.Logger) *Server {
 		probeBySess:    make(map[string][16]byte),
 		ipConns:        make(map[string]int),
 		ipSess:         make(map[string]int),
+		chainPeers:     make(map[string]int),
 		runCtx:         runCtx,
 		runCancel:      runCancel,
 		restartingDone: make(chan struct{}),
+		opts:           config.ServerOptions{ConfigPath: cfg.ConfigPath, AuthorizedKeys: cfg.AuthorizedKeys},
 	}
+	s.cfgPtr.Store(&cfg)
+	return s
 }
 
 func (s *Server) HostPublicKey() ed25519.PublicKey {
@@ -352,7 +486,8 @@ func (s *Server) adoptHandover() (bool, error) {
 		}
 
 		sendLog := session.RestoreRing(hSess.SendLogBase, hSess.SendLogData, hSess.SendLogCap, s.budget)
-		window := s.cfg.SendWindow
+		cfg := s.Config()
+		window := cfg.SendWindow
 		if window <= 0 {
 			window = 64
 		}
@@ -373,16 +508,16 @@ func (s *Server) adoptHandover() (bool, error) {
 			outDir:     proto.DirDown,
 			inDir:      proto.DirUp,
 		}, pumpConfig{
-			chunk:         s.cfg.DataChunkBytes,
+			chunk:         cfg.DataChunkBytes,
 			window:        window,
 			buffer:        hSess.SendLogCap,
-			keepalive:     s.cfg.KeepaliveInterval.Duration(),
-			idle:          s.cfg.IdleTimeout.Duration(),
-			switchTimeout: s.cfg.SwitchTimeout.Duration(),
-			heartbeat:     s.cfg.HeartbeatInterval.Duration(),
-			deadThreshold: s.cfg.DeadPeerThreshold,
+			keepalive:     cfg.KeepaliveInterval.Duration(),
+			idle:          cfg.IdleTimeout.Duration(),
+			switchTimeout: cfg.SwitchTimeout.Duration(),
+			heartbeat:     cfg.HeartbeatInterval.Duration(),
+			deadThreshold: cfg.DeadPeerThreshold,
 			log:           log,
-			splice:        s.cfg.Splice,
+			splice:        cfg.Splice,
 		}, sendLog)
 
 		p.delivered.Store(hSess.UpAcked)
@@ -396,7 +531,7 @@ func (s *Server) adoptHandover() (bool, error) {
 			p.outFinal.Store(hSess.DownNext)
 		}
 
-		holdDuration := s.cfg.HoldTimeout.Duration()
+		holdDuration := cfg.HoldTimeout.Duration()
 		if hSess.RemainingHoldMs > 0 {
 			holdDuration = time.Duration(hSess.RemainingHoldMs) * time.Millisecond
 		}
@@ -406,7 +541,7 @@ func (s *Server) adoptHandover() (bool, error) {
 			id:             hSess.Session.ID,
 			srv:            s,
 			store:          s.store,
-			cfg:            s.cfg,
+			cfg:            cfg,
 			window:         window,
 			holdTimeout:    holdDuration,
 			dest:           dtcp,
@@ -479,7 +614,7 @@ func (s *Server) Listen() error {
 		return nil
 	}
 
-	ln, err := transport.ListenTCP(s.cfg.ListenTCP)
+	ln, err := transport.ListenTCP(s.Config().ListenTCP)
 	if err != nil {
 		return err
 	}
@@ -499,10 +634,12 @@ func (s *Server) Serve(ctx context.Context) error {
 	s.serveCtx = ctx
 	s.mu.Unlock()
 	s.setupHotRestartSignal(ctx)
-	if config.AllowAll(s.cfg.AllowDestinations) {
+	s.setupSIGHUPSignal(ctx)
+	cfg := s.Config()
+	if config.AllowAll(cfg.AllowDestinations) {
 		s.log.Warn("allow_destinations includes \"*\": this process is an open TCP proxy")
 	}
-	if config.AllowAll(s.cfg.AllowRelayHops) {
+	if config.AllowAll(cfg.AllowRelayHops) {
 		s.log.Warn("allow_relay_hops includes \"*\": this process will chain to any next hop (max_chain_depth must be 1)")
 	}
 
@@ -651,7 +788,7 @@ func (s *Server) handle(raw net.Conn) {
 	}
 	// Flood cap counts live TCP sockets (2× max_conns_per_ip). HELLO is
 	// refused with ERR_NO_CAPACITY; RESUME of an existing session proceeds.
-	if max := s.cfg.MaxConnsPerIP; max > 0 && n > 2*max && (f.Type == proto.TypeHello || f.Type == proto.TypeChain) {
+	if max := s.Config().MaxConnsPerIP; max > 0 && n > 2*max && (f.Type == proto.TypeHello || f.Type == proto.TypeChain) {
 		s.refused.Add(1)
 		writeErr(cipherConn, proto.CodeNoCapacity, "too many connections from this address")
 		return
@@ -672,7 +809,7 @@ func (s *Server) handle(raw net.Conn) {
 // It is the seam a chained leg substitutes: an intermediate presents a nested
 // relay session in place of a real destination socket (FEAT-UTL-05 §2.1).
 func (s *Server) dialDestination(ctx context.Context, dest string) (*net.TCPConn, *proto.Error) {
-	d := net.Dialer{Timeout: s.cfg.DialTimeout.Duration(), KeepAlive: 15 * time.Second}
+	d := net.Dialer{Timeout: s.Config().DialTimeout.Duration(), KeepAlive: 15 * time.Second}
 	dconn, err := d.DialContext(ctx, "tcp", dest)
 	if err != nil {
 		return nil, proto.NewError(proto.CodeDestRefused, "dial destination failed")
@@ -687,6 +824,7 @@ func (s *Server) dialDestination(ctx context.Context, dest string) (*net.TCPConn
 }
 
 func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.Frame, ip string, releaseTCP func(), kexNonce string) {
+	cfg := s.Config()
 	var hello proto.Hello
 	if err := proto.UnmarshalPayload(f, &hello); err != nil {
 		writeErr(conn, proto.CodeProto, "bad HELLO")
@@ -700,19 +838,19 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 	dest := hello.Destination
 	isSocks := dest == proto.DestSOCKS5
 	if isSocks {
-		if s.cfg.DisableSOCKS {
+		if cfg.DisableSOCKS {
 			writeErr(conn, proto.CodeDestForbidden, "socks proxy mode disabled")
 			return
 		}
 	} else {
 		if dest == "" {
-			dest = s.cfg.DefaultDestination
+			dest = cfg.DefaultDestination
 		}
 		if _, _, err := net.SplitHostPort(dest); err != nil {
 			writeErr(conn, proto.CodeProto, "bad destination")
 			return
 		}
-		if !config.DestinationAllowed(dest, s.cfg.AllowDestinations) {
+		if !config.DestinationAllowed(dest, cfg.AllowDestinations) {
 			writeErr(conn, proto.CodeDestForbidden, "destination not allowed")
 			return
 		}
@@ -727,6 +865,26 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 	sess.AuthUser = id.Name
 	sess.Fingerprint = id.Fingerprint
 	sess.PublicKey = id.RawPubKey
+	sess.PortForwardingBlocked = id.PortForwardingBlocked
+	sess.PermittedDestinations = id.PermittedDestinations
+
+	// Check per-user RBAC restrictions from authorized_keys
+	if id.PortForwardingBlocked {
+		s.refused.Add(1)
+		if isSocks {
+			writeErr(conn, proto.CodeDestForbidden, "socks proxy mode disabled for this key")
+		} else {
+			writeErr(conn, proto.CodeDestForbidden, "port forwarding is disabled for this key")
+		}
+		return
+	}
+	if !isSocks && len(id.PermittedDestinations) > 0 {
+		if !config.DestinationAllowed(dest, id.PermittedDestinations) {
+			s.refused.Add(1)
+			writeErr(conn, proto.CodeDestForbidden, "destination not allowed by user policy")
+			return
+		}
+	}
 
 	if err := s.tryReserveIPSess(ip); err != nil {
 		s.refused.Add(1)
@@ -760,12 +918,12 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 		dtcp     *net.TCPConn
 		smux     *socksServerMux
 		sIO      sessionIO
-		doSplice = s.cfg.Splice
+		doSplice = cfg.Splice
 	)
 	if isSocks {
 		toMuxR, toMuxW := io.Pipe()
 		fromMuxR, fromMuxW := io.Pipe()
-		smux = newSocksServerMux(s, sess.ID, toMuxR, toMuxW, fromMuxR, fromMuxW)
+		smux = newSocksServerMux(s, sess.ID, toMuxR, toMuxW, fromMuxR, fromMuxW, sess.PortForwardingBlocked, sess.PermittedDestinations)
 		sIO = sessionIO{
 			src:        fromMuxR,
 			sink:       toMuxW,
@@ -801,11 +959,11 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 		}
 	}
 
-	window := s.cfg.SendWindow
+	window := cfg.SendWindow
 	if hello.Window > 0 && hello.Window < window {
 		window = hello.Window
 	}
-	bufCap := s.cfg.BufferBytes
+	bufCap := cfg.BufferBytes
 	if rem := s.budget.Remaining(); rem > 0 && rem < int64(bufCap) {
 		bufCap = int(rem)
 	}
@@ -830,10 +988,10 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 		UDP:         udp,
 		Limits: proto.Limits{
 			BufferBytes:     bufCap,
-			HoldTimeoutMs:   int(s.cfg.HoldTimeout.Duration() / time.Millisecond),
+			HoldTimeoutMs:   int(cfg.HoldTimeout.Duration() / time.Millisecond),
 			Window:          window,
-			DataChunkBytes:  s.cfg.DataChunkBytes,
-			SwitchTimeoutMs: int(s.cfg.SwitchTimeout.Duration() / time.Millisecond),
+			DataChunkBytes:  cfg.DataChunkBytes,
+			SwitchTimeoutMs: int(cfg.SwitchTimeout.Duration() / time.Millisecond),
 		},
 		ServerNonce: serverNonce,
 	}
@@ -854,14 +1012,14 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 	sendLog := session.NewRing(bufCap, s.budget)
 	sIO.conn = rawConn
 	p := newPump(ctx, sIO, pumpConfig{
-		chunk:         s.cfg.DataChunkBytes,
+		chunk:         cfg.DataChunkBytes,
 		window:        window,
 		buffer:        bufCap,
-		keepalive:     s.cfg.KeepaliveInterval.Duration(),
-		idle:          s.cfg.IdleTimeout.Duration(),
-		switchTimeout: s.cfg.SwitchTimeout.Duration(),
-		heartbeat:     s.cfg.HeartbeatInterval.Duration(),
-		deadThreshold: s.cfg.DeadPeerThreshold,
+		keepalive:     cfg.KeepaliveInterval.Duration(),
+		idle:          cfg.IdleTimeout.Duration(),
+		switchTimeout: cfg.SwitchTimeout.Duration(),
+		heartbeat:     cfg.HeartbeatInterval.Duration(),
+		deadThreshold: cfg.DeadPeerThreshold,
 		log:           log,
 		splice:        doSplice,
 	}, sendLog)
@@ -871,9 +1029,9 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 		id:              sess.ID,
 		srv:             s,
 		store:           s.store,
-		cfg:             s.cfg,
+		cfg:             cfg,
 		window:          window,
-		holdTimeout:     s.cfg.HoldTimeout.Duration(),
+		holdTimeout:     cfg.HoldTimeout.Duration(),
 		dest:            dtcp,
 		socksMux:        smux,
 		log:             log,
@@ -934,7 +1092,7 @@ func (s *Server) handleResume(ctx context.Context, conn transport.Conn, f proto.
 	fallback := false
 	if err := s.store.VerifyToken(msg.SessionID, msg.ResumeToken); err != nil {
 		sess := s.store.Get(msg.SessionID)
-		if s.auth.RequiresChallenge() && sess != nil && (sess.Fingerprint != "" || len(sess.PublicKey) > 0) {
+		if s.getAuth().RequiresChallenge() && sess != nil && (sess.Fingerprint != "" || len(sess.PublicKey) > 0) {
 			fallback = true
 		} else {
 			code, m := proto.CodeBadToken, "bad resume token"
@@ -1666,7 +1824,7 @@ func (s *Server) heldCount() int {
 }
 
 func (s *Server) authFail(conn transport.Conn, started time.Time) {
-	if d := s.auth.FailDelay(); d > 0 {
+	if d := s.getAuth().FailDelay(); d > 0 {
 		if started.IsZero() {
 			time.Sleep(d)
 		} else if rem := d - time.Since(started); rem > 0 {
@@ -1677,8 +1835,9 @@ func (s *Server) authFail(conn transport.Conn, started time.Time) {
 }
 
 func (s *Server) helloAuth(conn transport.Conn, hello proto.Hello, canonical []byte, dest, kexNonce string) (auth.Identity, *session.Session, string, string, bool) {
-	if !s.auth.RequiresChallenge() {
-		id, err := s.auth.Verify(auth.Challenge{
+	a := s.getAuth()
+	if !a.RequiresChallenge() {
+		id, err := a.Verify(auth.Challenge{
 			Destination: dest,
 			ClientNonce: hello.ClientNonce,
 		}, hello.Auth)
@@ -1726,7 +1885,7 @@ func (s *Server) helloAuth(conn transport.Conn, hello proto.Hello, canonical []b
 		return auth.Identity{}, nil, "", "", false
 	}
 	started := time.Now()
-	id, err := s.auth.Verify(ch, raw)
+	id, err := a.Verify(ch, raw)
 	if err != nil {
 		s.authFail(conn, started)
 		return auth.Identity{}, nil, "", "", false
@@ -1746,7 +1905,8 @@ func authServerNonce(kexNonce string) (string, error) {
 }
 
 func (s *Server) resumeAuth(conn transport.Conn, msg proto.Resume, canonical []byte, kexNonce string) bool {
-	if !s.auth.RequiresChallenge() {
+	a := s.getAuth()
+	if !a.RequiresChallenge() {
 		return true
 	}
 	sess := s.store.Get(msg.SessionID)
@@ -1778,7 +1938,7 @@ func (s *Server) resumeAuth(conn transport.Conn, msg proto.Resume, canonical []b
 		return false
 	}
 	started := time.Now()
-	if _, err := s.auth.Verify(ch, raw); err != nil {
+	if _, err := a.Verify(ch, raw); err != nil {
 		s.authFail(conn, started)
 		return false
 	}
@@ -1815,7 +1975,7 @@ func (s *Server) challengeAndVerify(conn transport.Conn, ch auth.Challenge, hop 
 		return auth.Identity{}, false
 	}
 	started := time.Now()
-	id, err := s.auth.Verify(ch, raw)
+	id, err := s.getAuth().Verify(ch, raw)
 	if err != nil {
 		s.authFail(conn, started)
 		return auth.Identity{}, false
