@@ -3,6 +3,7 @@ package relay
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -602,7 +603,16 @@ func (s *Server) negotiateOnward(
 ) (*nestedHop, *proto.Error) {
 	cfg := s.Config()
 	dialCtx, cancelDial := context.WithTimeout(ctx, cfg.DialTimeout.Duration())
-	oconn, err := transport.DialTCPWithDelayAndBind(dialCtx, next.Addr, transport.DefaultConnectionAttemptDelay, transport.BindConfig{})
+	var oconn transport.Conn
+	var err error
+	if len(next.Transport) > 0 && (strings.EqualFold(next.Transport[0], "ws") || strings.EqualFold(next.Transport[0], "websocket")) {
+		oconn, err = transport.DialWebSocket(dialCtx, next.Addr, &transport.WebSocketDialOptions{
+			Timeout:   cfg.DialTimeout.Duration(),
+			TLSConfig: &tls.Config{InsecureSkipVerify: true},
+		})
+	} else {
+		oconn, err = transport.DialTCPWithDelayAndBind(dialCtx, next.Addr, transport.DefaultConnectionAttemptDelay, transport.BindConfig{})
+	}
 	cancelDial()
 	if err != nil {
 		return nil, proto.NewError(proto.CodeDestRefused, "dial onward hop failed")

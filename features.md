@@ -29,7 +29,7 @@ Each proposal includes:
 | [**FEAT-UTL-05**](.feat-impl/FEAT-UTL-05.md) | Multi-Hop Jumphost Chaining (`-J`) | Tier 2: Utility | **P1** | Complete | Server-side chaining with per-hop resume, relayed signatures, and KEX attestation |
 | **FEAT-UTL-06** | Chained Jumphost Rendezvous to NATed Terminal (`HopSpec.Target`) | Tier 2: Utility | **P2** | High | Traverses NAT/CGNAT terminals via reverse agent rendezvous (depends on FEAT-UTL-04) |
 | [**FEAT-SEC-01**](.feat-impl/FEAT-SEC-01.md) | Encrypted Handshake Control Plane (X25519 / ChaCha20-Poly1305) | Tier 3: Security | **P1** | Complete | SSH-style X25519 ECDH + Ed25519 host keys + ChaCha20-Poly1305 control encryption |
-| **FEAT-SEC-02** | WebSocket & HTTPS Port 443 Fallback Transport | Tier 3: Security | **P3** | High | Bypasses restrictive enterprise firewalls & DPI |
+| [**FEAT-SEC-02**](.feat-impl/FEAT-SEC-02.md) | WebSocket & HTTPS Port 443 Fallback Transport | Tier 3: Security | **P3** | Complete | Bypasses restrictive enterprise firewalls & DPI |
 | [**FEAT-SEC-03**](.feat-impl/FEAT-SEC-03.md) | Per-User RBAC & Live `SIGHUP` Configuration Reload | Tier 3: Security | **P2** | Complete | Hot updates to `authorized_keys` & destination ACLs |
 | [**FEAT-PERF-01**](.feat-impl/FEAT-PERF-01.md)| Linux Kernel Zero-Copy Stream Splicing (`splice(2)`) | Tier 4: Performance | **P3** | Complete | Halves CPU & memory bus overhead on multi-gigabit links |
 | [**FEAT-PERF-02**](.feat-impl/FEAT-PERF-02.md)| Adaptive KCP Dynamic ARQ & Congestion Tuning | Tier 4: Performance | **P3** | Complete | Dynamic packet retransmission on fluctuating mobile links |
@@ -334,25 +334,34 @@ As noted in [`design.md` §10.1](file:///root/remote-relay/design.md#L500-L511),
 
 ---
 
-### FEAT-SEC-02: WebSocket & HTTPS Port 443 Fallback Transport
-* **Priority**: `P2` (Medium)
-* **Status**: Proposed
-* **Target Package**: `internal/transport`, `internal/relay`
+### [FEAT-SEC-02](.feat-impl/FEAT-SEC-02.md): WebSocket & HTTPS Port 443 Fallback Transport
+* **Priority**: `P3` (Medium)
+* **Status**: Implemented (Complete)
+* **Target Package**: `internal/transport`, `internal/config`, `internal/relay`
 
 #### 1. Problem Statement
 Strict enterprise firewalls, corporate proxies, and public Wi-Fi portals (e.g. hotels and airports) frequently block all non-standard ports (such as 7443) and drop all UDP traffic, preventing both QUIC and direct TCP handshakes.
 
 #### 2. Technical Specification
 - **WebSocket Transport Adapter**:
-  - Implement a `transport.Conn` adapter backed by `gorilla/websocket` or `coder/websocket`.
-  - Connect via HTTPS: `wss://relay.example.com/relay-stream`.
+  - Implemented `KindWebSocket` and `wsConn` adapter conforming to `transport.Conn` in `internal/transport/websocket.go` with RFC 6455 binary frame encoding.
+  - Connect via HTTPS: `wss://relay.example.com/relay-stream` or unencrypted `ws://`.
 - **Multiplexing on Existing Web Servers**:
-  - Allow the relay server to serve the WebSocket endpoint behind Nginx, Caddy, or standard Go HTTP reverse proxies on port 443.
-  - Transparent HTTP proxy support (reads `HTTP_PROXY` and `HTTPS_PROXY` environment variables and sends HTTP `CONNECT` headers).
+  - Server provides standalone WebSocket listener (`listen_ws`, `websocket_path`, `ws_cert`, `ws_key`) or embeddable `WebSocketHandler()` to mount behind Nginx, Caddy, Cloudflare, Traefik, or standard Go HTTP reverse proxies on port 443.
+  - Supports path multiplexing alongside existing HTTP routes (e.g., `/relay-stream` and `/health`).
+- **HTTP Proxy Traversal**:
+  - Transparent HTTP proxy support via `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY`.
+  - Performs standard HTTP `CONNECT` tunneling with `Proxy-Authorization: Basic` support and buffer preservation.
+- **Reverse Proxy Header Extraction**:
+  - Automatically parses `X-Forwarded-For` and `X-Real-IP` to extract actual client IP and port for connection limits and rate limiting.
+- **KEX Handshake & Jumphost Chaining**:
+  - End-to-end integration with FEAT-SEC-01 encrypted handshake, host key verification (with URL scheme stripping), session resumption, and jumphost chaining (`-J hop1?transport=ws,hop2`).
 
-#### 3. Benefits & Verification
-- Ensures connection survivability even on restricted networks where only outbound HTTPS (TCP port 443) is permitted.
-- **Verification**: Route traffic through an Squid HTTP proxy that blocks all non-443 ports; verify client successfully connects and resumes.
+#### 3. Verification & Results
+- Verified 100% green test suite under `go test -race ./...`:
+  - `internal/transport/websocket_test.go`: happy path, TLS ephemeral certs, proxy tunneling, proxy basic auth, proxy refusal, invalid upgrade responses, client IP extraction, and deadline resets.
+  - `internal/relay/ws_test.go`: direct E2E streaming, TLS E2E streaming, reverse proxy multiplexing with `/health`, forward HTTP CONNECT proxy tunneling, jumphost chaining over WebSocket hops, session resumption, Ed25519 host key pinning/verification, and sad paths (closed port, TLS failure).
+
 
 ---
 
@@ -522,7 +531,7 @@ Phase 3: Expanded Utility & High Availability (4–6 weeks)
 ├── FEAT-UTL-03: SOCKS5 Dynamic Forwarding Mode [COMPLETED] (.feat-impl/FEAT-UTL-03.md)
 ├── FEAT-UTL-04: Reverse Relay & NAT Gateway Mode
 ├── FEAT-UTL-06: Chained Jumphost Rendezvous to NATed Terminal (depends on FEAT-UTL-04)
-└── FEAT-SEC-02: WebSocket & HTTPS Port 443 Fallback
+└── FEAT-SEC-02: WebSocket & HTTPS Port 443 Fallback [COMPLETED] (.feat-impl/FEAT-SEC-02.md)
 
 Phase 4: Advanced Optimizations (Ongoing)
 ├── FEAT-PERF-01: Linux Kernel Zero-Copy Stream Splicing [COMPLETED] (.feat-impl/FEAT-PERF-01.md)

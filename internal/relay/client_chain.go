@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -41,9 +42,23 @@ func clientChainHello(ctx context.Context, cfg config.Client, jumphosts []proto.
 		Interface: cfg.TCPInterface,
 		SourceIP:  net.ParseIP(cfg.TCPSourceIP),
 	}
-	conn, err := transport.DialTCPWithDelayAndBind(ctx, first.Addr, cfg.HappyEyeballsDelay.Duration(), tcpBind)
-	if err != nil {
-		return nil, none, fmt.Errorf("dial jumphost: %w", err)
+	var conn transport.Conn
+	var err error
+	if len(first.Transport) > 0 && (first.Transport[0] == "ws" || first.Transport[0] == "websocket") {
+		wsOpts := &transport.WebSocketDialOptions{
+			Bind:      tcpBind,
+			Timeout:   handshakeTimeout,
+			TLSConfig: &tls.Config{InsecureSkipVerify: cfg.TLSInsecure},
+		}
+		conn, err = transport.DialWebSocket(ctx, first.Addr, wsOpts)
+		if err != nil {
+			return nil, none, fmt.Errorf("dial websocket jumphost: %w", err)
+		}
+	} else {
+		conn, err = transport.DialTCPWithDelayAndBind(ctx, first.Addr, cfg.HappyEyeballsDelay.Duration(), tcpBind)
+		if err != nil {
+			return nil, none, fmt.Errorf("dial jumphost: %w", err)
+		}
 	}
 
 	kexCli, err := kex.NewClientSession()

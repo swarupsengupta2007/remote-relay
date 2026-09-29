@@ -105,6 +105,12 @@ type Server struct {
 	// FEAT-UTL-03 SOCKS5 dynamic proxy mode.
 	DisableSOCKS    bool `toml:"disable_socks"`
 	MaxSocksStreams int  `toml:"max_socks_streams"`
+
+	// FEAT-SEC-02 WebSocket & HTTPS Port 443 transport.
+	ListenWS      string `toml:"listen_ws"`
+	WebSocketPath string `toml:"websocket_path"`
+	WSCert        string `toml:"ws_cert"`
+	WSKey         string `toml:"ws_key"`
 }
 
 type Client struct {
@@ -155,6 +161,11 @@ type Client struct {
 	// FEAT-UTL-03 SOCKS5 dynamic proxy mode.
 	SocksListen     string `toml:"socks_listen"`
 	MaxSocksStreams int    `toml:"max_socks_streams"`
+
+	// FEAT-SEC-02 WebSocket transport.
+	WS            bool   `toml:"ws"`
+	WebSocketPath string `toml:"websocket_path"`
+	TLSInsecure   bool   `toml:"tls_insecure"`
 
 	TCPInterface string `toml:"-"`
 	UDPInterface string `toml:"-"`
@@ -219,6 +230,7 @@ func DefaultServer() Server {
 		ChainAuthRelaysMax:         8,
 		RelayStrictHostKeyChecking: "yes",
 		MaxSocksStreams:            512,
+		WebSocketPath:              "/relay-stream",
 	}
 }
 
@@ -227,6 +239,7 @@ func DefaultClient() Client {
 		Server:                "relay.example.com:7443",
 		Destination:           "",
 		Transport:             "quic",
+		WebSocketPath:         "/relay-stream",
 		BufferBytes:           67108864,
 		SendWindow:            4194304,
 		ProbeTimeout:          Duration(2 * time.Second),
@@ -269,6 +282,8 @@ type ServerOptions struct {
 	AdaptiveKCP       *bool
 	DisableSOCKS      *bool
 	MaxSocksStreams   int
+	ListenWS          string
+	WebSocketPath     string
 }
 
 type ClientOptions struct {
@@ -278,6 +293,7 @@ type ClientOptions struct {
 	DestSet               bool
 	TCP                   bool
 	KCP                   bool
+	WS                    bool
 	AllowHA               bool
 	AllowHASet            bool
 	LogLevel              string
@@ -303,6 +319,7 @@ type ClientOptions struct {
 	HUDIsTerminal         *bool
 	SocksListen           string
 	MaxSocksStreams       int
+	TLSInsecure           bool
 }
 
 func LoadServer(opts ServerOptions) (Server, error) {
@@ -350,6 +367,12 @@ func LoadServer(opts ServerOptions) (Server, error) {
 	if opts.MaxSocksStreams > 0 {
 		cfg.MaxSocksStreams = opts.MaxSocksStreams
 	}
+	if opts.ListenWS != "" {
+		cfg.ListenWS = opts.ListenWS
+	}
+	if opts.WebSocketPath != "" {
+		cfg.WebSocketPath = opts.WebSocketPath
+	}
 	if err := cfg.Validate(); err != nil {
 		return Server{}, err
 	}
@@ -379,11 +402,16 @@ func LoadClient(opts ClientOptions) (Client, error) {
 			cfg.Destination = opts.PosHost
 		}
 	}
-	// §8.5: --tcp > --kcp > config transport > default quic
-	if opts.TCP {
+	// §8.5: --ws > --tcp > --kcp > config transport > default quic
+	if opts.WS {
+		cfg.Transport = "ws"
+	} else if opts.TCP {
 		cfg.Transport = "tcp"
 	} else if opts.KCP {
 		cfg.Transport = "kcp"
+	}
+	if opts.TLSInsecure {
+		cfg.TLSInsecure = true
 	}
 	if opts.AllowHASet {
 		cfg.AllowHA = opts.AllowHA
@@ -577,6 +605,9 @@ func (c Client) Validate() error {
 	if strings.ToLower(strings.TrimSpace(c.Transport)) == "tcp" && c.AllowHA {
 		return fmt.Errorf("--allow-ha cannot be used with tcp transport")
 	}
+	if c.IsWS() && c.AllowHA {
+		return fmt.Errorf("--allow-ha cannot be used with websocket transport")
+	}
 	if c.HeartbeatInterval <= 0 {
 		return fmt.Errorf("heartbeat_interval must be positive")
 	}
@@ -641,7 +672,7 @@ func validAuthMethod(m string) error {
 
 func validTransport(t string) bool {
 	switch strings.ToLower(t) {
-	case "tcp", "quic", "kcp":
+	case "tcp", "quic", "kcp", "ws", "websocket":
 		return true
 	default:
 		return false
@@ -661,6 +692,8 @@ func TransportPreferenceList(t string) []string {
 		return []string{"tcp"}
 	case "kcp":
 		return []string{"kcp"}
+	case "ws", "websocket":
+		return []string{"ws"}
 	default:
 		return []string{"quic", "kcp"}
 	}
@@ -668,6 +701,15 @@ func TransportPreferenceList(t string) []string {
 
 func (c Client) IsTCP() bool {
 	return strings.EqualFold(strings.TrimSpace(c.Transport), "tcp")
+}
+
+func (c Client) IsWS() bool {
+	t := strings.ToLower(strings.TrimSpace(c.Transport))
+	if t == "ws" || t == "websocket" {
+		return true
+	}
+	srv := strings.ToLower(strings.TrimSpace(c.Server))
+	return strings.HasPrefix(srv, "ws://") || strings.HasPrefix(srv, "wss://") || strings.HasPrefix(srv, "http://") || strings.HasPrefix(srv, "https://")
 }
 
 func (s Server) QUICEnabled() bool {
@@ -682,6 +724,18 @@ func (s Server) QUICEnabled() bool {
 func (s Server) KCPEnabled() bool {
 	for _, t := range s.Transports {
 		if strings.EqualFold(t, "kcp") {
+			return true
+		}
+	}
+	return false
+}
+
+func (s Server) WSEnabled() bool {
+	if s.ListenWS != "" {
+		return true
+	}
+	for _, t := range s.Transports {
+		if strings.EqualFold(t, "ws") || strings.EqualFold(t, "websocket") {
 			return true
 		}
 	}

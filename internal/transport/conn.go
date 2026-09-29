@@ -13,6 +13,7 @@ const (
 	KindTCP Kind = iota
 	KindQUIC
 	KindKCP
+	KindWebSocket
 )
 
 func (k Kind) String() string {
@@ -23,6 +24,8 @@ func (k Kind) String() string {
 		return "quic"
 	case KindKCP:
 		return "kcp"
+	case KindWebSocket:
+		return "ws"
 	default:
 		return "unknown"
 	}

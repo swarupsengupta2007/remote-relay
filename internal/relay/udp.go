@@ -271,9 +271,6 @@ func (s *Server) unregisterProbe(sessionID string) {
 
 func (s *Server) pickTransport(pref []string, sessionID string, tcpLocal net.Addr) (string, *proto.UdpInfo) {
 	cfg := s.Config()
-	if !cfg.QUICEnabled() && !cfg.KCPEnabled() {
-		return "tcp", nil
-	}
 	if len(pref) == 0 {
 		pref = []string{"quic", "kcp"}
 	}
@@ -281,6 +278,8 @@ func (s *Server) pickTransport(pref []string, sessionID string, tcpLocal net.Add
 		switch strings.ToLower(strings.TrimSpace(p)) {
 		case "tcp":
 			return "tcp", nil
+		case "ws", "websocket":
+			return "ws", nil
 		case "quic":
 			if !cfg.QUICEnabled() {
 				continue

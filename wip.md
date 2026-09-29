@@ -650,5 +650,42 @@ Implemented **FEAT-SEC-03**: Per-User RBAC & Live `SIGHUP` Configuration Reload.
   - High concurrency stress test: 10 concurrent clients performing multiple transfers while SIGHUP reload runs repeatedly.
   - Real OS SIGHUP signal dispatch via `syscall.Kill(os.Getpid(), syscall.SIGHUP)`.
 
+---
+
+Implemented **FEAT-SEC-02**: WebSocket & HTTPS Port 443 Fallback Transport.
+
+### 1. WebSocket Transport Adapter (`internal/transport/websocket.go`, `conn.go`)
+- Added `KindWebSocket` to `transport.Kind` (`Kind.String()` returns `"ws"`).
+- Implemented `wsConn` wrapping `golang.org/x/net/websocket.Conn` satisfying `transport.Conn` with RFC 6455 binary frame encoding.
+- Implemented thread-safe `WriteFrame` and race-free `Close()` matching `tcpConn` design.
+- Implemented `DialWebSocket`:
+  - Parses `ws://`, `wss://`, `http://`, and `https://` endpoints.
+  - Automatically defaults to port 80 for ws/http and 443 for wss/https when port is omitted.
+  - Corporate forward proxy support: detects `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` environment variables.
+  - Standard HTTP `CONNECT` tunneling to proxy with `Proxy-Authorization: Basic` support and preserved buffered reader bytes.
+  - Configurable `TLSConfig` and `--tls-insecure` skip-verify flag.
+- Implemented `ExtractClientIP` and `ExtractRemoteAddr` parsing `X-Forwarded-For` and `X-Real-IP` to extract actual client endpoints behind reverse proxies.
+
+### 2. Server-Side WebSocket Ingestion (`internal/relay/ws_server.go`, `server.go`, `shutdown.go`, `udp.go`)
+- Implemented `WebSocketHandler()` returning an `http.Handler` serving `/relay-stream` and `/health`, suitable for direct mounting into reverse proxies (Nginx, Caddy, Cloudflare, Traefik, AWS ALB).
+- Implemented standalone WebSocket listener (`listen_ws`, `websocket_path`, `ws_cert`, `ws_key`).
+- Extracted `handleTransportConn` in `server.go` to provide uniform encrypted session ingestion, RBAC enforcement, destination ACL checks, rate limiting, and I/O pump processing across TCP and WebSocket connections.
+- Integrated `closeWS` with graceful server shutdown.
+- Updated `pickTransport` in `udp.go` to support `"ws"` / `"websocket"` preferences.
+
+### 3. Client, Jumphost Chaining & Resumption Integration (`internal/relay/client.go`, `client_chain.go`, `chain.go`, `upgrade.go`, `internal/config`)
+- Updated `clientHello` and `clientResumeHook` to dial via `DialWebSocket` when `cfg.IsWS()`.
+- Updated `upgrade.go` (`writeResumeRoleHook`) to execute encrypted KEX handshake for `KindWebSocket`.
+- Updated `client.go` to recognize WebSocket transport when checking UDP route requirements.
+- Updated jumphost chaining (`-J hop1?transport=ws,hop2`) and intermediate forwarders to handle WebSocket hops and parse WebSocket URI query parameters.
+- Updated `internal/crypto/kex/hostkey.go` (`VerifyKnownHosts`) to strip URL schemes and path segments before known_hosts normalization and TCP resolution.
+- Added CLI flags to `cmd/relay/main.go`: `--listen-ws`, `--websocket-path`, `--ws`, `--tls-insecure` / `--insecure`.
+
+### 4. Verification & Testing Matrix (`internal/transport/websocket_test.go`, `internal/relay/ws_test.go`, `internal/config/config_test.go`)
+- 100% test pass with race detector across all packages (`go test -race ./...`).
+- Unit tests: frame round-trips, TLS handshakes, HTTP CONNECT proxy traversal, Basic Auth, proxy 403 refusal, bad gateway 502, invalid upgrade responses, client IP extraction, buffer resets.
+- Integration tests: direct end-to-end streaming, TLS end-to-end streaming, reverse proxy multiplexing with `/health`, forward HTTP CONNECT proxy tunneling, jumphost chaining with WebSocket hops, session resumption, host key fingerprint pinning/verification, and sad paths (closed ports, untrusted TLS certificates).
+
+
 
 

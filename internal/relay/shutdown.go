@@ -29,6 +29,7 @@ func (s *Server) closeListener() {
 	if ln != nil {
 		_ = ln.Close()
 	}
+	s.closeWS()
 }
 
 func (s *Server) stopRun() {

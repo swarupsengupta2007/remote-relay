@@ -300,7 +300,7 @@ func writeResumeRoleHook(ctx context.Context, conn transport.Conn, cfg config.Cl
 	var none proto.ResumeOK
 	controlConn := conn
 	var kexInit, kexReply []byte
-	if conn.Kind() == transport.KindTCP {
+	if conn.Kind() == transport.KindTCP || conn.Kind() == transport.KindWebSocket {
 		kexCli, err := kex.NewClientSession()
 		if err != nil {
 			return none, fmt.Errorf("kex new client session: %w", err)

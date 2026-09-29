@@ -247,25 +247,33 @@ func VerifyKnownHosts(knownHostsPath, serverAddr string, pub ed25519.PublicKey, 
 		return fmt.Errorf("kex: %w: no known_hosts file path available (configure --known-hosts, --server-fingerprint, or ensure HOME is set)", ErrHostKey)
 	}
 
-	normAddr := knownhosts.Normalize(serverAddr)
+	cleanAddr := serverAddr
+	if idx := strings.Index(cleanAddr, "://"); idx >= 0 {
+		cleanAddr = cleanAddr[idx+3:]
+	}
+	if idx := strings.Index(cleanAddr, "/"); idx >= 0 {
+		cleanAddr = cleanAddr[:idx]
+	}
+
+	normAddr := knownhosts.Normalize(cleanAddr)
 
 	cb, err := knownhosts.New(knownHostsPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			// File does not exist yet -> TOFU
 			reason := fmt.Sprintf("known_hosts file %s does not exist", knownHostsPath)
-			return handleTOFU(knownHostsPath, serverAddr, normAddr, sshPub, fp, strictChecking, reason)
+			return handleTOFU(knownHostsPath, cleanAddr, normAddr, sshPub, fp, strictChecking, reason)
 		}
 		return fmt.Errorf("kex: %w: read known_hosts %s: %v", ErrHostKey, knownHostsPath, err)
 	}
 
 	var remoteAddr net.Addr
-	tcpAddr, err := net.ResolveTCPAddr("tcp", serverAddr)
+	tcpAddr, err := net.ResolveTCPAddr("tcp", cleanAddr)
 	if err == nil {
 		remoteAddr = tcpAddr
 	} else {
 		port := 7443
-		if _, portStr, splitErr := net.SplitHostPort(serverAddr); splitErr == nil {
+		if _, portStr, splitErr := net.SplitHostPort(cleanAddr); splitErr == nil {
 			if p, convErr := strconv.Atoi(portStr); convErr == nil && p > 0 {
 				port = p
 			}

@@ -91,6 +91,13 @@ type Server struct {
 	cert     tls.Certificate
 	certErr  error
 
+	wsMu       sync.Mutex
+	wsLn       net.Listener
+	wsSrv      *http.Server
+	wsCertOnce sync.Once
+	wsCertVal  tls.Certificate
+	wsCertErr  error
+
 	histMu   sync.Mutex
 	pathHist []pathInfo
 
@@ -172,6 +179,10 @@ func (s *Server) ReloadConfig() error {
 		// Sockets cannot be re-bound on live reload without restart
 		newCfg.ListenTCP = currentCfg.ListenTCP
 		newCfg.UDPListen = currentCfg.UDPListen
+		newCfg.ListenWS = currentCfg.ListenWS
+		newCfg.WebSocketPath = currentCfg.WebSocketPath
+		newCfg.WSCert = currentCfg.WSCert
+		newCfg.WSKey = currentCfg.WSKey
 	} else {
 		newCfg = currentCfg
 	}
@@ -626,6 +637,12 @@ func (s *Server) Listen() error {
 	}
 	s.ln = ln
 	s.mu.Unlock()
+	if s.Config().ListenWS != "" {
+		if err := s.listenWS(); err != nil {
+			_ = ln.Close()
+			return err
+		}
+	}
 	return nil
 }
 
@@ -661,6 +678,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 
 	s.log.Info("listening", "addr", ln.Addr().String())
+	s.startWS(ctx)
 
 	go func() {
 		<-ctx.Done()
@@ -714,6 +732,10 @@ func (s *Server) handle(raw net.Conn) {
 	}
 	defer conn.Close()
 
+	s.handleTransportConn(conn, ip, n, releaseTCP)
+}
+
+func (s *Server) handleTransportConn(conn transport.Conn, ip string, n int, releaseConn func()) {
 	_ = conn.SetDeadline(time.Now().Add(handshakeTimeout))
 	f, err := conn.ReadFrame()
 	_ = conn.SetDeadline(time.Time{})
@@ -724,7 +746,7 @@ func (s *Server) handle(raw net.Conn) {
 
 	// Strict encrypted-only enforcement (FEAT-SEC-01)
 	if f.Type != proto.TypeKexInit {
-		s.log.Warn("rejecting unencrypted handshake: expected KEX_INIT", "type", f.Type.String(), "from", raw.RemoteAddr().String())
+		s.log.Warn("rejecting unencrypted handshake: expected KEX_INIT", "type", f.Type.String(), "from", conn.RemoteAddr().String())
 		writeErr(conn, proto.CodeProto, "encrypted handshake required (expected KEX_INIT)")
 		return
 	}
@@ -786,7 +808,7 @@ func (s *Server) handle(raw net.Conn) {
 		}
 		return
 	}
-	// Flood cap counts live TCP sockets (2× max_conns_per_ip). HELLO is
+	// Flood cap counts live carrier sockets (2× max_conns_per_ip). HELLO is
 	// refused with ERR_NO_CAPACITY; RESUME of an existing session proceeds.
 	if max := s.Config().MaxConnsPerIP; max > 0 && n > 2*max && (f.Type == proto.TypeHello || f.Type == proto.TypeChain) {
 		s.refused.Add(1)
@@ -797,9 +819,9 @@ func (s *Server) handle(raw net.Conn) {
 	case proto.TypeResume:
 		s.handleResume(ctx, cipherConn, f, kexNonce)
 	case proto.TypeHello:
-		s.handleHello(ctx, cipherConn, f, ip, releaseTCP, kexNonce)
+		s.handleHello(ctx, cipherConn, f, ip, releaseConn, kexNonce)
 	case proto.TypeChain:
-		s.handleChain(ctx, cipherConn, f, ip, releaseTCP, kexNonce)
+		s.handleChain(ctx, cipherConn, f, ip, releaseConn, kexNonce)
 	default:
 		writeErr(cipherConn, proto.CodeProto, "expected HELLO")
 	}

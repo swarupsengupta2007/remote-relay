@@ -51,9 +51,9 @@ func run(args []string) int {
 func usage() {
 	fmt.Fprintf(os.Stderr, `usage: relay <server|client|socks|version> [flags]
 
-  relay server [--config PATH] [--listen HOST:PORT] [--host-key PATH] [--splice|--no-splice] [--adaptive-kcp|--no-adaptive-kcp] [--log-level LVL]
-  relay client --server HOST:PORT [-J|--jumphost|--chain HOST:PORT] [--dest HOST:PORT] [--tcp|--kcp] [--allow-ha] [--splice|--no-splice] [--adaptive-kcp|--no-adaptive-kcp] [--hud|--no-hud] [--interface NAME[@proto]] [--source-ip IP[@proto]] [--auth-sock PATH] [--server-fingerprint FP] [--known-hosts PATH] [--config PATH] [--log-level LVL] [%%h %%p]
-  relay socks [--listen HOST:PORT] --server HOST:PORT [-J|--jumphost|--chain HOST:PORT] [--tcp|--kcp] [--allow-ha] [--hud|--no-hud] [--interface NAME[@proto]] [--source-ip IP[@proto]] [--auth-sock PATH] [--server-fingerprint FP] [--known-hosts PATH] [--config PATH] [--log-level LVL]
+  relay server [--config PATH] [--listen HOST:PORT] [--listen-ws HOST:PORT] [--websocket-path PATH] [--host-key PATH] [--splice|--no-splice] [--adaptive-kcp|--no-adaptive-kcp] [--log-level LVL]
+  relay client --server HOST:PORT [-J|--jumphost|--chain HOST:PORT] [--dest HOST:PORT] [--tcp|--kcp|--ws] [--insecure] [--allow-ha] [--splice|--no-splice] [--adaptive-kcp|--no-adaptive-kcp] [--hud|--no-hud] [--interface NAME[@proto]] [--source-ip IP[@proto]] [--auth-sock PATH] [--server-fingerprint FP] [--known-hosts PATH] [--config PATH] [--log-level LVL] [%%h %%p]
+  relay socks [--listen HOST:PORT] --server HOST:PORT [-J|--jumphost|--chain HOST:PORT] [--tcp|--kcp|--ws] [--insecure] [--allow-ha] [--hud|--no-hud] [--interface NAME[@proto]] [--source-ip IP[@proto]] [--auth-sock PATH] [--server-fingerprint FP] [--known-hosts PATH] [--config PATH] [--log-level LVL]
   relay version
 `)
 }
@@ -63,6 +63,8 @@ func runServer(args []string) int {
 	fs.SetOutput(os.Stderr)
 	configPath := fs.String("config", "", "path to server TOML config")
 	listen := fs.String("listen", "", "TCP listen address (overrides config)")
+	listenWS := fs.String("listen-ws", "", "WebSocket HTTP/HTTPS listen address (e.g. 0.0.0.0:8080 or 0.0.0.0:443)")
+	websocketPath := fs.String("websocket-path", "", "WebSocket HTTP path (default: /relay-stream)")
 	logLevel := fs.String("log-level", "", "log level")
 	heartbeat := fs.Duration("heartbeat-interval", 0, "BFD heartbeat interval (default: 750ms)")
 	deadThreshold := fs.Int("dead-peer-threshold", 0, "BFD dead peer missed heartbeat threshold (default: 3)")
@@ -97,6 +99,8 @@ func runServer(args []string) int {
 	cfg, err := config.LoadServer(config.ServerOptions{
 		ConfigPath:        *configPath,
 		Listen:            *listen,
+		ListenWS:          *listenWS,
+		WebSocketPath:     *websocketPath,
 		LogLevel:          *logLevel,
 		HeartbeatInterval: *heartbeat,
 		DeadPeerThreshold: *deadThreshold,
@@ -148,6 +152,9 @@ func runClient(args []string) int {
 	dest := fs.String("dest", "", "destination host:port")
 	tcp := fs.Bool("tcp", false, "use TCP data plane")
 	kcp := fs.Bool("kcp", false, "use KCP data plane")
+	ws := fs.Bool("ws", false, "use WebSocket & HTTPS fallback transport")
+	insecure := fs.Bool("insecure", false, "skip TLS certificate verification for WebSocket transport")
+	fs.BoolVar(insecure, "tls-insecure", false, "alias of --insecure")
 	allowHA := fs.Bool("allow-ha", false, "allow HA dual-path failover (UDP > TCP)")
 	logLevel := fs.String("log-level", "", "log level")
 	heartbeat := fs.Duration("heartbeat-interval", 0, "BFD heartbeat interval (default: 750ms)")
@@ -226,6 +233,10 @@ func runClient(args []string) int {
 		fmt.Fprintf(os.Stderr, "relay client: --allow-ha cannot be used with --tcp\n")
 		return 2
 	}
+	if *ws && *allowHA {
+		fmt.Fprintf(os.Stderr, "relay client: --allow-ha cannot be used with --ws\n")
+		return 2
+	}
 
 	var posHost, posPort string
 	rest := fs.Args()
@@ -252,6 +263,8 @@ func runClient(args []string) int {
 		DestSet:               destSet,
 		TCP:                   *tcp,
 		KCP:                   *kcp,
+		WS:                    *ws,
+		TLSInsecure:           *insecure,
 		AllowHA:               *allowHA,
 		AllowHASet:            allowHASet,
 		LogLevel:              *logLevel,
@@ -296,6 +309,9 @@ func runSocks(args []string) int {
 	server := fs.String("server", "", "relay server host:port")
 	tcp := fs.Bool("tcp", false, "use TCP data plane")
 	kcp := fs.Bool("kcp", false, "use KCP data plane")
+	ws := fs.Bool("ws", false, "use WebSocket & HTTPS fallback transport")
+	insecure := fs.Bool("insecure", false, "skip TLS certificate verification for WebSocket transport")
+	fs.BoolVar(insecure, "tls-insecure", false, "alias of --insecure")
 	allowHA := fs.Bool("allow-ha", false, "allow HA dual-path failover (UDP > TCP)")
 	logLevel := fs.String("log-level", "", "log level")
 	heartbeat := fs.Duration("heartbeat-interval", 0, "BFD heartbeat interval (default: 750ms)")
@@ -360,6 +376,10 @@ func runSocks(args []string) int {
 		fmt.Fprintf(os.Stderr, "relay socks: --allow-ha cannot be used with --tcp\n")
 		return 2
 	}
+	if *ws && *allowHA {
+		fmt.Fprintf(os.Stderr, "relay socks: --allow-ha cannot be used with --ws\n")
+		return 2
+	}
 
 	noSplice := false
 	spliceOpt := &noSplice // In-memory pipes for SOCKS mux don't splice
@@ -371,6 +391,8 @@ func runSocks(args []string) int {
 		DestSet:               true,
 		TCP:                   *tcp,
 		KCP:                   *kcp,
+		WS:                    *ws,
+		TLSInsecure:           *insecure,
 		AllowHA:               *allowHA,
 		AllowHASet:            allowHASet,
 		LogLevel:              *logLevel,

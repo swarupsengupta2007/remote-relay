@@ -7,6 +7,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -101,7 +102,7 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 		attempt++
 	}
 	log = logging.WithSession(log, helloOK.SessionID)
-	if !cfg.AllowHA && !cfg.IsTCP() && (helloOK.Transport == "tcp" || helloOK.UDP == nil) {
+	if !cfg.AllowHA && !cfg.IsTCP() && !cfg.IsWS() && (helloOK.Transport == "tcp" || helloOK.UDP == nil) {
 		_ = conn.Close()
 		return fmt.Errorf("udp route unavailable and --allow-ha not specified: server does not provide udp transport")
 	}
@@ -313,7 +314,7 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 				_ = udpHold.Close()
 				udpHold = nil
 			}
-			if !pathCfg.AllowHA && !pathCfg.IsTCP() && (target == "tcp" || udp == nil) {
+			if !pathCfg.AllowHA && !pathCfg.IsTCP() && !pathCfg.IsWS() && (target == "tcp" || udp == nil) {
 				_ = nconn.Close()
 				failErr := fmt.Errorf("udp route unavailable and --allow-ha not specified: server does not provide udp transport")
 				hud.OnFailed(failErr.Error(), failErr)
@@ -390,9 +391,22 @@ func clientHello(ctx context.Context, cfg config.Client) (transport.Conn, proto.
 		Interface: cfg.TCPInterface,
 		SourceIP:  net.ParseIP(cfg.TCPSourceIP),
 	}
-	conn, err := transport.DialTCPWithDelayAndBind(ctx, cfg.Server, cfg.HappyEyeballsDelay.Duration(), tcpBind)
-	if err != nil {
-		return nil, none, fmt.Errorf("dial server: %w", err)
+	var conn transport.Conn
+	if cfg.IsWS() {
+		wsOpts := &transport.WebSocketDialOptions{
+			Bind:      tcpBind,
+			Timeout:   handshakeTimeout,
+			TLSConfig: &tls.Config{InsecureSkipVerify: cfg.TLSInsecure},
+		}
+		conn, err = transport.DialWebSocket(ctx, cfg.Server, wsOpts)
+		if err != nil {
+			return nil, none, fmt.Errorf("dial websocket server: %w", err)
+		}
+	} else {
+		conn, err = transport.DialTCPWithDelayAndBind(ctx, cfg.Server, cfg.HappyEyeballsDelay.Duration(), tcpBind)
+		if err != nil {
+			return nil, none, fmt.Errorf("dial server: %w", err)
+		}
 	}
 
 	// 1. KEX Handshake
@@ -580,7 +594,18 @@ func clientResumeHook(ctx context.Context, cfg config.Client, sessionID, token s
 		SourceIP:  net.ParseIP(cfg.TCPSourceIP),
 	}
 	addr, _ := resumeDialAddr(cfg)
-	conn, err := transport.DialTCPWithDelayAndBind(ctx, addr, cfg.HappyEyeballsDelay.Duration(), tcpBind)
+	var conn transport.Conn
+	var err error
+	if cfg.IsWS() {
+		wsOpts := &transport.WebSocketDialOptions{
+			Bind:      tcpBind,
+			Timeout:   handshakeTimeout,
+			TLSConfig: &tls.Config{InsecureSkipVerify: cfg.TLSInsecure},
+		}
+		conn, err = transport.DialWebSocket(ctx, addr, wsOpts)
+	} else {
+		conn, err = transport.DialTCPWithDelayAndBind(ctx, addr, cfg.HappyEyeballsDelay.Duration(), tcpBind)
+	}
 	if err != nil {
 		return nil, none, err
 	}
@@ -651,7 +676,7 @@ func deadlineOr(ctx context.Context, d time.Duration) time.Time {
 }
 
 func checkStrictUDPProbe(ctx context.Context, cfg config.Client, conn transport.Conn, udp *proto.UdpInfo) error {
-	if cfg.AllowHA || cfg.IsTCP() || testGateUpgrade.Load() != nil || conn == nil || conn.Kind() != transport.KindTCP || udp == nil {
+	if cfg.AllowHA || cfg.IsTCP() || cfg.IsWS() || testGateUpgrade.Load() != nil || conn == nil || conn.Kind() != transport.KindTCP || udp == nil {
 		return nil
 	}
 	attempts := udp.ProbeAttempts

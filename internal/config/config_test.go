@@ -197,17 +197,33 @@ func TestTransportPreference(t *testing.T) {
 	if got := c.TransportPreference(); len(got) != 1 || got[0] != "kcp" {
 		t.Fatalf("kcp pref %v", got)
 	}
+	c.Transport = "ws"
+	if got := c.TransportPreference(); len(got) != 1 || got[0] != "ws" {
+		t.Fatalf("ws pref %v", got)
+	}
+	if !c.IsWS() {
+		t.Fatal("expected c.IsWS() to be true")
+	}
+	c.Transport = "quic"
+	c.Server = "wss://relay.example.com/relay-stream"
+	if !c.IsWS() {
+		t.Fatal("expected c.IsWS() to be true for wss:// server")
+	}
 	s := DefaultServer()
 	if !s.QUICEnabled() || !s.KCPEnabled() {
 		t.Fatal("default server should enable quic and kcp")
 	}
-	s.Transports = []string{"tcp"}
-	if s.QUICEnabled() || s.KCPEnabled() {
-		t.Fatal("tcp-only")
+	if s.WSEnabled() {
+		t.Fatal("default server should not have WS enabled without listen_ws or transport")
 	}
-	s.Transports = []string{"kcp"}
-	if s.QUICEnabled() || !s.KCPEnabled() {
-		t.Fatal("kcp-only")
+	s.ListenWS = "0.0.0.0:8080"
+	if !s.WSEnabled() {
+		t.Fatal("server should have WS enabled when ListenWS is set")
+	}
+	s.ListenWS = ""
+	s.Transports = []string{"ws"}
+	if !s.WSEnabled() {
+		t.Fatal("server should have WS enabled when ws in Transports")
 	}
 }
 
@@ -248,6 +264,12 @@ func TestValidationErrors(t *testing.T) {
 	c.Transport = ""
 	if err := c.Validate(); err == nil {
 		t.Fatal("expected empty transports error")
+	}
+	c = DefaultClient()
+	c.Transport = "ws"
+	c.AllowHA = true
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected allow-ha + ws error")
 	}
 
 	dir := t.TempDir()
