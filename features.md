@@ -34,7 +34,7 @@ Each proposal includes:
 | [**FEAT-PERF-01**](.feat-impl/FEAT-PERF-01.md)| Linux Kernel Zero-Copy Stream Splicing (`splice(2)`) | Tier 4: Performance | **P3** | Complete | Halves CPU & memory bus overhead on multi-gigabit links |
 | [**FEAT-PERF-02**](.feat-impl/FEAT-PERF-02.md)| Adaptive KCP Dynamic ARQ & Congestion Tuning | Tier 4: Performance | **P3** | Complete | Dynamic packet retransmission on fluctuating mobile links |
 | [**FEAT-PERF-03**](.feat-impl/FEAT-PERF-03.md)| Fast 3-RTT Token-Authorized Resumption in AEAD Plane | Tier 4: Performance | **P1** | Complete | Cuts 1 RTT per resume, eliminates flaky link RTO stalls & enables silent standby |
-| **FEAT-OBS-01** | Prometheus Metrics Endpoint & OpenTelemetry Tracing | Tier 4: Observability| **P2** | Low | Production-grade SLA alerting & Grafana monitoring |
+| **FEAT-OBS-01** | Prometheus Exporter, OpenTelemetry Tracing & Live Metrics TUI Dashboard | Tier 4: Observability| **P2** | Medium | Production-grade SLA alerting, Prometheus scraping, & interactive terminal metrics dashboard (`relay top`) |
 
 ---
 
@@ -456,13 +456,13 @@ However, with the completion of [**FEAT-SEC-01**](.feat-impl/FEAT-SEC-01.md), ev
 
 ---
 
-### FEAT-OBS-01: Prometheus Metrics Exporter & OpenTelemetry Tracing
+### FEAT-OBS-01: Prometheus Metrics Exporter, OpenTelemetry Tracing & Live Metrics TUI Dashboard (`relay top`)
 * **Priority**: `P2` (Medium)
 * **Status**: Proposed
-* **Target Package**: `internal/relay`
+* **Target Package**: `internal/obs`, `internal/tui`, `cmd/relay`
 
 #### 1. Problem Statement
-[`obs.go`](file:///root/remote-relay/internal/relay/obs.go) currently only exposes basic `expvar` variables (`sessions`, `held`, `buffer_used`, `accepts`, `refused`). It lacks dimensional labels, histograms, latency percentiles, and compatibility with industry-standard monitoring systems (Prometheus, Grafana, Datadog).
+[`obs.go`](file:///root/remote-relay/internal/relay/obs.go) currently only exposes basic `expvar` variables (`sessions`, `held`, `buffer_used`, `accepts`, `refused`). It lacks dimensional labels, histograms, latency percentiles, and compatibility with industry-standard monitoring systems (Prometheus, Grafana, Datadog). Furthermore, operators, developers, and SREs troubleshooting live connections on remote jumphosts or servers currently have no interactive terminal observability tool (analogous to `top`, `htop`, or `iftop`) to inspect live relay health, buffer occupancy, active session counts by transport, and real-time throughput without setting up an external Prometheus/Grafana stack.
 
 #### 2. Technical Specification
 - **Prometheus Exporter (`/metrics`)**:
@@ -473,12 +473,31 @@ However, with the completion of [**FEAT-SEC-01**](.feat-impl/FEAT-SEC-01.md), ev
     - `relay_held_duration_seconds` (histogram)
     - `relay_bytes_transferred_total{direction="up|down", transport="..."}` (counter)
     - `relay_buffer_utilization_ratio` (gauge)
+    - `relay_hop_chain_depth` (histogram)
+    - `relay_socks_streams_active` (gauge)
+    - `relay_rbac_rejections_total{reason="..."}` (counter)
 - **OpenTelemetry Tracing**:
-  - Instrument session lifecycle events with trace spans (`Handshake`, `Upgrade`, `Resume`).
+  - Instrument session lifecycle events with trace spans (`Handshake`, `Upgrade`, `Resume`, `ChainHop`).
+- **Live Terminal Metrics TUI Dashboard (`relay top` / `relay stats`)**:
+  - CLI subcommand: `relay top [--endpoint URL] [--interval DURATION] [--color=auto|always|never]` (default connects to `http://127.0.0.1:9090/metrics` or server admin port).
+  - Scrapes the `/metrics` endpoint periodically (e.g. 1s default) and parses standard Prometheus text exposition format into real-time gauges, rates, and counters.
+  - Interactive Terminal Interface (built with clean ANSI terminal control / `golang.org/x/term` alt screen buffer):
+    - **Header & Health Panel**: Server uptime, process PID, total live sessions, scrape status, and latency.
+    - **Transport & Session Breakdown**: Visual bars / tables showing active sessions by transport (`TCP`, `KCP`, `QUIC`), standby connections, and hold counts.
+    - **Throughput & Bandwidth Rates**: Upload / download transfer rates ($\text{KiB/s}$, $\text{MiB/s}$) with moving deltas or sparklines.
+    - **Memory & Ring Buffer Bar**: Current buffer bytes vs total buffer capacity with percentage gauge and backpressure alerts.
+    - **Reliability & Resiliency Counters**: Handshake rates, BFD dead-peer triggers, failovers, reconnections, and RBAC rejection counts.
+    - **Interactive Keybindings**: `q`/`Esc` to exit, `r` to force refresh, `+`/`-` or `1`/`2`/`5` to adjust refresh frequency, `p` to pause/resume live updates.
+    - **Fail-Safe Terminal Lifecycle**: Restores alternate screen buffer, cursor, and terminal echo on exit or signals (`SIGINT`, `SIGTERM`, `SIGWINCH` resize handling).
+    - **Sad Path Resilience**: Displays clear disconnection warning and retry countdown if the server restarts or `/metrics` is temporarily unreachable, resuming automatically once the server is back.
 
 #### 3. Benefits & Verification
 - Out-of-the-box observability for enterprise SRE teams with alerting on disconnection spikes or high resume failure rates.
-- **Verification**: Scrape `/metrics` endpoint with Prometheus, verify metric validity, and generate Grafana dashboard panels.
+- Instant, zero-overhead developer and operator diagnostics on live servers and jumphosts with `relay top` without external dependencies.
+- **Verification**: 
+  - Unit tests verifying Prometheus text exposition parser and metrics collection.
+  - Integration tests verifying `/metrics` scraping under load.
+  - Mock terminal buffer tests verifying TUI frame rendering, ANSI layout, key events, and resize/reconnect recovery.
 
 ---
 
@@ -493,7 +512,7 @@ Phase 1: Usability & Resiliency Quick-Wins (1–2 weeks)
 
 Phase 2: Enterprise Operations, Zero-Downtime & Security (2–4 weeks)
 ├── FEAT-ROB-02: Zero-Downtime Server Restarts (SCM_RIGHTS) [COMPLETED] (.feat-impl/FEAT-ROB-02.md)
-├── FEAT-OBS-01: Prometheus Metrics Endpoint
+├── FEAT-OBS-01: Prometheus Metrics Endpoint & Live TUI Dashboard
 ├── FEAT-SEC-03: Per-User RBAC & SIGHUP Reload [COMPLETED] (.feat-impl/FEAT-SEC-03.md)
 ├── FEAT-SEC-01: Encrypted Handshake Control Plane [COMPLETED] (.feat-impl/FEAT-SEC-01.md)
 ├── FEAT-UTL-05: Multi-Hop Jumphost Chaining (-J) [COMPLETED] (.feat-impl/FEAT-UTL-05.md)
