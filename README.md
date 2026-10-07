@@ -76,6 +76,18 @@ go build -o relay ./cmd/relay
 Release builds stamp the version with
 `-ldflags "-X github.com/remote-relay/relay/internal/version.Version=vX.Y.Z"`.
 
+## Tests
+
+```
+go test -race ./...                          # unit and in-process integration
+sudo python3 scripts/test_netns_suite.py     # 43 end-to-end checks in network namespaces
+```
+
+The namespace suite builds the relay from the checkout, runs servers, clients,
+jumphosts and agents in isolated namespaces (loss, blackholes, hot restart,
+WebSocket proxies, RBAC reload), and fails if the host network stack is not
+left exactly as it found it. Other `scripts/` are focused benchmarks and soaks.
+
 ## Server
 
 ```
