@@ -60,7 +60,7 @@ settings. A 60s mixed soak is not run in default CI.
 
 ## Install
 
-Prebuilt binaries for Linux, macOS, and Windows (amd64/arm64) are attached to
+Prebuilt binaries for Linux, macOS, and Windows (amd64 and arm64) are attached to
 each [GitHub release](https://github.com/swarupsengupta2007/remote-relay/releases),
 with a `SHA256SUMS` file.
 

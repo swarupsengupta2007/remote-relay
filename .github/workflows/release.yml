@@ -1,11 +1,22 @@
 name: Release
 
+# Pushing a v* tag tests, builds and publishes that tag. Running it by hand
+# with an existing tag rebuilds it and replaces the release's assets, e.g. to
+# add a platform to a release that already exists.
 on:
   push:
     tags: [ "v*" ]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build and publish (e.g. v0.1.0)
+        required: true
 
 permissions:
   contents: write
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   test:
@@ -13,6 +24,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
@@ -32,8 +45,11 @@ jobs:
           - { goos: darwin,  goarch: amd64 }
           - { goos: darwin,  goarch: arm64 }
           - { goos: windows, goarch: amd64 }
+          - { goos: windows, goarch: arm64 }
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
@@ -43,7 +59,7 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
-          VERSION: ${{ github.ref_name }}
+          VERSION: ${{ env.TAG }}
         run: |
           name="relay_${VERSION}_${GOOS}_${GOARCH}"
           ext=""
@@ -77,12 +93,20 @@ jobs:
           merge-multiple: true
       - name: Checksums
         run: cd dist && sha256sum * > SHA256SUMS
-      - name: Create GitHub release
+      - name: Create or update GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
         run: |
-          gh release create "${{ github.ref_name }}" dist/* \
-            --repo "${{ github.repository }}" \
-            --title "${{ github.ref_name }}" \
-            --generate-notes \
-            $([[ "${{ github.ref_name }}" == *-* ]] && echo --prerelease)
+          if gh release view "$TAG" --repo "$REPO" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --repo "$REPO" --clobber
+          else
+            prerelease=""
+            if [[ "$TAG" == *-* ]]; then prerelease="--prerelease"; fi
+            gh release create "$TAG" dist/* \
+              --repo "$REPO" \
+              --verify-tag \
+              --title "$TAG" \
+              --generate-notes \
+              $prerelease
+          fi
