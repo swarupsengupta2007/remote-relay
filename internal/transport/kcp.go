@@ -104,10 +104,6 @@ type kcpConn struct {
 	tuner     *AdaptiveTuner
 }
 
-func wrapKCP(sess *kcp.UDPSession) Conn {
-	return wrapKCPWithConfig(sess, DefaultAdaptiveKCPConfig())
-}
-
 func wrapKCPWithConfig(sess *kcp.UDPSession, cfg AdaptiveKCPConfig) Conn {
 	TuneKCP(sess)
 	var tuner *AdaptiveTuner

@@ -250,11 +250,6 @@ func (p *PublicKey) findAuthorizedEntry(pub ssh.PublicKey) (*AuthorizedKeyEntry,
 	return nil, false
 }
 
-func (p *PublicKey) keyAuthorized(pub ssh.PublicKey) bool {
-	_, ok := p.findAuthorizedEntry(pub)
-	return ok
-}
-
 func (p *PublicKey) getSigners() ([]ssh.Signer, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -605,10 +600,6 @@ func LoadAuthorizedKeys(path string) ([]ssh.PublicKey, error) {
 func HasValidAuthorizedKeys(path string) bool {
 	keys, err := LoadAuthorizedKeys(path)
 	return err == nil && len(keys) > 0
-}
-
-func loadAuthorizedKeys(path string) ([]ssh.PublicKey, error) {
-	return LoadAuthorizedKeys(path)
 }
 
 func containsSigner(signers []ssh.Signer, pub ssh.PublicKey) bool {

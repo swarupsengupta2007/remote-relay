@@ -9,7 +9,6 @@ import (
 	"os"
 	"sync/atomic"
 	"syscall"
-	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -127,14 +126,6 @@ func isPipe(fd int) bool {
 		return false
 	}
 	return (st.Mode & unix.S_IFMT) == unix.S_IFIFO
-}
-
-func isSocket(fd int) bool {
-	var st unix.Stat_t
-	if err := unix.Fstat(fd, &st); err != nil {
-		return false
-	}
-	return (st.Mode & unix.S_IFMT) == unix.S_IFSOCK
 }
 
 // waitWritable blocks until fd is writable or reports an error/hangup.
@@ -379,77 +370,4 @@ func readFullFD(fd int, buf []byte) error {
 		total += n
 	}
 	return nil
-}
-
-// spliceSliceToSocket sends data from a memory slice into rawTCP using vmsplice(2) and splice(2).
-func spliceSliceToSocket(rawTCP *net.TCPConn, p *pipePair, data []byte, writeHdr func() error, acct *byteAcct) (int64, error) {
-	if len(data) == 0 {
-		return 0, nil
-	}
-	if p == nil {
-		return 0, errors.New("nil pipePair")
-	}
-	if writeHdr != nil {
-		if err := writeHdr(); err != nil {
-			return 0, err
-		}
-	}
-	iov := []unix.Iovec{
-		{
-			Base: (*byte)(unsafe.Pointer(&data[0])),
-			Len:  uint64(len(data)),
-		},
-	}
-	spliceCallsTotal.Add(1)
-	wfd := p.W()
-	if wfd < 0 {
-		return 0, net.ErrClosed
-	}
-	nVmsplice, err := unix.Vmsplice(wfd, iov, 0)
-	if err != nil {
-		return 0, err
-	}
-	if nVmsplice == 0 {
-		return 0, io.ErrUnexpectedEOF
-	}
-
-	rc, err := rawTCP.SyscallConn()
-	if err != nil {
-		return 0, err
-	}
-
-	var pumped int64
-	for pumped < int64(nVmsplice) {
-		want := int(int64(nVmsplice) - pumped)
-		var nPump int64
-		var sysErr error
-		err := rc.Write(func(sfd uintptr) bool {
-			spliceCallsTotal.Add(1)
-			rfd := p.R()
-			if rfd < 0 {
-				sysErr = net.ErrClosed
-				return true
-			}
-			nPump, sysErr = unix.Splice(rfd, nil, int(sfd), nil, want, unix.SPLICE_F_NONBLOCK)
-			if sysErr == unix.EAGAIN || sysErr == unix.EWOULDBLOCK {
-				return false
-			}
-			return true
-		})
-		if err != nil {
-			return pumped, err
-		}
-		if sysErr != nil {
-			return pumped, sysErr
-		}
-		if nPump == 0 {
-			return pumped, io.ErrUnexpectedEOF
-		}
-		pumped += nPump
-	}
-	splicedBytesOut.Add(uint64(pumped))
-	if acct != nil {
-		acct.add(pumped)
-	}
-	return pumped, nil
 }

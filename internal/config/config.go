@@ -12,7 +12,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 	"github.com/remote-relay/relay/internal/proto"
-	"golang.org/x/crypto/ssh/terminal"
+	"golang.org/x/term"
 )
 
 const (
@@ -235,7 +235,7 @@ func defaultSplice() bool {
 }
 
 var isTerminal = func(fd uintptr) bool {
-	return terminal.IsTerminal(int(fd))
+	return term.IsTerminal(int(fd))
 }
 
 func isTTY() bool {

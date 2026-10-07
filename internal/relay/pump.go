@@ -222,20 +222,6 @@ func (p *pump) getSinkFD() (int, bool) {
 	return -1, false
 }
 
-func (p *pump) getSrcFD() (int, bool) {
-	if p.io.rawSrc != nil {
-		if fd, ok := getFD(p.io.rawSrc); ok {
-			return fd, true
-		}
-	}
-	if p.io.src != nil {
-		if fd, ok := getFD(p.io.src); ok {
-			return fd, true
-		}
-	}
-	return -1, false
-}
-
 func (p *pump) getTCPConn() *net.TCPConn {
 	p.connMu.Lock()
 	c := p.conn

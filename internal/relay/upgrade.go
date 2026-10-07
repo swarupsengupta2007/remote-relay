@@ -23,13 +23,6 @@ var testFailQUICDial atomic.Bool
 var testGateUpgrade atomic.Pointer[chan struct{}]
 var testDropUDPProbe atomic.Bool
 
-func probeUDP(ctx context.Context, mux *transport.UDPMux, addr net.Addr, tok [16]byte, attempts int, timeout time.Duration) error {
-	if testDropUDPProbe.Load() {
-		return errors.New("udp probe timeout")
-	}
-	return transport.Probe(ctx, mux, addr, tok, attempts, timeout)
-}
-
 func probeUDPDualStack(ctx context.Context, hostPort string, tok [16]byte, attempts int, timeout time.Duration, delay time.Duration, bind transport.BindConfig) (*transport.UDPMux, net.Addr, error) {
 	if testDropUDPProbe.Load() {
 		return nil, nil, errors.New("udp probe timeout")
@@ -294,18 +287,10 @@ func tryUpgrade(ctx context.Context, p *pump, cfg config.Client, tcpConn transpo
 	}
 }
 
-func writeResumeOn(ctx context.Context, conn transport.Conn, cfg config.Client, sessionID, token string, downAcked uint64) (proto.ResumeOK, error) {
-	return writeResumeRole(ctx, conn, cfg, sessionID, token, downAcked, "")
-}
-
 // resumeChallengeFn signs a nested-hop AUTH_OK the local process cannot sign
 // (Case C). canonical is the RESUME JSON; kexInit/kexReply are the resume KEX
 // transcript to attest.
 type resumeChallengeFn func(aok proto.AuthOK, canonical, kexInit, kexReply []byte) (proto.Auth, error)
-
-func writeResumeRole(ctx context.Context, conn transport.Conn, cfg config.Client, sessionID, token string, downAcked uint64, role string) (proto.ResumeOK, error) {
-	return writeResumeRoleHook(ctx, conn, cfg, sessionID, token, downAcked, role, nil)
-}
 
 func writeResumeRoleHook(ctx context.Context, conn transport.Conn, cfg config.Client, sessionID, token string, downAcked uint64, role string, onChallenge resumeChallengeFn) (proto.ResumeOK, error) {
 	var none proto.ResumeOK

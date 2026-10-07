@@ -139,12 +139,6 @@ func (s *Server) setAuth(a auth.Authenticator) {
 	s.auth = a
 }
 
-func (s *Server) getLogger() *slog.Logger {
-	s.logMu.RLock()
-	defer s.logMu.RUnlock()
-	return s.log
-}
-
 func (s *Server) setLogger(l *slog.Logger) {
 	s.logMu.Lock()
 	defer s.logMu.Unlock()

@@ -96,24 +96,6 @@ func TestKexTamperedSignature(t *testing.T) {
 	}
 }
 
-// mockConn creates an in-memory transport.Conn pair using net.Pipe.
-func mockConnPair(t *testing.T) (transport.Conn, transport.Conn) {
-	p1, p2 := net.Pipe()
-	c1, err := transport.WrapTCP(p1)
-	if err != nil {
-		// net.Pipe is not *net.TCPConn, so WrapTCP might fail. Let's use pipeConn.
-	}
-	_ = c1
-	_ = p2
-	return nil, nil
-}
-
-type memoryConn struct {
-	net.Conn
-	rCh chan proto.Frame
-	wCh chan proto.Frame
-}
-
 func newMemConnPair() (*memConn, *memConn) {
 	c2s := make(chan proto.Frame, 16)
 	s2c := make(chan proto.Frame, 16)

@@ -25,12 +25,6 @@ type clientStandby struct {
 	onData       func()
 }
 
-func (s *clientStandby) isReady() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return !s.closed && s.sess != nil && s.sess.IsUp()
-}
-
 func (s *clientStandby) promote() (transport.Conn, *bfd.Session, []proto.Frame, bool) {
 	s.mu.Lock()
 	if s.closed || s.sess == nil || !s.sess.IsUp() {
@@ -240,13 +234,6 @@ func (sm *standbyManager) start() {
 		sm.started = true
 		go sm.loop()
 	}
-	sm.mu.Unlock()
-	sm.wake()
-}
-
-func (sm *standbyManager) setEnabled(enabled bool) {
-	sm.mu.Lock()
-	sm.enabled = enabled
 	sm.mu.Unlock()
 	sm.wake()
 }

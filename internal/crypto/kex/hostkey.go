@@ -16,7 +16,7 @@ import (
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
-	"golang.org/x/crypto/ssh/terminal"
+	"golang.org/x/term"
 )
 
 // LoadOrGenerateHostKey loads an OpenSSH Ed25519 private key from path.
@@ -150,7 +150,7 @@ var (
 
 func defaultPromptUser(serverAddr, fp string) (bool, error) {
 	if f, ok := PromptReader.(*os.File); ok && f == os.Stdin {
-		if !terminal.IsTerminal(int(f.Fd())) {
+		if !term.IsTerminal(int(f.Fd())) {
 			return false, fmt.Errorf("no interactive terminal available to prompt for host key verification")
 		}
 	}
@@ -175,7 +175,7 @@ func defaultPromptUser(serverAddr, fp string) (bool, error) {
 func handleTOFU(knownHostsPath, serverAddr, normAddr string, sshPub ssh.PublicKey, fp, strictChecking, notFoundReason string) error {
 	mode := strings.ToLower(strings.TrimSpace(strictChecking))
 	if mode == "" {
-		if terminal.IsTerminal(int(os.Stdin.Fd())) && terminal.IsTerminal(int(os.Stderr.Fd())) {
+		if term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stderr.Fd())) {
 			mode = "ask"
 		} else {
 			mode = "yes"

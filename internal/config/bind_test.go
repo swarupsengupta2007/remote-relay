@@ -107,8 +107,6 @@ func TestResolveClientBindings_CLIOverrides(t *testing.T) {
 	}
 }
 
-type interfaceDummy = struct{}
-
 func TestResolveClientBindings_ConflictsAndDuplicates(t *testing.T) {
 	// 1. Duplicate TCP in same scope
 	_, _, _, _, err := ResolveClientBindings([]string{"lo@tcp", "lo@tcp"}, nil, nil, nil)
