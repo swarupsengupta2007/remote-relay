@@ -576,3 +576,86 @@ func TestDestinationAllowedWildcardsAndGlobs(t *testing.T) {
 		t.Fatal("expected '*' to allow any destination")
 	}
 }
+
+func TestAgentConfig(t *testing.T) {
+	agent := DefaultAgent()
+	if agent.Destination != "127.0.0.1:22" {
+		t.Fatalf("agent.Destination = %q, want 127.0.0.1:22", agent.Destination)
+	}
+	if agent.HoldTimeout.Duration() != 5*time.Minute {
+		t.Fatalf("agent.HoldTimeout = %v, want 5m", agent.HoldTimeout)
+	}
+
+	// Missing required fields
+	if err := agent.Validate(); err == nil {
+		t.Fatal("expected validation error for empty Name")
+	}
+	agent.Name = "homelab"
+	if err := agent.Validate(); err != nil {
+		t.Fatalf("unexpected validation error: %v", err)
+	}
+
+	// LoadAgent via options
+	opts := AgentOptions{
+		Server:    "myrelay:7443",
+		Name:      "nas",
+		Dest:      "127.0.0.1:8080",
+		AllowDest: []string{"127.0.0.1:8080", "127.0.0.1:9000"},
+		TCP:       true,
+	}
+	loaded, err := LoadAgent(opts)
+	if err != nil {
+		t.Fatalf("LoadAgent failed: %v", err)
+	}
+	if loaded.Server != "myrelay:7443" || loaded.Name != "nas" || loaded.Destination != "127.0.0.1:8080" || loaded.Transport != "tcp" {
+		t.Fatalf("loaded agent config mismatch: %+v", loaded)
+	}
+
+	// DestinationAllowed checks
+	if !loaded.DestinationAllowed("") {
+		t.Fatal("empty destination should default to true")
+	}
+	if !loaded.DestinationAllowed("127.0.0.1:8080") {
+		t.Fatal("default destination should be allowed")
+	}
+	if !loaded.DestinationAllowed("127.0.0.1:9000") {
+		t.Fatal("explicitly allowed destination should be allowed")
+	}
+	if loaded.DestinationAllowed("127.0.0.1:22") {
+		t.Fatal("unlisted destination should be rejected")
+	}
+
+	// Empty AllowDestinations allows only default Destination
+	agentSingle := DefaultAgent()
+	agentSingle.Name = "pi"
+	agentSingle.Destination = "127.0.0.1:22"
+	if !agentSingle.DestinationAllowed("127.0.0.1:22") {
+		t.Fatal("default dest should be allowed")
+	}
+	if agentSingle.DestinationAllowed("127.0.0.1:80") {
+		t.Fatal("different dest should be rejected when AllowDestinations is empty")
+	}
+}
+
+func TestServerTargetAllowed(t *testing.T) {
+	srv := DefaultServer()
+	if !srv.TargetAllowed("any-target") {
+		t.Fatal("empty AllowTargets should allow any target")
+	}
+
+	srv.AllowTargets = []string{"homelab", "nas"}
+	if !srv.TargetAllowed("homelab") {
+		t.Fatal("homelab should be allowed")
+	}
+	if !srv.TargetAllowed("nas") {
+		t.Fatal("nas should be allowed")
+	}
+	if srv.TargetAllowed("workstation") {
+		t.Fatal("workstation should be disallowed")
+	}
+
+	srv.AllowTargets = []string{"*"}
+	if !srv.TargetAllowed("anything") {
+		t.Fatal("* should allow everything")
+	}
+}

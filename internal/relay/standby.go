@@ -21,6 +21,8 @@ type clientStandby struct {
 	cancel       context.CancelFunc
 	dropped      chan struct{}
 	closed       bool
+	prefetched   []proto.Frame
+	onData       func()
 }
 
 func (s *clientStandby) isReady() bool {
@@ -29,25 +31,26 @@ func (s *clientStandby) isReady() bool {
 	return !s.closed && s.sess != nil && s.sess.IsUp()
 }
 
-func (s *clientStandby) promote() (transport.Conn, *bfd.Session, bool) {
+func (s *clientStandby) promote() (transport.Conn, *bfd.Session, []proto.Frame, bool) {
 	s.mu.Lock()
 	if s.closed || s.sess == nil || !s.sess.IsUp() {
 		s.mu.Unlock()
-		return nil, nil, false
+		return nil, nil, nil, false
 	}
 	s.closed = true
 	promoteCh := s.promoteCh
 	promotedDone := s.promotedDone
 	conn := s.conn
 	sess := s.sess
+	prefetched := append([]proto.Frame(nil), s.prefetched...)
 	s.mu.Unlock()
 
 	close(promoteCh)
 	<-promotedDone
-	return conn, sess, true
+	return conn, sess, prefetched, true
 }
 
-func startClientStandby(ctx context.Context, conn transport.Conn, sess *bfd.Session, log *slog.Logger) *clientStandby {
+func startClientStandby(ctx context.Context, conn transport.Conn, sess *bfd.Session, log *slog.Logger, onData func()) *clientStandby {
 	runCtx, runCancel := context.WithCancel(ctx)
 	promoteCh := make(chan struct{})
 	promotedDone := make(chan struct{})
@@ -60,6 +63,7 @@ func startClientStandby(ctx context.Context, conn transport.Conn, sess *bfd.Sess
 		promotedDone: promotedDone,
 		cancel:       runCancel,
 		dropped:      dropped,
+		onData:       onData,
 	}
 
 	var wg sync.WaitGroup
@@ -79,7 +83,21 @@ func startClientStandby(ctx context.Context, conn transport.Conn, sess *bfd.Sess
 				if perr == nil {
 					_, _ = sess.Receive(pkt)
 				}
+				continue
 			}
+			// A non-ping frame means the peer already promoted this carrier.
+			// Keep the bytes and promote immediately instead of discarding
+			// them until the UDP dead-peer timer fires.
+			payload := append([]byte(nil), f.Payload...)
+			f.Payload = payload
+			cs.mu.Lock()
+			cs.prefetched = append(cs.prefetched, f)
+			cb := cs.onData
+			cs.mu.Unlock()
+			if cb != nil {
+				cb()
+			}
+			return
 		}
 	}()
 
@@ -99,6 +117,7 @@ func startClientStandby(ctx context.Context, conn transport.Conn, sess *bfd.Sess
 				return
 			case now := <-t.C:
 				if sess.CheckTimeout(now) {
+					noteDeadPeer(log, nil, "standby", sess, now)
 					runCancel()
 					return
 				}
@@ -305,7 +324,11 @@ func (sm *standbyManager) loop() {
 			sm.mu.Unlock()
 			continue
 		}
-		sm.standby = startClientStandby(sm.ctx, conn, sess, sm.log)
+		sm.standby = startClientStandby(sm.ctx, conn, sess, sm.log, func() {
+			if sm.p != nil {
+				sm.p.dropConn()
+			}
+		})
 		if sm.log != nil {
 			sm.log.Info("standby connection attached", "transport", conn.Kind().String())
 		}
@@ -313,20 +336,20 @@ func (sm *standbyManager) loop() {
 	}
 }
 
-func (sm *standbyManager) takeForPromotion() (transport.Conn, *bfd.Session, bool) {
+func (sm *standbyManager) takeForPromotion() (transport.Conn, *bfd.Session, []proto.Frame, bool) {
 	sm.mu.Lock()
 	st := sm.standby
 	if st == nil {
 		sm.mu.Unlock()
-		return nil, nil, false
+		return nil, nil, nil, false
 	}
 	sm.standby = nil
 	sm.enabled = false
 	sm.mu.Unlock()
 	sm.wake()
 
-	conn, sess, ok := st.promote()
-	return conn, sess, ok
+	conn, sess, prefetched, ok := st.promote()
+	return conn, sess, prefetched, ok
 }
 
 func (sm *standbyManager) stop() {

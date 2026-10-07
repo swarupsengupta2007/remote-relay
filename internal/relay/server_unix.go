@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -121,6 +122,41 @@ func (s *Server) HandoverTo(unixConn *net.UnixConn) error {
 	}
 	s.udpMu.Unlock()
 
+	// 2b. Extract the WebSocket and debug (metrics/pprof/expvar) listener FDs.
+	// The child cannot bind these while the parent still holds them.
+	hasListenWS := false
+	s.wsMu.Lock()
+	if tl, ok := s.wsRawLn.(*net.TCPListener); ok {
+		if wf, err := dupSocket(tl, "listen-ws"); err == nil {
+			passedFiles = append(passedFiles, wf)
+			hasListenWS = true
+		} else {
+			s.log.Warn("failed to dup WebSocket listener file", "err", err)
+		}
+	}
+	s.wsMu.Unlock()
+
+	var debugListen []string
+	s.debugMu.Lock()
+	debugAddrs := make([]string, 0, len(s.debugLns))
+	for addr := range s.debugLns {
+		debugAddrs = append(debugAddrs, addr)
+	}
+	sort.Strings(debugAddrs)
+	for _, addr := range debugAddrs {
+		tl, ok := s.debugLns[addr].(*net.TCPListener)
+		if !ok {
+			continue
+		}
+		if df, err := dupSocket(tl, "listen-debug"); err == nil {
+			passedFiles = append(passedFiles, df)
+			debugListen = append(debugListen, addr)
+		} else {
+			s.log.Warn("failed to dup debug listener file", "addr", addr, "err", err)
+		}
+	}
+	s.debugMu.Unlock()
+
 	// Stop accepting on parent so clients only connect to child
 	s.closeListener()
 	s.closeUDP()
@@ -184,6 +220,8 @@ func (s *Server) HandoverTo(unixConn *net.UnixConn) error {
 		Timestamp:    time.Now().UTC(),
 		HasListenTCP: hasListenTCP,
 		HasListenUDP: hasListenUDP,
+		HasListenWS:  hasListenWS,
+		DebugListen:  debugListen,
 		Sessions:     handoverSessions,
 	}
 

@@ -150,6 +150,13 @@ func (s *Session) TxInterval() time.Duration {
 }
 
 // DetectionTimeout returns the duration of silence before declaring the peer dead.
+// LastRx returns when the last valid packet was received.
+func (s *Session) LastRx() time.Time {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.lastRx
+}
+
 func (s *Session) DetectionTimeout() time.Duration {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

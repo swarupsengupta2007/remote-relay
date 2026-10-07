@@ -43,6 +43,23 @@ func ParseJumphost(entries []string) ([]proto.HopSpec, error) {
 func ParseHopSpec(tok string) (proto.HopSpec, error) {
 	var hop proto.HopSpec
 
+	trimmed := strings.TrimSpace(tok)
+	if strings.HasPrefix(trimmed, "target:") {
+		tName := strings.TrimPrefix(trimmed, "target:")
+		if i := strings.Index(tName, "?"); i >= 0 {
+			tName = tName[:i]
+		}
+		if i := strings.Index(tName, "#"); i >= 0 {
+			tName = tName[:i]
+		}
+		tName = strings.TrimSpace(tName)
+		if tName == "" {
+			return hop, fmt.Errorf("jumphost %q: empty target name after 'target:'", tok)
+		}
+		hop.Target = tName
+		return hop, nil
+	}
+
 	rest := tok
 	if i := strings.Index(rest, "#"); i >= 0 {
 		hop.Fp = strings.TrimSpace(rest[i+1:])
@@ -173,8 +190,24 @@ func (s Server) validateChain() error {
 }
 
 func (c Client) validateChain() error {
-	if _, err := ParseJumphost(c.Jumphost); err != nil {
+	hops, err := ParseJumphost(c.Jumphost)
+	if err != nil {
 		return err
+	}
+	targetCount := 0
+	for i, h := range hops {
+		if h.Target != "" {
+			targetCount++
+			if i != len(hops)-1 || c.Server != "" {
+				return fmt.Errorf("target hop must be the terminal hop in chain")
+			}
+		}
+	}
+	if c.Target != "" && targetCount > 0 {
+		return fmt.Errorf("target cannot be specified in both --target and -J")
+	}
+	if targetCount > 0 && len(hops) < 2 {
+		return fmt.Errorf("chained target requires at least one intermediate jumphost relay")
 	}
 	if c.SSHDAliveBudget < 0 {
 		return fmt.Errorf("sshd_alive_budget must not be negative")

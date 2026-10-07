@@ -160,6 +160,61 @@ func TestHUD_HappyPath_ProlongedOutageNotifications(t *testing.T) {
 	}
 }
 
+// lockedBuffer is a bytes.Buffer safe for the HUD's timer goroutine.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// TestHUD_NotificationDuringBlockedAttempt covers an outage spent inside one
+// reconnect attempt: no second OnAttempt runs, yet the notification must fire
+// once the timeout passes, and the recovery notification must follow.
+func TestHUD_NotificationDuringBlockedAttempt(t *testing.T) {
+	var buf lockedBuffer
+	hud := NewHUD(HUDConfig{
+		Enabled:             true,
+		Out:                 &buf,
+		IsTerminal:          truePtr(),
+		NotificationTimeout: 50 * time.Millisecond,
+	})
+
+	hud.OnDisrupted("tcp")
+	hud.OnAttempt(1, 8, "tcp", nil)
+	if strings.Contains(buf.String(), "\033]9;") {
+		t.Fatal("notification before timeout")
+	}
+	waitUntil(t, 2*time.Second, func() bool {
+		return strings.Contains(buf.String(), "\033]9;remote-relay: Link disrupted, attempting reconnect...\007") &&
+			strings.Contains(buf.String(), "\033]777;notify;remote-relay;Link disrupted, attempting reconnect...\007")
+	})
+
+	hud.OnRestored("tcp", 0)
+	if !strings.Contains(buf.String(), "\033]9;remote-relay: Link restored via TCP.\007") {
+		t.Fatalf("expected recovery notification, got %q", buf.String())
+	}
+
+	// A quick outage that ends before the timeout emits nothing.
+	hud.OnDisrupted("tcp")
+	before := strings.Count(buf.String(), "\033]9;")
+	hud.OnRestored("tcp", 0)
+	time.Sleep(120 * time.Millisecond)
+	if after := strings.Count(buf.String(), "\033]9;"); after != before {
+		t.Fatalf("stale timer emitted a notification: %d -> %d", before, after)
+	}
+}
+
 func TestHUD_SadPath_NonTTY(t *testing.T) {
 	var buf bytes.Buffer
 	hud := NewHUD(HUDConfig{

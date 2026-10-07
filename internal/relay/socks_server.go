@@ -27,6 +27,11 @@ type serverStream struct {
 	once       sync.Once
 	readerDone chan struct{}
 	writerDone chan struct{}
+	// overflow keeps payloads that did not fit in dataCh, in arrival order.
+	// One drainer (not one goroutine per frame) moves them onto dataCh.
+	qMu      sync.Mutex
+	overflow [][]byte
+	draining bool
 }
 
 func (st *serverStream) close() {
@@ -343,22 +348,77 @@ func (smux *socksServerMux) handleData(streamID uint32, payload []byte) {
 		return
 	}
 
+	// Never block the mux reader on this stream. A full buffer is queued, in
+	// order, for the single drainer. Per-frame goroutines race onto dataCh
+	// and can deliver a later payload first.
+	st.qMu.Lock()
+	if st.draining {
+		st.overflow = append(st.overflow, append([]byte(nil), payload...))
+		st.qMu.Unlock()
+		return
+	}
+	st.qMu.Unlock()
+
 	select {
 	case st.dataCh <- payload:
+		return
 	case <-st.resetCh:
+		return
 	case <-smux.ctx.Done():
+		return
 	default:
-		// Brief bounded block to avoid dropping data under transient burst
+	}
+
+	st.qMu.Lock()
+	if st.closed.Load() {
+		st.qMu.Unlock()
+		return
+	}
+	st.overflow = append(st.overflow, append([]byte(nil), payload...))
+	start := !st.draining
+	st.draining = true
+	st.qMu.Unlock()
+	if start {
+		go smux.drainStream(st)
+	}
+}
+
+// drainStream delivers one stream's overflow to dataCh in queue order.
+func (smux *socksServerMux) drainStream(st *serverStream) {
+	for {
+		st.qMu.Lock()
+		if len(st.overflow) == 0 {
+			st.draining = false
+			if cap(st.overflow) > 64 {
+				st.overflow = nil
+			}
+			st.qMu.Unlock()
+			return
+		}
+		payload := st.overflow[0]
+		st.overflow[0] = nil
+		st.overflow = st.overflow[1:]
+		st.qMu.Unlock()
+
+		timer := time.NewTimer(3 * time.Second)
 		select {
 		case st.dataCh <- payload:
-		case <-time.After(3 * time.Second):
-			smux.log.Warn("socks stream write buffer saturated, resetting", "streamID", streamID)
-			smux.closeStream(streamID)
+			timer.Stop()
+		case <-st.resetCh:
+			timer.Stop()
+			return
+		case <-smux.ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+			smux.log.Warn("socks stream write buffer saturated, resetting", "streamID", st.id)
+			smux.closeStream(st.id)
 			_ = smux.sendFrame(socks5.MuxFrame{
-				StreamID: streamID,
+				StreamID: st.id,
 				Type:     socks5.TypeStreamReset,
 				Payload:  []byte("write buffer saturated"),
 			})
+			return
 		}
 	}
 }
@@ -474,4 +534,13 @@ func mapDialErrorToSocksRep(err error) byte {
 		return socks5.RepNetworkUnreachable
 	}
 	return socks5.RepGeneralFailure
+}
+
+func (smux *socksServerMux) activeStreams() int {
+	if smux == nil {
+		return 0
+	}
+	smux.mu.Lock()
+	defer smux.mu.Unlock()
+	return len(smux.streams)
 }

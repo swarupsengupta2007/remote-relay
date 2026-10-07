@@ -107,15 +107,30 @@ type Server struct {
 	MaxSocksStreams int  `toml:"max_socks_streams"`
 
 	// FEAT-SEC-02 WebSocket & HTTPS Port 443 transport.
-	ListenWS      string `toml:"listen_ws"`
-	WebSocketPath string `toml:"websocket_path"`
-	WSCert        string `toml:"ws_cert"`
-	WSKey         string `toml:"ws_key"`
+	ListenWS       string   `toml:"listen_ws"`
+	WebSocketPath  string   `toml:"websocket_path"`
+	WSCert         string   `toml:"ws_cert"`
+	WSKey          string   `toml:"ws_key"`
+	TrustedProxies []string `toml:"trusted_proxies"`
+
+	// FEAT-OBS-01 Prometheus metrics & OpenTelemetry tracing.
+	MetricsListen string `toml:"metrics_listen"`
+	OTELEndpoint  string `toml:"otel_endpoint"`
+
+	// FEAT-UTL-04 Reverse Relay & NAT Gateway mode
+	AllowTargets     []string `toml:"allow_targets"`
+	AgentHoldTimeout Duration `toml:"agent_hold_timeout"`
+
+	// FEAT-ROB-04 Tiered Disk-Spill Storage
+	SpillDir     string `toml:"spill_dir"`
+	SpillL1Bytes int    `toml:"spill_l1_bytes"`
+	NoSpill      bool   `toml:"no_spill"`
 }
 
 type Client struct {
 	Server                string   `toml:"server"`
 	Destination           string   `toml:"destination"`
+	Target                string   `toml:"target"`
 	Transport             string   `toml:"transport"`
 	BufferBytes           int      `toml:"buffer_bytes"`
 	SendWindow            int      `toml:"send_window"`
@@ -167,10 +182,52 @@ type Client struct {
 	WebSocketPath string `toml:"websocket_path"`
 	TLSInsecure   bool   `toml:"tls_insecure"`
 
+	// FEAT-ROB-04 Tiered Disk-Spill Storage
+	SpillDir     string `toml:"spill_dir"`
+	SpillL1Bytes int    `toml:"spill_l1_bytes"`
+	NoSpill      bool   `toml:"no_spill"`
+
 	TCPInterface string `toml:"-"`
 	UDPInterface string `toml:"-"`
 	TCPSourceIP  string `toml:"-"`
 	UDPSourceIP  string `toml:"-"`
+}
+
+type Agent struct {
+	ConfigPath            string   `toml:"config_path,omitempty"`
+	Server                string   `toml:"server"`
+	Name                  string   `toml:"name"`
+	Destination           string   `toml:"destination"`
+	AllowDestinations     []string `toml:"allow_destinations"`
+	Transport             string   `toml:"transport"`
+	BufferBytes           int      `toml:"buffer_bytes"`
+	SendWindow            int      `toml:"send_window"`
+	KeepaliveInterval     Duration `toml:"keepalive_interval"`
+	IdleTimeout           Duration `toml:"idle_timeout"`
+	HeartbeatInterval     Duration `toml:"heartbeat_interval"`
+	DeadPeerThreshold     int      `toml:"dead_peer_threshold"`
+	HoldTimeout           Duration `toml:"hold_timeout"`
+	ReconnectBackoff      []string `toml:"reconnect_backoff"`
+	ReconnectMaxElapsed   Duration `toml:"reconnect_max_elapsed"`
+	LogLevel              string   `toml:"log_level"`
+	LogFormat             string   `toml:"log_format"`
+	AuthMethod            string   `toml:"auth_method"`
+	AuthUser              string   `toml:"auth_user"`
+	AuthSock              string   `toml:"auth_sock"`
+	IdentityFiles         []string `toml:"identity_files"`
+	KnownHosts            string   `toml:"known_hosts"`
+	ServerFingerprint     string   `toml:"server_fingerprint"`
+	StrictHostKeyChecking string   `toml:"strict_host_key_checking"`
+	WS                    bool     `toml:"ws"`
+	WebSocketPath         string   `toml:"websocket_path"`
+	TLSInsecure           bool     `toml:"tls_insecure"`
+	Splice                bool     `toml:"splice"`
+	AdaptiveKCP           bool     `toml:"adaptive_kcp"`
+
+	// FEAT-ROB-04 Tiered Disk-Spill Storage
+	SpillDir     string `toml:"spill_dir"`
+	SpillL1Bytes int    `toml:"spill_l1_bytes"`
+	NoSpill      bool   `toml:"no_spill"`
 }
 
 func defaultSplice() bool {
@@ -231,6 +288,38 @@ func DefaultServer() Server {
 		RelayStrictHostKeyChecking: "yes",
 		MaxSocksStreams:            512,
 		WebSocketPath:              "/relay-stream",
+		AgentHoldTimeout:           Duration(15 * time.Second),
+		SpillDir:                   "",
+		SpillL1Bytes:               8388608,
+		NoSpill:                    false,
+	}
+}
+
+func DefaultAgent() Agent {
+	return Agent{
+		Server:                "relay.example.com:7443",
+		Name:                  "",
+		Destination:           "127.0.0.1:22",
+		Transport:             "quic",
+		WebSocketPath:         "/relay-stream",
+		BufferBytes:           67108864,
+		SendWindow:            4194304,
+		KeepaliveInterval:     Duration(5 * time.Second),
+		IdleTimeout:           Duration(30 * time.Second),
+		HeartbeatInterval:     Duration(750 * time.Millisecond),
+		DeadPeerThreshold:     3,
+		HoldTimeout:           Duration(5 * time.Minute),
+		ReconnectBackoff:      []string{"100ms", "250ms", "500ms", "1s", "2s", "5s", "10s"},
+		ReconnectMaxElapsed:   Duration(5 * time.Minute),
+		LogLevel:              "info",
+		LogFormat:             "text",
+		AuthMethod:            "ssh-publickey",
+		StrictHostKeyChecking: DefaultStrictHostKeyChecking(),
+		Splice:                defaultSplice(),
+		AdaptiveKCP:           true,
+		SpillDir:              "",
+		SpillL1Bytes:          8388608,
+		NoSpill:               false,
 	}
 }
 
@@ -267,6 +356,9 @@ func DefaultClient() Client {
 		NotificationTimeout:   Duration(5 * time.Second),
 		SocksListen:           "127.0.0.1:1080",
 		MaxSocksStreams:       512,
+		SpillDir:              "",
+		SpillL1Bytes:          8388608,
+		NoSpill:               false,
 	}
 }
 
@@ -284,6 +376,15 @@ type ServerOptions struct {
 	MaxSocksStreams   int
 	ListenWS          string
 	WebSocketPath     string
+	MetricsListen     string
+	OTELEndpoint      string
+	AllowTargets      []string
+	AgentHoldTimeout  time.Duration
+
+	// FEAT-ROB-04 Tiered Disk-Spill Storage
+	SpillDir     string
+	SpillL1Bytes int
+	NoSpill      *bool
 }
 
 type ClientOptions struct {
@@ -291,6 +392,7 @@ type ClientOptions struct {
 	Server                string
 	Dest                  string
 	DestSet               bool
+	Target                string
 	TCP                   bool
 	KCP                   bool
 	WS                    bool
@@ -320,6 +422,38 @@ type ClientOptions struct {
 	SocksListen           string
 	MaxSocksStreams       int
 	TLSInsecure           bool
+
+	// FEAT-ROB-04 Tiered Disk-Spill Storage
+	SpillDir     string
+	SpillL1Bytes int
+	NoSpill      *bool
+}
+
+type AgentOptions struct {
+	ConfigPath            string
+	Server                string
+	Name                  string
+	Dest                  string
+	AllowDest             []string
+	TCP                   bool
+	KCP                   bool
+	WS                    bool
+	LogLevel              string
+	HeartbeatInterval     time.Duration
+	DeadPeerThreshold     int
+	KnownHosts            string
+	ServerFingerprint     string
+	StrictHostKeyChecking string
+	Identity              string
+	AuthSock              string
+	Splice                *bool
+	AdaptiveKCP           *bool
+	TLSInsecure           bool
+
+	// FEAT-ROB-04 Tiered Disk-Spill Storage
+	SpillDir     string
+	SpillL1Bytes int
+	NoSpill      *bool
 }
 
 func LoadServer(opts ServerOptions) (Server, error) {
@@ -372,6 +506,27 @@ func LoadServer(opts ServerOptions) (Server, error) {
 	}
 	if opts.WebSocketPath != "" {
 		cfg.WebSocketPath = opts.WebSocketPath
+	}
+	if opts.MetricsListen != "" {
+		cfg.MetricsListen = opts.MetricsListen
+	}
+	if opts.OTELEndpoint != "" {
+		cfg.OTELEndpoint = opts.OTELEndpoint
+	}
+	if len(opts.AllowTargets) > 0 {
+		cfg.AllowTargets = opts.AllowTargets
+	}
+	if opts.AgentHoldTimeout > 0 {
+		cfg.AgentHoldTimeout = Duration(opts.AgentHoldTimeout)
+	}
+	if opts.SpillDir != "" {
+		cfg.SpillDir = opts.SpillDir
+	}
+	if opts.SpillL1Bytes > 0 {
+		cfg.SpillL1Bytes = opts.SpillL1Bytes
+	}
+	if opts.NoSpill != nil {
+		cfg.NoSpill = *opts.NoSpill
 	}
 	if err := cfg.Validate(); err != nil {
 		return Server{}, err
@@ -493,8 +648,97 @@ func LoadClient(opts ClientOptions) (Client, error) {
 	if opts.MaxSocksStreams > 0 {
 		cfg.MaxSocksStreams = opts.MaxSocksStreams
 	}
+	if opts.Target != "" {
+		cfg.Target = opts.Target
+	}
+	if opts.SpillDir != "" {
+		cfg.SpillDir = opts.SpillDir
+	}
+	if opts.SpillL1Bytes > 0 {
+		cfg.SpillL1Bytes = opts.SpillL1Bytes
+	}
+	if opts.NoSpill != nil {
+		cfg.NoSpill = *opts.NoSpill
+	}
 	if err := cfg.Validate(); err != nil {
 		return Client{}, err
+	}
+	return cfg, nil
+}
+
+func LoadAgent(opts AgentOptions) (Agent, error) {
+	cfg := DefaultAgent()
+	if opts.ConfigPath != "" {
+		if err := mergeTOML(opts.ConfigPath, true, &cfg); err != nil {
+			return Agent{}, err
+		}
+	}
+	if opts.Server != "" {
+		cfg.Server = opts.Server
+	}
+	if opts.Name != "" {
+		cfg.Name = opts.Name
+	}
+	if opts.Dest != "" {
+		cfg.Destination = opts.Dest
+	}
+	if len(opts.AllowDest) > 0 {
+		cfg.AllowDestinations = opts.AllowDest
+	}
+	if opts.WS {
+		cfg.Transport = "ws"
+	} else if opts.TCP {
+		cfg.Transport = "tcp"
+	} else if opts.KCP {
+		cfg.Transport = "kcp"
+	}
+	if opts.TLSInsecure {
+		cfg.TLSInsecure = true
+	}
+	if opts.LogLevel != "" {
+		cfg.LogLevel = opts.LogLevel
+	}
+	if opts.HeartbeatInterval > 0 {
+		cfg.HeartbeatInterval = Duration(opts.HeartbeatInterval)
+	}
+	if opts.DeadPeerThreshold > 0 {
+		cfg.DeadPeerThreshold = opts.DeadPeerThreshold
+	}
+	if opts.KnownHosts != "" {
+		cfg.KnownHosts = opts.KnownHosts
+	}
+	if opts.ServerFingerprint != "" {
+		cfg.ServerFingerprint = opts.ServerFingerprint
+	}
+	if opts.StrictHostKeyChecking != "" {
+		cfg.StrictHostKeyChecking = opts.StrictHostKeyChecking
+	}
+	if cfg.StrictHostKeyChecking == "" {
+		cfg.StrictHostKeyChecking = DefaultStrictHostKeyChecking()
+	}
+	if opts.Identity != "" {
+		cfg.IdentityFiles = []string{opts.Identity}
+	}
+	if opts.AuthSock != "" {
+		cfg.AuthSock = opts.AuthSock
+	}
+	if opts.Splice != nil {
+		cfg.Splice = *opts.Splice
+	}
+	if opts.AdaptiveKCP != nil {
+		cfg.AdaptiveKCP = *opts.AdaptiveKCP
+	}
+	if opts.SpillDir != "" {
+		cfg.SpillDir = opts.SpillDir
+	}
+	if opts.SpillL1Bytes > 0 {
+		cfg.SpillL1Bytes = opts.SpillL1Bytes
+	}
+	if opts.NoSpill != nil {
+		cfg.NoSpill = *opts.NoSpill
+	}
+	if err := cfg.Validate(); err != nil {
+		return Agent{}, err
 	}
 	return cfg, nil
 }
@@ -572,6 +816,9 @@ func (s Server) Validate() error {
 	if s.MaxSocksStreams < 0 {
 		return fmt.Errorf("max_socks_streams must not be negative")
 	}
+	if s.SpillL1Bytes < 0 {
+		return fmt.Errorf("spill_l1_bytes must not be negative")
+	}
 	return s.validateChain()
 }
 
@@ -597,7 +844,9 @@ func (c Client) Validate() error {
 		}
 	}
 	if strings.TrimSpace(c.Server) == "" {
-		return fmt.Errorf("server is required")
+		if !c.hasTargetChain() {
+			return fmt.Errorf("server is required")
+		}
 	}
 	if err := validAuthMethod(c.AuthMethod); err != nil {
 		return err
@@ -647,7 +896,29 @@ func (c Client) Validate() error {
 			}
 		}
 	}
+	if c.SpillL1Bytes < 0 {
+		return fmt.Errorf("spill_l1_bytes must not be negative")
+	}
 	return c.validateChain()
+}
+
+func (c Client) hasTargetChain() bool {
+	if len(c.Jumphost) == 0 {
+		return false
+	}
+	if c.Target != "" {
+		return true
+	}
+	hops, err := ParseJumphost(c.Jumphost)
+	if err != nil {
+		return false
+	}
+	for _, h := range hops {
+		if h.Target != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func validStrictHostKeyChecking(s string) error {
@@ -784,6 +1055,89 @@ func DestinationAllowed(dest string, allow []string) bool {
 			if destIP != nil && ipNet.Contains(destIP) {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+func (a Agent) Validate() error {
+	if strings.TrimSpace(a.Server) == "" {
+		return fmt.Errorf("server is required")
+	}
+	if strings.TrimSpace(a.Name) == "" {
+		return fmt.Errorf("name is required")
+	}
+	if strings.TrimSpace(a.Destination) == "" {
+		return fmt.Errorf("destination is required")
+	}
+	if strings.TrimSpace(a.Transport) == "" {
+		return fmt.Errorf("empty transports")
+	}
+	if !validTransport(a.Transport) {
+		return fmt.Errorf("unknown transport %q", a.Transport)
+	}
+	if a.SendWindow <= 0 {
+		return fmt.Errorf("send_window must be positive")
+	}
+	if a.BufferBytes <= 0 {
+		return fmt.Errorf("buffer_bytes must be positive")
+	}
+	for _, s := range a.ReconnectBackoff {
+		if _, err := time.ParseDuration(s); err != nil {
+			return fmt.Errorf("bad duration %q: %w", s, err)
+		}
+	}
+	if a.HeartbeatInterval <= 0 {
+		return fmt.Errorf("heartbeat_interval must be positive")
+	}
+	if a.DeadPeerThreshold <= 0 {
+		return fmt.Errorf("dead_peer_threshold must be positive")
+	}
+	if err := validAuthMethod(a.AuthMethod); err != nil {
+		return err
+	}
+	if err := validStrictHostKeyChecking(a.StrictHostKeyChecking); err != nil {
+		return err
+	}
+	if a.SpillL1Bytes < 0 {
+		return fmt.Errorf("spill_l1_bytes must not be negative")
+	}
+	return nil
+}
+
+func (a Agent) TransportPreference() []string {
+	return TransportPreferenceList(a.Transport)
+}
+
+func (a Agent) IsWS() bool {
+	if a.WS {
+		return true
+	}
+	t := strings.ToLower(strings.TrimSpace(a.Transport))
+	if t == "ws" || t == "websocket" {
+		return true
+	}
+	srv := strings.ToLower(strings.TrimSpace(a.Server))
+	return strings.HasPrefix(srv, "ws://") || strings.HasPrefix(srv, "wss://") || strings.HasPrefix(srv, "http://") || strings.HasPrefix(srv, "https://")
+}
+
+func (a Agent) DestinationAllowed(dest string) bool {
+	if dest == "" || dest == a.Destination {
+		return true
+	}
+	if len(a.AllowDestinations) == 0 {
+		return false
+	}
+	return DestinationAllowed(dest, a.AllowDestinations)
+}
+
+func (s Server) TargetAllowed(target string) bool {
+	if len(s.AllowTargets) == 0 {
+		return true
+	}
+	for _, allowed := range s.AllowTargets {
+		if allowed == "*" || allowed == target {
+			return true
 		}
 	}
 	return false

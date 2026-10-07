@@ -23,6 +23,7 @@ import (
 	"github.com/remote-relay/relay/internal/config"
 	"github.com/remote-relay/relay/internal/crypto/kex"
 	"github.com/remote-relay/relay/internal/logging"
+	"github.com/remote-relay/relay/internal/obs"
 	"github.com/remote-relay/relay/internal/proto"
 	"github.com/remote-relay/relay/internal/session"
 	"github.com/remote-relay/relay/internal/transport"
@@ -124,7 +125,12 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 
 	bw := bufio.NewWriterSize(stdout, 128*1024)
 	src, stopSrc := interruptibleReader(stdin)
-	sendLog := session.NewRing(bufCap, nil)
+	sendLog := session.NewTieredRing(session.RingConfig{
+		CapMax:   bufCap,
+		L1Cap:    cfg.SpillL1Bytes,
+		SpillDir: cfg.SpillDir,
+		NoSpill:  cfg.NoSpill,
+	})
 	st := 5 * time.Second
 	if helloOK.Limits.SwitchTimeoutMs > 0 {
 		st = time.Duration(helloOK.Limits.SwitchTimeoutMs) * time.Millisecond
@@ -159,18 +165,36 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 		log:           log,
 		splice:        cfg.Splice,
 	}, sendLog)
+	p.tracer = obs.NewTracer("remote-relay", "")
 	if len(cfg.Jumphost) > 0 {
 		chainHops, herr := config.ParseJumphost(cfg.Jumphost)
 		if herr == nil && len(chainHops) > 0 {
-			chainHops = append(chainHops, proto.HopSpec{
-				Addr: cfg.Server, Fp: cfg.ServerFingerprint, User: cfg.AuthUser,
-			})
+			if cfg.Server != "" {
+				chainHops = append(chainHops, proto.HopSpec{
+					Addr: cfg.Server, Fp: cfg.ServerFingerprint, User: cfg.AuthUser,
+				})
+			}
+			if cfg.Target != "" {
+				if len(chainHops) == 0 || chainHops[len(chainHops)-1].Target != cfg.Target {
+					chainHops = append(chainHops, proto.HopSpec{
+						Target: cfg.Target,
+					})
+				}
+			}
+			targetName := cfg.Target
+			if targetName == "" && len(chainHops) > 0 && chainHops[len(chainHops)-1].Target != "" {
+				targetName = chainHops[len(chainHops)-1].Target
+			}
+			dest := cfg.Destination
+			if targetName != "" && dest == "" {
+				dest = proto.DestTargetPrefix + targetName
+			}
 			signer := clientAuth(cfg)
 			if c, ok := signer.(io.Closer); ok {
 				defer c.Close()
 			}
 			p.cfg.onAuthOK = func(aok proto.AuthOK) error {
-				return signRelayedDataPlane(p, cfg, chainHops, cfg.Destination, signer, aok)
+				return signRelayedDataPlane(p, cfg, chainHops, dest, signer, aok)
 			}
 		}
 	}
@@ -209,12 +233,15 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 	}
 
 	var currentBFD *bfd.Session
+	var prefetched []proto.Frame
 
 	for {
 		upgCh, upgCancel := startUpgrade(ctx, p, pathCfg, current, sessionID, token, target, udp, log)
 		bfdToUse := currentBFD
 		currentBFD = nil
-		err = p.serveConnWithBFD(p.sessCtx, current, sendFrom, bfdToUse, nil)
+		frames := prefetched
+		prefetched = nil
+		err = p.serveConnWithBFD(p.sessCtx, current, sendFrom, bfdToUse, frames)
 		upg := takeUpgrade(upgCh, upgCancel, p)
 		if upg.conn != nil {
 			if udpHold != nil {
@@ -259,10 +286,11 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 
 		// In HA mode, check if warm standby channel is ready for instant zero-latency promotion
 		if standbyMgr != nil {
-			if promotedConn, bfdSess, ok := standbyMgr.takeForPromotion(); ok {
+			if promotedConn, bfdSess, pref, ok := standbyMgr.takeForPromotion(); ok {
 				log.Info("standby connection promoted to active carrier", "transport", promotedConn.Kind().String())
 				current = promotedConn
 				currentBFD = bfdSess
+				prefetched = pref
 				token = standbyMgr.getToken()
 				sendFrom = p.ack.Get()
 				continue
@@ -275,6 +303,25 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 		maxAttempts := len(schedule) + 1
 		disruptedTransport := current.Kind().String()
 		hud.OnDisrupted(disruptedTransport)
+		// Strict mode (no --allow-ha) gives up once the UDP route fails two
+		// probes in a row in one outage. One failure may be load or a probe
+		// lost in the outage itself; two means the route is gone.
+		//
+		// When the UDP carrier died, probe first with the session's token. A
+		// dead route then costs a probe timeout before the TCP resume, so the
+		// resume does not pre-empt the server's own dead-peer detection on the
+		// old carrier, and the post-resume probe below is the second failure.
+		strictFails := 0
+		if k := current.Kind(); k == transport.KindQUIC || k == transport.KindKCP {
+			if perr := strictUDPProbe(ctx, pathCfg, udp); perr != nil {
+				if ctx.Err() != nil {
+					hud.OnAborted("canceled by user")
+					return ctx.Err()
+				}
+				log.Info("udp probe failed before resume", "err", perr)
+				strictFails++
+			}
+		}
 		for reconnectable(err) && time.Now().Before(deadline) {
 			hud.OnAttempt(attempt+1, maxAttempts, disruptedTransport, err)
 			dialCtx, dialCancel := context.WithDeadline(ctx, deadline)
@@ -326,6 +373,13 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 					hud.OnAborted("canceled by user")
 					return ctx.Err()
 				}
+				strictFails++
+				if strictFails >= 2 {
+					// The relay answers over TCP but the UDP route stays dead.
+					// Without --allow-ha that is final, as on the first connect.
+					hud.OnFailed(perr.Error(), perr)
+					return perr
+				}
 				err = perr
 				if serr := sleepBackoff(ctx, schedule, attempt, deadline); serr != nil {
 					hud.OnAborted("canceled by user")
@@ -334,6 +388,7 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 				attempt++
 				continue
 			}
+			strictFails = 0
 			current = nconn
 			sendFrom = rok.UpAcked
 			resumed = true
@@ -460,7 +515,11 @@ func clientHello(ctx context.Context, cfg config.Client) (transport.Conn, proto.
 		_ = cipherConn.Close()
 		return nil, none, err
 	}
-	authMsg, err := a.Respond(auth.Challenge{Destination: cfg.Destination, ClientNonce: nonce})
+	dest := cfg.Destination
+	if cfg.Target != "" && dest == "" {
+		dest = proto.DestTargetPrefix + cfg.Target
+	}
+	authMsg, err := a.Respond(auth.Challenge{Destination: dest, ClientNonce: nonce})
 	if err != nil {
 		_ = cipherConn.Close()
 		return nil, none, err
@@ -471,6 +530,7 @@ func clientHello(ctx context.Context, cfg config.Client) (transport.Conn, proto.
 		ResumeToken: "",
 		Transport:   cfg.TransportPreference(),
 		Destination: cfg.Destination,
+		Target:      cfg.Target,
 		ClientNonce: nonce,
 		Auth:        authMsg,
 		Window:      cfg.SendWindow,
@@ -499,7 +559,7 @@ func clientHello(ctx context.Context, cfg config.Client) (transport.Conn, proto.
 	}
 	if reply.Type == proto.TypeAuthOK {
 		ch := auth.Challenge{
-			Destination: cfg.Destination,
+			Destination: dest,
 			ClientNonce: nonce,
 			Canonical:   fr.Payload,
 			Offer:       authMsg,
@@ -676,7 +736,16 @@ func deadlineOr(ctx context.Context, d time.Duration) time.Time {
 }
 
 func checkStrictUDPProbe(ctx context.Context, cfg config.Client, conn transport.Conn, udp *proto.UdpInfo) error {
-	if cfg.AllowHA || cfg.IsTCP() || cfg.IsWS() || testGateUpgrade.Load() != nil || conn == nil || conn.Kind() != transport.KindTCP || udp == nil {
+	if conn == nil || conn.Kind() != transport.KindTCP {
+		return nil
+	}
+	return strictUDPProbe(ctx, cfg, udp)
+}
+
+// strictUDPProbe probes the session's UDP route when the client runs without
+// --allow-ha on a UDP transport. It returns nil when no probe applies.
+func strictUDPProbe(ctx context.Context, cfg config.Client, udp *proto.UdpInfo) error {
+	if cfg.AllowHA || cfg.IsTCP() || cfg.IsWS() || testGateUpgrade.Load() != nil || udp == nil {
 		return nil
 	}
 	attempts := udp.ProbeAttempts

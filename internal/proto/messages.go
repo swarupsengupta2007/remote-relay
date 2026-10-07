@@ -15,6 +15,9 @@ type Hello struct {
 	ClientNonce string          `json:"clientNonce"`
 	Auth        json.RawMessage `json:"auth"`
 	Window      int             `json:"window"`
+	Traceparent string          `json:"traceparent,omitempty"`
+	Target      string          `json:"target,omitempty"`
+	Role        string          `json:"role,omitempty"`
 }
 
 type HelloOK struct {
@@ -36,6 +39,7 @@ type Resume struct {
 	ClientNonce string          `json:"clientNonce"`
 	Auth        json.RawMessage `json:"auth,omitempty"`
 	Role        string          `json:"role,omitempty"`
+	Traceparent string          `json:"traceparent,omitempty"`
 }
 
 // Auth is C→S TypeAuth: the signature over the AUTH_OK challenge.
@@ -122,6 +126,7 @@ type ChainHello struct {
 	Window      int             `json:"window"`
 	SessionID   string          `json:"sessionId,omitempty"`
 	ResumeToken string          `json:"resumeToken,omitempty"`
+	Traceparent string          `json:"traceparent,omitempty"`
 }
 
 // ChainHelloOK is S→C TypeChainOK: one per completed onward hop, sent before
@@ -225,4 +230,41 @@ func RandomNonce() (string, error) {
 
 func EmptyAuth() json.RawMessage {
 	return json.RawMessage("{}")
+}
+
+// AgentRegister is A→S TypeAgentRegister: register a reverse agent target.
+type AgentRegister struct {
+	V           int             `json:"v"`
+	Name        string          `json:"name"`
+	Dest        string          `json:"dest"`
+	AllowDest   []string        `json:"allowDest,omitempty"`
+	Auth        json.RawMessage `json:"auth,omitempty"`
+	ClientNonce string          `json:"clientNonce,omitempty"`
+	Traceparent string          `json:"traceparent,omitempty"`
+}
+
+// AgentRegisterOK is S→A TypeAgentRegisterOK: confirmation of target registration.
+type AgentRegisterOK struct {
+	V            int    `json:"v"`
+	Target       string `json:"target"`
+	ServerNonce  string `json:"serverNonce,omitempty"`
+	ExpiresInSec int    `json:"expiresInSec,omitempty"`
+}
+
+// AgentBind is S→A TypeAgentBind: notification that a client has requested this target.
+type AgentBind struct {
+	V           int    `json:"v"`
+	BindID      string `json:"bindId"`
+	Target      string `json:"target"`
+	Destination string `json:"destination,omitempty"`
+	ClientIP    string `json:"clientIp,omitempty"`
+	Traceparent string `json:"traceparent,omitempty"`
+}
+
+// AgentBindOK is A→S TypeAgentBindOK: agent confirms local destination connection.
+type AgentBindOK struct {
+	V      int    `json:"v"`
+	BindID string `json:"bindId"`
+	Status string `json:"status"` // "ok" or error code
+	Msg    string `json:"msg,omitempty"`
 }

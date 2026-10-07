@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/remote-relay/relay/internal/bfd"
 	"github.com/remote-relay/relay/internal/crypto/kex"
+	"github.com/remote-relay/relay/internal/obs"
 	"github.com/remote-relay/relay/internal/proto"
 	"github.com/remote-relay/relay/internal/session"
 	"github.com/remote-relay/relay/internal/transport"
@@ -56,6 +58,7 @@ type pumpConfig struct {
 	deadThreshold int
 	log           *slog.Logger
 	splice        bool
+	metrics       *obs.Metrics
 	// onAuthOK handles a mid-session AUTH_OK on the originator (Case C).
 	onAuthOK func(proto.AuthOK) error
 	// onAuth handles a mid-session AUTH on an intermediate inbound pump (Case C).
@@ -171,6 +174,34 @@ type pump struct {
 
 	fatalMu sync.Mutex
 	fatal   error
+
+	tracer   *obs.Tracer
+	srcReads atomic.Uint64
+}
+
+// byteAcct records bytes on relay_bytes_transferred_total. A nil acct is a no-op.
+type byteAcct struct {
+	metrics   *obs.Metrics
+	dir       string
+	transport string
+}
+
+func (a *byteAcct) add(n int64) {
+	if a == nil || a.metrics == nil || n <= 0 || a.dir == "" {
+		return
+	}
+	transport := a.transport
+	if transport == "" {
+		transport = "tcp"
+	}
+	a.metrics.BytesTransferred.WithLabelValues(a.dir, transport).Add(float64(n))
+}
+
+func (p *pump) noteBytes(dir string, n int) {
+	if p == nil || n <= 0 {
+		return
+	}
+	(&byteAcct{metrics: p.cfg.metrics, dir: dir, transport: p.currentKind().String()}).add(int64(n))
 }
 
 func (p *pump) canSplice() bool {
@@ -461,7 +492,7 @@ func (p *pump) serveConnWithBFD(ctx context.Context, conn transport.Conn, sendFr
 	cancel()
 	_ = conn.Close()
 	wg.Wait()
-	if p.finished.Load() {
+	if p.finished.Load() || p.bothDrained() {
 		return errByeSent
 	}
 	if se := p.sessionErr(); se != nil {
@@ -601,14 +632,35 @@ func (p *pump) tryWriteShutdownBye() {
 	}
 }
 
+// endpointReady reports whether an io.Reader or io.Writer is a usable
+// endpoint. A typed nil (*net.TCPConn)(nil) stored in an interface is not
+// usable and must not be Read or Written.
+func endpointReady(v any) bool {
+	if v == nil {
+		return false
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return !rv.IsNil()
+	default:
+		return true
+	}
+}
+
 func (p *pump) srcReader() error {
+	if !endpointReady(p.io.src) {
+		return nil
+	}
 	buf := make([]byte, p.cfg.chunk)
 	for {
 		if err := p.sessCtx.Err(); err != nil {
 			return err
 		}
+		p.srcReads.Add(1)
 		n, err := p.io.src.Read(buf)
 		if n > 0 {
+			p.noteBytes(p.io.outDir, n)
 			if aerr := p.sendLog.Append(p.sessCtx, buf[:n]); aerr != nil {
 				if errors.Is(aerr, session.ErrClosed) || errors.Is(aerr, context.Canceled) {
 					return nil
@@ -1043,13 +1095,19 @@ func (p *pump) netReader() error {
 					if p.io.flushSink != nil {
 						_ = p.io.flushSink()
 					}
-					spliced, spErr := spliceSocketToSink(tc, sinkFd, p.inPipe, dataLen)
-					if spErr != nil {
-						return spErr
-					}
+					spliced, spErr := spliceSocketToSink(tc, sinkFd, p.inPipe, dataLen, &byteAcct{
+						metrics:   p.cfg.metrics,
+						dir:       p.io.inDir,
+						transport: p.currentKind().String(),
+					})
+					// Bytes spliced before an error are already in the sink:
+					// count them so resume does not retransmit them.
 					expected += uint64(spliced)
 					p.expected.Store(expected)
 					delivered := p.delivered.Add(uint64(spliced))
+					if spErr != nil {
+						return spErr
+					}
 					if !testSuppressAck.Load() {
 						if err := p.sendCtrl(proto.Frame{Type: proto.TypeAck, Payload: proto.EncodeAck(delivered)}); err != nil {
 							return err
@@ -1216,6 +1274,9 @@ func (p *pump) tryCloseWrite() {
 }
 
 func (p *pump) sinkWriter() error {
+	if !endpointReady(p.io.sink) {
+		return nil
+	}
 	for {
 		select {
 		case <-p.sessCtx.Done():
@@ -1225,6 +1286,7 @@ func (p *pump) sinkWriter() error {
 				if err := writeFull(p.io.sink, frag.data); err != nil {
 					return err
 				}
+				p.noteBytes(p.io.inDir, len(frag.data))
 				if p.io.flushSink != nil {
 					if err := p.io.flushSink(); err != nil {
 						return err
@@ -1274,6 +1336,7 @@ func (p *pump) timer() error {
 			p.connMu.Unlock()
 
 			if currentSess != nil && currentSess.CheckTimeout(now) {
+				noteDeadPeer(p.cfg.log, p.cfg.metrics, "active", currentSess, now)
 				return ErrDeadPeer
 			}
 
@@ -1296,6 +1359,18 @@ func (p *pump) timer() error {
 				}
 			}
 		}
+	}
+}
+
+// noteDeadPeer logs and counts a BFD detection-time expiry on a carrier.
+func noteDeadPeer(log *slog.Logger, m *obs.Metrics, carrier string, sess *bfd.Session, now time.Time) {
+	if m != nil {
+		m.BFDDeadPeers.Inc()
+	}
+	if log != nil {
+		log.Warn("dead-peer detected: bfd timeout", "carrier", carrier,
+			"silentMs", now.Sub(sess.LastRx()).Milliseconds(),
+			"detectMs", sess.DetectionTimeout().Milliseconds())
 	}
 }
 
@@ -1353,4 +1428,16 @@ func clampChunk(n int) int {
 		return max
 	}
 	return n
+}
+
+func (p *pump) currentTransport() string {
+	if p == nil {
+		return ""
+	}
+	p.connMu.Lock()
+	defer p.connMu.Unlock()
+	if p.conn != nil {
+		return p.conn.Kind().String()
+	}
+	return ""
 }

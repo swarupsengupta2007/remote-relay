@@ -1271,10 +1271,20 @@ func TestChainConcurrencyLeak(t *testing.T) {
 }
 
 func TestAddrEqualWildcard(t *testing.T) {
-	if !addrEqual("0.0.0.0:7443", "10.1.2.3:7443") {
-		t.Fatal("wildcard host must match any host on the same port")
+	orig := localIPs
+	localIPs = func() []net.IP { return []net.IP{net.ParseIP("10.9.9.9")} }
+	defer func() { localIPs = orig }()
+
+	if addrEqual("0.0.0.0:7443", "10.1.2.3:7443") {
+		t.Fatal("wildcard bind must not match another host on the same port")
 	}
-	if addrEqual("0.0.0.0:7443", "10.1.2.3:8443") {
+	if !addrEqual("0.0.0.0:7443", "10.9.9.9:7443") {
+		t.Fatal("wildcard bind must match a local address on the same port")
+	}
+	if !addrEqual("[::]:7443", "127.0.0.1:7443") {
+		t.Fatal("wildcard bind must match loopback on the same port")
+	}
+	if addrEqual("0.0.0.0:7443", "10.9.9.9:8443") {
 		t.Fatal("wildcard must still require the same port")
 	}
 	if !addrEqual("127.0.0.1:9", "127.0.0.1:9") {

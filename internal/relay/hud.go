@@ -35,6 +35,10 @@ type HUD struct {
 	notificationSent bool
 	clock            func() time.Time
 	noColor          bool
+	// notifyTimer emits the prolonged-outage notification even while a single
+	// reconnect attempt blocks; notifyGen discards a timer from an earlier outage.
+	notifyTimer *time.Timer
+	notifyGen   uint64
 }
 
 // NewHUD creates a new HUD instance.
@@ -110,6 +114,7 @@ func (h *HUD) OnDisrupted(transport string) {
 	h.disruptedAt = h.clock()
 	h.active = true
 	h.notificationSent = false
+	h.armNotifyLocked()
 
 	if !h.isTTY || !h.cfg.Enabled {
 		return
@@ -132,6 +137,8 @@ func (h *HUD) OnAttempt(attempt, maxAttempts int, transport string, err error) {
 	if !h.active {
 		h.disruptedAt = h.clock()
 		h.active = true
+		h.notificationSent = false
+		h.armNotifyLocked()
 	}
 
 	elapsed := h.clock().Sub(h.disruptedAt)
@@ -179,7 +186,7 @@ func (h *HUD) OnRestored(transport string, bufferedBytes int) {
 	}
 
 	if !h.isTTY || !h.cfg.Enabled {
-		h.active = false
+		h.stopNotifyLocked()
 		return
 	}
 
@@ -198,7 +205,7 @@ func (h *HUD) OnRestored(transport string, bufferedBytes int) {
 	}
 
 	h.renderLine(msg, true)
-	h.active = false
+	h.stopNotifyLocked()
 }
 
 // OnFailed prints a final failure line when reconnection is permanently exhausted.
@@ -214,14 +221,14 @@ func (h *HUD) OnFailed(reason string, err error) {
 	h.emitNotification("remote-relay", fmt.Sprintf("Reconnection failed: %s", reason))
 
 	if !h.isTTY || !h.cfg.Enabled {
-		h.active = false
+		h.stopNotifyLocked()
 		return
 	}
 
 	msg := fmt.Sprintf("%sReconnection failed: %s (after %.1fs).",
 		h.tag("error"), reason, elapsed.Seconds())
 	h.renderLine(msg, true)
-	h.active = false
+	h.stopNotifyLocked()
 }
 
 // OnAborted prints a cancellation or fatal termination line.
@@ -234,13 +241,13 @@ func (h *HUD) OnAborted(reason string) {
 	}
 
 	if !h.isTTY || !h.cfg.Enabled {
-		h.active = false
+		h.stopNotifyLocked()
 		return
 	}
 
 	msg := fmt.Sprintf("%sReconnection aborted: %s.", h.tag("error"), reason)
 	h.renderLine(msg, true)
-	h.active = false
+	h.stopNotifyLocked()
 }
 
 // Clear erases the in-progress HUD line if active, leaving the terminal clean.
@@ -249,12 +256,45 @@ func (h *HUD) Clear() {
 	defer h.mu.Unlock()
 
 	if !h.active || !h.isTTY || !h.cfg.Enabled {
-		h.active = false
+		h.stopNotifyLocked()
 		return
 	}
 
 	_, _ = fmt.Fprint(h.out, "\r\033[K")
+	h.stopNotifyLocked()
+}
+
+// armNotifyLocked schedules the prolonged-outage notification for the
+// disruption that started at h.disruptedAt.
+func (h *HUD) armNotifyLocked() {
+	if h.notifyTimer != nil {
+		h.notifyTimer.Stop()
+		h.notifyTimer = nil
+	}
+	h.notifyGen++
+	if !h.isTTY || !h.cfg.Enabled {
+		return
+	}
+	gen := h.notifyGen
+	h.notifyTimer = time.AfterFunc(h.cfg.NotificationTimeout, func() {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		if h.notifyGen != gen || !h.active || h.notificationSent {
+			return
+		}
+		h.emitNotification("remote-relay", "Link disrupted, attempting reconnect...")
+		h.notificationSent = true
+	})
+}
+
+// stopNotifyLocked ends the current disruption.
+func (h *HUD) stopNotifyLocked() {
 	h.active = false
+	h.notifyGen++
+	if h.notifyTimer != nil {
+		h.notifyTimer.Stop()
+		h.notifyTimer = nil
+	}
 }
 
 // renderLine renders a line to the output stream.

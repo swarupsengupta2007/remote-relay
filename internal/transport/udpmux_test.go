@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -159,6 +160,71 @@ func TestProbeIgnoresWrongSource(t *testing.T) {
 	defer cancel()
 	if err := Probe(ctx, cli, srv.LocalAddr(), want, 2, 200*time.Millisecond); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestConcurrentProbesUseDistinctNonces(t *testing.T) {
+	cli, err := ListenUDPMux("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+	a, err := ListenUDPMux("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := ListenUDPMux("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	var mu sync.Mutex
+	var noncesA, noncesB []uint64
+	var tokenA, tokenB [16]byte
+	tokenA[0] = 0xa1
+	tokenB[0] = 0xb2
+	a.SetProbeHandler(func(token [16]byte, nonce uint64, addr net.Addr) {
+		if token != tokenA {
+			return
+		}
+		mu.Lock()
+		noncesA = append(noncesA, nonce)
+		mu.Unlock()
+		_ = a.WriteProbeOK(addr, nonce)
+	})
+	b.SetProbeHandler(func(token [16]byte, nonce uint64, addr net.Addr) {
+		if token != tokenB {
+			return
+		}
+		mu.Lock()
+		noncesB = append(noncesB, nonce)
+		mu.Unlock()
+		_ = b.WriteProbeOK(addr, nonce)
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	errCh := make(chan error, 2)
+	go func() {
+		errCh <- Probe(ctx, cli, a.LocalAddr(), tokenA, 2, 400*time.Millisecond)
+	}()
+	go func() {
+		errCh <- Probe(ctx, cli, b.LocalAddr(), tokenB, 2, 400*time.Millisecond)
+	}()
+	for i := 0; i < 2; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatalf("probe %d: %v", i, err)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(noncesA) == 0 || len(noncesB) == 0 {
+		t.Fatalf("missing nonces a=%v b=%v", noncesA, noncesB)
+	}
+	if noncesA[0] == noncesB[0] {
+		t.Fatalf("overlapping probes shared nonce %d", noncesA[0])
 	}
 }
 

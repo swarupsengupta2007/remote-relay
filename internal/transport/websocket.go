@@ -399,10 +399,20 @@ func (b *bufferedConn) Read(p []byte) (int, error) {
 	return b.Conn.Read(p)
 }
 
-// ExtractClientIP extracts the real client IP address from an HTTP request,
-// checking X-Forwarded-For and X-Real-IP headers for reverse proxy compatibility.
-func ExtractClientIP(req *http.Request, rawAddr net.Addr) string {
-	if req != nil {
+// ExtractClientIP extracts the real client IP address from an HTTP request.
+// X-Forwarded-For and X-Real-IP are honored only when the direct peer is listed
+// in trustedProxies (an IP or CIDR). Otherwise the raw peer address is returned.
+func ExtractClientIP(req *http.Request, rawAddr net.Addr, trustedProxies []string) string {
+	// The direct peer is the TCP address in req.RemoteAddr. rawAddr is only a
+	// fallback: on a server websocket.Conn, RemoteAddr() is the Origin URL.
+	var peer net.Addr
+	if req != nil && req.RemoteAddr != "" {
+		peer = peerAddrString(req.RemoteAddr)
+	}
+	if peer == nil && ipFromNetAddr(rawAddr) != nil {
+		peer = rawAddr
+	}
+	if req != nil && peerTrusted(peer, trustedProxies) {
 		if xff := req.Header.Get("X-Forwarded-For"); xff != "" {
 			parts := strings.Split(xff, ",")
 			ip := strings.TrimSpace(parts[0])
@@ -416,27 +426,103 @@ func ExtractClientIP(req *http.Request, rawAddr net.Addr) string {
 				return ip
 			}
 		}
-		if req.RemoteAddr != "" {
-			if host, _, err := net.SplitHostPort(req.RemoteAddr); err == nil {
-				if net.ParseIP(host) != nil {
-					return host
-				}
+	}
+	if req != nil && req.RemoteAddr != "" {
+		if host, _, err := net.SplitHostPort(req.RemoteAddr); err == nil {
+			if net.ParseIP(host) != nil {
+				return host
 			}
 		}
 	}
-	if rawAddr != nil {
-		if host, _, err := net.SplitHostPort(rawAddr.String()); err == nil {
+	if s := addrString(rawAddr); s != "" {
+		if host, _, err := net.SplitHostPort(s); err == nil {
 			return host
 		}
-		return rawAddr.String()
+		return s
 	}
 	return ""
 }
 
-// ExtractRemoteAddr returns a net.Addr reflecting the client IP (considering reverse proxy headers).
-func ExtractRemoteAddr(req *http.Request, ws *websocket.Conn) net.Addr {
+// addrString returns addr.String without panicking. A server websocket.Addr
+// can embed a nil *url.URL, and URL.String then dereferences it.
+func addrString(addr net.Addr) (s string) {
+	if addr == nil {
+		return ""
+	}
+	if wa, ok := addr.(*websocket.Addr); ok && (wa == nil || wa.URL == nil) {
+		return ""
+	}
+	defer func() {
+		if recover() != nil {
+			s = ""
+		}
+	}()
+	return addr.String()
+}
+
+func peerAddrString(addr string) net.Addr {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		if ip := net.ParseIP(addr); ip != nil {
+			return &net.TCPAddr{IP: ip}
+		}
+		return nil
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return nil
+	}
+	port, _ := strconv.Atoi(portStr)
+	return &net.TCPAddr{IP: ip, Port: port}
+}
+
+func peerTrusted(peer net.Addr, trusted []string) bool {
+	if peer == nil || len(trusted) == 0 {
+		return false
+	}
+	ip := ipFromNetAddr(peer)
+	if ip == nil {
+		return false
+	}
+	for _, entry := range trusted {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		if _, network, err := net.ParseCIDR(entry); err == nil {
+			if network.Contains(ip) {
+				return true
+			}
+			continue
+		}
+		if tip := net.ParseIP(entry); tip != nil && tip.Equal(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func ipFromNetAddr(addr net.Addr) net.IP {
+	s := addrString(addr)
+	if s == "" {
+		return nil
+	}
+	host, _, err := net.SplitHostPort(s)
+	if err != nil {
+		host = s
+	}
+	return net.ParseIP(host)
+}
+
+// ExtractRemoteAddr returns a net.Addr reflecting the client IP.
+// Forwarded headers apply only for peers in trustedProxies.
+func ExtractRemoteAddr(req *http.Request, ws *websocket.Conn, trustedProxies []string) net.Addr {
+	var raw net.Addr
+	if ws != nil {
+		raw = ws.RemoteAddr()
+	}
 	if req != nil {
-		ipStr := ExtractClientIP(req, nil)
+		ipStr := ExtractClientIP(req, raw, trustedProxies)
 		if ip := net.ParseIP(ipStr); ip != nil {
 			port := 0
 			if req.RemoteAddr != "" {

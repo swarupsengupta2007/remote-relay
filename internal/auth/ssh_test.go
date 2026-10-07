@@ -651,76 +651,108 @@ func TestPublicKeySKKeyPolicy(t *testing.T) {
 
 func TestParseAuthorizedKeyOptions(t *testing.T) {
 	cases := []struct {
-		name      string
-		options   []string
-		wantBlock bool
-		wantPerm  []string
+		name        string
+		options     []string
+		wantBlock   bool
+		wantPerm    []string
+		wantTargets []string
 	}{
 		{
-			name:      "no options",
-			options:   nil,
-			wantBlock: false,
-			wantPerm:  nil,
+			name:        "no options",
+			options:     nil,
+			wantBlock:   false,
+			wantPerm:    nil,
+			wantTargets: nil,
 		},
 		{
-			name:      "no-port-forwarding",
-			options:   []string{"no-port-forwarding", "no-pty"},
-			wantBlock: true,
-			wantPerm:  nil,
+			name:        "no-port-forwarding",
+			options:     []string{"no-port-forwarding", "no-pty"},
+			wantBlock:   true,
+			wantPerm:    nil,
+			wantTargets: nil,
 		},
 		{
-			name:      "restrict without port-forwarding",
-			options:   []string{"restrict"},
-			wantBlock: true,
-			wantPerm:  nil,
+			name:        "restrict without port-forwarding",
+			options:     []string{"restrict"},
+			wantBlock:   true,
+			wantPerm:    nil,
+			wantTargets: []string{},
 		},
 		{
-			name:      "restrict with port-forwarding",
-			options:   []string{"restrict", "port-forwarding"},
-			wantBlock: false,
-			wantPerm:  nil,
+			name:        "restrict with port-forwarding",
+			options:     []string{"restrict", "port-forwarding"},
+			wantBlock:   false,
+			wantPerm:    nil,
+			wantTargets: nil,
 		},
 		{
-			name:      "permitopen none",
-			options:   []string{`permitopen="none"`},
-			wantBlock: true,
-			wantPerm:  nil,
+			name:        "permitopen none",
+			options:     []string{`permitopen="none"`},
+			wantBlock:   true,
+			wantPerm:    nil,
+			wantTargets: nil,
 		},
 		{
-			name:      "permitopen empty",
-			options:   []string{`permitopen=""`},
-			wantBlock: true,
-			wantPerm:  nil,
+			name:        "permitopen empty",
+			options:     []string{`permitopen=""`},
+			wantBlock:   true,
+			wantPerm:    nil,
+			wantTargets: nil,
 		},
 		{
-			name:      "single permitopen",
-			options:   []string{`permitopen="127.0.0.1:22"`},
-			wantBlock: false,
-			wantPerm:  []string{"127.0.0.1:22"},
+			name:        "single permitopen",
+			options:     []string{`permitopen="127.0.0.1:22"`},
+			wantBlock:   false,
+			wantPerm:    []string{"127.0.0.1:22"},
+			wantTargets: nil,
 		},
 		{
-			name:      "multiple permitopen options",
-			options:   []string{`permitopen="127.0.0.1:22"`, `permitopen="10.0.0.1:80"`},
-			wantBlock: false,
-			wantPerm:  []string{"127.0.0.1:22", "10.0.0.1:80"},
+			name:        "multiple permitopen options",
+			options:     []string{`permitopen="127.0.0.1:22"`, `permitopen="10.0.0.1:80"`},
+			wantBlock:   false,
+			wantPerm:    []string{"127.0.0.1:22", "10.0.0.1:80"},
+			wantTargets: nil,
 		},
 		{
-			name:      "comma-separated permitopen",
+			name:        "comma-separated permitopen",
 			options:   []string{`permitopen="127.0.0.1:22,10.0.0.1:80,192.168.1.*:*"`},
 			wantBlock: false,
 			wantPerm:  []string{"127.0.0.1:22", "10.0.0.1:80", "192.168.1.*:*"},
+			wantTargets: nil,
 		},
 		{
-			name:      "restrict with port-forwarding and permitopen",
-			options:   []string{"restrict", "port-forwarding", `permitopen="10.0.1.5:22"`},
-			wantBlock: false,
-			wantPerm:  []string{"10.0.1.5:22"},
+			name:        "restrict with port-forwarding and permitopen",
+			options:     []string{"restrict", "port-forwarding", `permitopen="10.0.1.5:22"`},
+			wantBlock:   false,
+			wantPerm:    []string{"10.0.1.5:22"},
+			wantTargets: nil,
+		},
+		{
+			name:        "permitlisten single",
+			options:     []string{`permitlisten="homelab"`},
+			wantBlock:   false,
+			wantPerm:    nil,
+			wantTargets: []string{"homelab"},
+		},
+		{
+			name:        "permitlisten multiple and comma-separated",
+			options:     []string{`permitlisten="homelab,backup"`, `permitlisten="nas"`},
+			wantBlock:   false,
+			wantPerm:    nil,
+			wantTargets: []string{"homelab", "backup", "nas"},
+		},
+		{
+			name:        "permitlisten none",
+			options:     []string{`permitlisten="none"`},
+			wantBlock:   false,
+			wantPerm:    nil,
+			wantTargets: []string{},
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			blocked, permitted := ParseAuthorizedKeyOptions(tc.options)
+			blocked, permitted, targets := ParseAuthorizedKeyOptions(tc.options)
 			if blocked != tc.wantBlock {
 				t.Fatalf("blocked = %v, want %v", blocked, tc.wantBlock)
 			}
@@ -730,6 +762,17 @@ func TestParseAuthorizedKeyOptions(t *testing.T) {
 			for i := range permitted {
 				if permitted[i] != tc.wantPerm[i] {
 					t.Errorf("permitted[%d] = %q, want %q", i, permitted[i], tc.wantPerm[i])
+				}
+			}
+			if (targets == nil) != (tc.wantTargets == nil) {
+				t.Fatalf("targets nilness = %v, want %v", targets == nil, tc.wantTargets == nil)
+			}
+			if len(targets) != len(tc.wantTargets) {
+				t.Fatalf("targets len = %d (%v), want %d (%v)", len(targets), targets, len(tc.wantTargets), tc.wantTargets)
+			}
+			for i := range targets {
+				if targets[i] != tc.wantTargets[i] {
+					t.Errorf("targets[%d] = %q, want %q", i, targets[i], tc.wantTargets[i])
 				}
 			}
 		})

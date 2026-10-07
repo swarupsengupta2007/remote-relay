@@ -207,3 +207,72 @@ func TestLoadClientJumphostPrecedence(t *testing.T) {
 		t.Fatalf("an explicitly empty -J must clear the TOML value, got %v", cleared.Jumphost)
 	}
 }
+
+func TestChainedTargetConfig(t *testing.T) {
+	// 1. ParseHopSpec with target
+	hop, err := ParseHopSpec("target:homelab")
+	if err != nil {
+		t.Fatalf("ParseHopSpec target: %v", err)
+	}
+	if hop.Target != "homelab" || hop.Addr != "" {
+		t.Fatalf("unexpected hop: %+v", hop)
+	}
+
+	hop, err = ParseHopSpec("target:homelab?transport=ws")
+	if err != nil {
+		t.Fatalf("ParseHopSpec target with query: %v", err)
+	}
+	if hop.Target != "homelab" {
+		t.Fatalf("unexpected target: %q", hop.Target)
+	}
+
+	if _, err := ParseHopSpec("target:"); err == nil {
+		t.Fatal("expected error on empty target:")
+	}
+
+	// 2. Client.Validate with --target and -J without Server
+	c := DefaultClient()
+	c.Server = ""
+	c.Target = "homelab"
+	c.Jumphost = []string{"jump.example.com:7443"}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Client.Validate with --target and -J without Server should pass: %v", err)
+	}
+
+	// 3. Client.Validate with target in -J without Server
+	c2 := DefaultClient()
+	c2.Server = ""
+	c2.Target = ""
+	c2.Jumphost = []string{"jump.example.com:7443,target:homelab"}
+	if err := c2.Validate(); err != nil {
+		t.Fatalf("Client.Validate with target in -J without Server should pass: %v", err)
+	}
+
+	// 4. Rejections
+	// 4a. Target in -J without intermediate jumphost
+	c3 := DefaultClient()
+	c3.Server = ""
+	c3.Target = ""
+	c3.Jumphost = []string{"target:homelab"}
+	if err := c3.Validate(); err == nil {
+		t.Fatal("expected error when target in -J has no intermediate jumphosts")
+	}
+
+	// 4b. Target in -J is not terminal
+	c4 := DefaultClient()
+	c4.Server = ""
+	c4.Target = ""
+	c4.Jumphost = []string{"target:homelab,jump.example.com:7443"}
+	if err := c4.Validate(); err == nil {
+		t.Fatal("expected error when target in -J is not terminal")
+	}
+
+	// 4c. Duplicate target in --target and -J
+	c5 := DefaultClient()
+	c5.Server = ""
+	c5.Target = "homelab"
+	c5.Jumphost = []string{"jump.example.com:7443,target:other"}
+	if err := c5.Validate(); err == nil {
+		t.Fatal("expected error when target is specified in both --target and -J")
+	}
+}

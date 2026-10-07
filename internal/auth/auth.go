@@ -40,6 +40,7 @@ type Identity struct {
 	RawPubKey             []byte
 	PortForwardingBlocked bool
 	PermittedDestinations []string
+	PermittedTargets      []string
 }
 
 type Authenticator interface {

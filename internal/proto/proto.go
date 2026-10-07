@@ -47,6 +47,12 @@ const (
 	TypeProbeOK  Type = 0x14
 	TypePing     Type = 0x15
 	TypePong     Type = 0x16
+
+	// FEAT-UTL-04 reverse relay & NAT gateway mode frames.
+	TypeAgentRegister   Type = 0x17
+	TypeAgentRegisterOK Type = 0x18
+	TypeAgentBind       Type = 0x19
+	TypeAgentBindOK     Type = 0x1A
 )
 
 const (
@@ -57,6 +63,12 @@ const (
 	// DestSOCKS5 is the sentinel destination in Hello indicating that the session
 	// is a dynamic multiplexed SOCKS5 proxy session (FEAT-UTL-03).
 	DestSOCKS5 = "socks5"
+
+	// DestTargetPrefix is the destination prefix identifying an agent rendezvous target (FEAT-UTL-04).
+	DestTargetPrefix = "target:"
+
+	// RoleAgentData is the Hello Role identifying a reverse agent data stream session.
+	RoleAgentData = "agent-data"
 )
 
 func (t Type) Known() bool {
@@ -66,7 +78,8 @@ func (t Type) Known() bool {
 		TypeKexInit, TypeKexReply, TypeEncrypted,
 		TypeChain, TypeChainOK,
 		TypeData, TypeAck, TypeCloseDir,
-		TypeProbe, TypeProbeOK, TypePing, TypePong:
+		TypeProbe, TypeProbeOK, TypePing, TypePong,
+		TypeAgentRegister, TypeAgentRegisterOK, TypeAgentBind, TypeAgentBindOK:
 		return true
 	default:
 		return false
@@ -119,6 +132,14 @@ func (t Type) String() string {
 		return "PING"
 	case TypePong:
 		return "PONG"
+	case TypeAgentRegister:
+		return "AGENT_REGISTER"
+	case TypeAgentRegisterOK:
+		return "AGENT_REGISTER_OK"
+	case TypeAgentBind:
+		return "AGENT_BIND"
+	case TypeAgentBindOK:
+		return "AGENT_BIND_OK"
 	default:
 		return fmt.Sprintf("0x%02x", uint8(t))
 	}

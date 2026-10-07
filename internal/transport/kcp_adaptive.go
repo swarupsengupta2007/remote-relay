@@ -3,9 +3,10 @@ package transport
 import (
 	"context"
 	"math"
+	"reflect"
 	"sync"
-	"sync/atomic"
 	"time"
+	"unsafe"
 
 	kcp "github.com/xtaci/kcp-go/v5"
 )
@@ -85,21 +86,137 @@ type MetricsSampler interface {
 	SampleMetrics() (outSegs, retransSegs, lostSegs, sndQueue, sndBuf uint64, srtt int32, rto uint32)
 }
 
+// defaultSampler counts transmits from this session's snd_buf. Loss on one
+// session must not move another session's tuner, so it does not read the
+// process-global SNMP counters.
 type defaultSampler struct {
-	sess *kcp.UDPSession
+	sess    *kcp.UDPSession
+	seen    map[uint32]uint32 // sn -> last observed xmit
+	out     uint64
+	retrans uint64
 }
 
 func (s *defaultSampler) SampleMetrics() (outSegs, retransSegs, lostSegs, sndQueue, sndBuf uint64, srtt int32, rto uint32) {
-	outSegs = atomic.LoadUint64(&kcp.DefaultSnmp.OutSegs)
-	retransSegs = atomic.LoadUint64(&kcp.DefaultSnmp.RetransSegs)
-	lostSegs = atomic.LoadUint64(&kcp.DefaultSnmp.LostSegs)
-	sndQueue = atomic.LoadUint64(&kcp.DefaultSnmp.RingBufferSndQueue)
-	sndBuf = atomic.LoadUint64(&kcp.DefaultSnmp.RingBufferSndBuffer)
-	if s.sess != nil {
-		srtt = s.sess.GetSRTT()
-		rto = s.sess.GetRTO()
+	if s == nil || s.sess == nil {
+		return
 	}
+	// GetSRTT and GetRTO take the session lock themselves.
+	srtt = s.sess.GetSRTT()
+	rto = s.sess.GetRTO()
+	outSegs, retransSegs, sndQueue, sndBuf = s.sampleLocked()
 	return
+}
+
+func (s *defaultSampler) sampleLocked() (out, retrans, sndQueue, sndBuf uint64) {
+	if s.seen == nil {
+		s.seen = make(map[uint32]uint32)
+	}
+	sessVal := reflect.ValueOf(s.sess).Elem()
+	muField := sessVal.FieldByName("mu")
+	kcpField := sessVal.FieldByName("kcp")
+	if !muField.IsValid() || !kcpField.IsValid() || kcpField.IsNil() {
+		return s.out, s.retrans, 0, 0
+	}
+	mu := (*sync.Mutex)(unsafe.Pointer(muField.UnsafeAddr()))
+	mu.Lock()
+	defer mu.Unlock()
+
+	kcpVal := kcpField.Elem()
+	sndQueue = uint64(ringLen(kcpVal.FieldByName("snd_queue")))
+	sndBufV := kcpVal.FieldByName("snd_buf")
+	sndBuf = uint64(ringLen(sndBufV))
+
+	present := make(map[uint32]struct{})
+	walkRing(sndBufV, func(sn, xmit uint32) {
+		present[sn] = struct{}{}
+		prev, ok := s.seen[sn]
+		switch {
+		case !ok:
+			if xmit > 0 {
+				s.out += uint64(xmit)
+				s.retrans += uint64(xmit - 1)
+			}
+			s.seen[sn] = xmit
+		case xmit > prev:
+			delta := xmit - prev
+			s.out += uint64(delta)
+			if prev == 0 {
+				s.retrans += uint64(delta - 1)
+			} else {
+				s.retrans += uint64(delta)
+			}
+			s.seen[sn] = xmit
+		}
+	})
+	for sn := range s.seen {
+		if _, ok := present[sn]; !ok {
+			delete(s.seen, sn)
+		}
+	}
+	return s.out, s.retrans, sndQueue, sndBuf
+}
+
+// ringLen and walkRing read a kcp RingBuffer without calling its methods.
+// Those methods are not callable through reflect when the buffer is reached
+// via an unexported session field.
+func ringLen(v reflect.Value) int {
+	v = deref(v)
+	if !v.IsValid() {
+		return 0
+	}
+	head := int(v.FieldByName("head").Int())
+	tail := int(v.FieldByName("tail").Int())
+	n := v.FieldByName("elements").Len()
+	if n == 0 || head == tail {
+		return 0
+	}
+	if head < tail {
+		return tail - head
+	}
+	return n - head + tail
+}
+
+func walkRing(v reflect.Value, fn func(sn, xmit uint32)) {
+	v = deref(v)
+	if !v.IsValid() {
+		return
+	}
+	head := int(v.FieldByName("head").Int())
+	tail := int(v.FieldByName("tail").Int())
+	elements := v.FieldByName("elements")
+	n := elements.Len()
+	if n == 0 || head == tail {
+		return
+	}
+	visit := func(i int) {
+		seg := elements.Index(i)
+		fn(uint32(seg.FieldByName("sn").Uint()), uint32(seg.FieldByName("xmit").Uint()))
+	}
+	if head < tail {
+		for i := head; i < tail; i++ {
+			visit(i)
+		}
+		return
+	}
+	for i := head; i < n; i++ {
+		visit(i)
+	}
+	for i := 0; i < tail; i++ {
+		visit(i)
+	}
+}
+
+func deref(v reflect.Value) reflect.Value {
+	if !v.IsValid() {
+		return v
+	}
+	if v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			return reflect.Value{}
+		}
+		return v.Elem()
+	}
+	return v
 }
 
 type sampleDelta struct {

@@ -14,6 +14,7 @@ import (
 	"github.com/remote-relay/relay/internal/auth"
 	"github.com/remote-relay/relay/internal/config"
 	"github.com/remote-relay/relay/internal/crypto/kex"
+	"github.com/remote-relay/relay/internal/obs"
 	"github.com/remote-relay/relay/internal/proto"
 	"github.com/remote-relay/relay/internal/transport"
 )
@@ -85,6 +86,16 @@ func takeUpgrade(ch <-chan upgradeResult, cancel context.CancelFunc, p *pump) up
 }
 
 func tryUpgrade(ctx context.Context, p *pump, cfg config.Client, tcpConn transport.Conn, sessionID, token, target string, udp *proto.UdpInfo, log *slog.Logger) (res upgradeResult) {
+	if p != nil && p.tracer != nil {
+		var span *obs.Span
+		ctx, span = p.tracer.Start(ctx, "Upgrade")
+		defer func() {
+			if res.err != nil {
+				span.SetStatus("ERROR", res.err.Error())
+			}
+			span.End()
+		}()
+	}
 	tok, ok := transport.ParseProbeToken(udp.ProbeToken)
 	if !ok {
 		res.err = proto.NewError(proto.CodeProto, "bad probe token")

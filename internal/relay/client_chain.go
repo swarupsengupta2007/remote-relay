@@ -28,14 +28,34 @@ func clientChainHello(ctx context.Context, cfg config.Client, jumphosts []proto.
 	var none proto.HelloOK
 	log := logging.NewClient(cfg.LogLevel, cfg.LogFormat)
 
-	hops := make([]proto.HopSpec, 0, len(jumphosts)+1)
+	hops := make([]proto.HopSpec, 0, len(jumphosts)+2)
 	hops = append(hops, jumphosts...)
-	hops = append(hops, proto.HopSpec{
-		Addr:      cfg.Server,
-		Transport: cfg.TransportPreference(),
-		Fp:        cfg.ServerFingerprint,
-		User:      cfg.AuthUser,
-	})
+	if cfg.Server != "" {
+		hops = append(hops, proto.HopSpec{
+			Addr:      cfg.Server,
+			Transport: cfg.TransportPreference(),
+			Fp:        cfg.ServerFingerprint,
+			User:      cfg.AuthUser,
+		})
+	}
+	if cfg.Target != "" {
+		if len(hops) == 0 || hops[len(hops)-1].Target != cfg.Target {
+			hops = append(hops, proto.HopSpec{
+				Target: cfg.Target,
+			})
+		}
+	}
+	if len(hops) < 2 {
+		return nil, none, proto.NewError(proto.CodeProto, "chain requires at least two hops")
+	}
+	if hops[0].Target != "" {
+		return nil, none, proto.NewError(proto.CodeProto, "first hop in chain cannot be a target")
+	}
+	for i, h := range hops {
+		if h.Target != "" && i != len(hops)-1 {
+			return nil, none, proto.NewError(proto.CodeProto, "target hop must be the terminal hop in chain")
+		}
+	}
 	first := hops[0]
 
 	tcpBind := transport.BindConfig{
@@ -112,7 +132,15 @@ func clientChainHello(ctx context.Context, cfg config.Client, jumphosts []proto.
 		_ = cipherConn.Close()
 		return nil, none, err
 	}
-	authMsg, err := a.Respond(auth.Challenge{Destination: cfg.Destination, ClientNonce: nonce})
+	targetName := cfg.Target
+	if targetName == "" && len(hops) > 0 && hops[len(hops)-1].Target != "" {
+		targetName = hops[len(hops)-1].Target
+	}
+	dest := cfg.Destination
+	if targetName != "" && dest == "" {
+		dest = proto.DestTargetPrefix + targetName
+	}
+	authMsg, err := a.Respond(auth.Challenge{Destination: dest, ClientNonce: nonce})
 	if err != nil {
 		_ = cipherConn.Close()
 		return nil, none, err
@@ -126,7 +154,7 @@ func clientChainHello(ctx context.Context, cfg config.Client, jumphosts []proto.
 		V:           1,
 		ChainID:     chainID,
 		Hops:        hops[1:],
-		Destination: cfg.Destination,
+		Destination: dest,
 		Transport:   hop1Pref,
 		ClientNonce: nonce,
 		Auth:        authMsg,
@@ -160,7 +188,7 @@ func clientChainHello(ctx context.Context, cfg config.Client, jumphosts []proto.
 		}
 		switch reply.Type {
 		case proto.TypeAuthOK:
-			if err := completeChainAuth(cipherConn, a, cfg, hops, cfg.Destination, authMsg, reply); err != nil {
+			if err := completeChainAuth(cipherConn, a, cfg, hops, dest, authMsg, reply); err != nil {
 				_ = cipherConn.Close()
 				return nil, none, err
 			}

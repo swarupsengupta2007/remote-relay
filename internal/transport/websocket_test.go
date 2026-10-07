@@ -392,29 +392,53 @@ func TestWebSocket_ClientIPExtraction(t *testing.T) {
 	req, _ := http.NewRequest("GET", "http://example.com/relay-stream", nil)
 	req.RemoteAddr = "10.0.0.1:12345"
 
-	// 1. Direct remote addr
-	ip := ExtractClientIP(req, nil)
+	// Direct remote addr, no forwarded headers.
+	ip := ExtractClientIP(req, nil, nil)
 	if ip != "10.0.0.1" {
 		t.Fatalf("expected 10.0.0.1, got %q", ip)
 	}
 
-	// 2. X-Real-IP overrides
+	// Forged headers from an untrusted peer are ignored.
 	req.Header.Set("X-Real-IP", "203.0.113.195")
-	ip = ExtractClientIP(req, nil)
-	if ip != "203.0.113.195" {
-		t.Fatalf("expected 203.0.113.195, got %q", ip)
-	}
-
-	// 3. X-Forwarded-For overrides X-Real-IP with first client
 	req.Header.Set("X-Forwarded-For", "198.51.100.42, 10.0.0.1")
-	ip = ExtractClientIP(req, nil)
-	if ip != "198.51.100.42" {
-		t.Fatalf("expected 198.51.100.42, got %q", ip)
+	ip = ExtractClientIP(req, nil, nil)
+	if ip != "10.0.0.1" {
+		t.Fatalf("untrusted peer: expected 10.0.0.1, got %q", ip)
+	}
+	addr := ExtractRemoteAddr(req, nil, nil)
+	if addr == nil || addr.String() != "10.0.0.1:12345" {
+		t.Fatalf("untrusted peer: expected 10.0.0.1:12345, got %v", addr)
 	}
 
-	addr := ExtractRemoteAddr(req, nil)
+	// The same headers are honored when the direct peer is trusted.
+	trusted := []string{"10.0.0.1"}
+	ip = ExtractClientIP(req, nil, trusted)
+	if ip != "198.51.100.42" {
+		t.Fatalf("trusted peer: expected 198.51.100.42, got %q", ip)
+	}
+	addr = ExtractRemoteAddr(req, nil, trusted)
 	if addr == nil || addr.String() != "198.51.100.42:12345" {
-		t.Fatalf("expected 198.51.100.42:12345, got %v", addr)
+		t.Fatalf("trusted peer: expected 198.51.100.42:12345, got %v", addr)
+	}
+
+	req.Header.Del("X-Forwarded-For")
+	ip = ExtractClientIP(req, nil, trusted)
+	if ip != "203.0.113.195" {
+		t.Fatalf("trusted X-Real-IP: expected 203.0.113.195, got %q", ip)
+	}
+
+	// A server websocket.Conn reports the Origin URL as RemoteAddr; the trust
+	// decision must still use the TCP peer in req.RemoteAddr.
+	req.Header.Set("X-Forwarded-For", "198.51.100.42")
+	origin, _ := url.Parse("http://proxy.example")
+	originAddr := &websocket.Addr{URL: origin}
+	ip = ExtractClientIP(req, originAddr, trusted)
+	if ip != "198.51.100.42" {
+		t.Fatalf("origin raw addr, trusted peer: expected 198.51.100.42, got %q", ip)
+	}
+	ip = ExtractClientIP(req, originAddr, nil)
+	if ip != "10.0.0.1" {
+		t.Fatalf("origin raw addr, untrusted peer: expected 10.0.0.1, got %q", ip)
 	}
 }
 

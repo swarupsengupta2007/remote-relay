@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -440,4 +441,101 @@ hold_timeout = "30s"
 	} else if !parentState.Success() {
 		t.Fatalf("parent process exited with non-zero status: %v", parentState)
 	}
+}
+
+// TestHandoverPassesWSAndMetricsListeners checks that a hot restart hands the
+// WebSocket and metrics listeners to the child instead of having the child
+// bind addresses the parent still holds.
+func TestHandoverPassesWSAndMetricsListeners(t *testing.T) {
+	log := logging.New(io.Discard, "error", "text")
+
+	// Reserve fixed ports so the child config names the same addresses.
+	reserve := func() string {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		addr := l.Addr().String()
+		_ = l.Close()
+		return addr
+	}
+	wsAddr := reserve()
+	metricsAddr := reserve()
+
+	mkCfg := func() config.Server {
+		cfg := config.DefaultServer()
+		cfg.ListenTCP = "127.0.0.1:0"
+		cfg.ListenWS = "ws://" + wsAddr
+		cfg.MetricsListen = metricsAddr
+		cfg.Transports = []string{"tcp"}
+		return cfg
+	}
+
+	srv1 := NewServer(mkCfg(), log)
+	srv1.SetNoExitOnRestart(true)
+	if err := srv1.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	defer cancel1()
+	go func() { _ = srv1.Serve(ctx1) }()
+	waitUntil(t, 5*time.Second, func() bool { return srv1.MetricsAddr() != "" && srv1.WSAddr() != "" })
+
+	sp, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentFile := os.NewFile(uintptr(sp[0]), "parent-file")
+	childFile := os.NewFile(uintptr(sp[1]), "child-file")
+	defer parentFile.Close()
+	defer childFile.Close()
+	parentConn, err := net.FileConn(parentFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parentConn.Close()
+	t.Setenv("RELAY_HANDOVER_FD", strconv.Itoa(int(childFile.Fd())))
+
+	srv2 := NewServer(mkCfg(), log)
+	srv2.SetNoExitOnRestart(true)
+	handoverErrCh := make(chan error, 1)
+	go func() { handoverErrCh <- srv1.HandoverTo(parentConn.(*net.UnixConn)) }()
+
+	if err := srv2.Listen(); err != nil {
+		t.Fatalf("srv2.Listen: %v", err)
+	}
+	defer srv2.Close()
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	srv2ErrCh := make(chan error, 1)
+	go func() { srv2ErrCh <- srv2.Serve(ctx2) }()
+
+	if err := <-handoverErrCh; err != nil {
+		t.Fatalf("HandoverTo: %v", err)
+	}
+	// Parent still holds its copy of the metrics socket here, as it does until
+	// os.Exit in a real restart; the child must not have tried to bind it.
+	waitUntil(t, 5*time.Second, func() bool {
+		select {
+		case err := <-srv2ErrCh:
+			t.Fatalf("child Serve exited: %v", err)
+		default:
+		}
+		return srv2.MetricsAddr() == metricsAddr && srv2.WSAddr() == wsAddr
+	})
+	cancel1()
+
+	resp, err := (&http.Client{Timeout: 3 * time.Second}).Get("http://" + metricsAddr + "/metrics")
+	if err != nil {
+		t.Fatalf("metrics after handover: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("metrics status %d", resp.StatusCode)
+	}
+	c, err := net.DialTimeout("tcp", wsAddr, 3*time.Second)
+	if err != nil {
+		t.Fatalf("websocket port after handover: %v", err)
+	}
+	_ = c.Close()
 }

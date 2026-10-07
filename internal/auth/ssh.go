@@ -187,6 +187,7 @@ func (p *PublicKey) Verify(ch Challenge, raw json.RawMessage) (Identity, error) 
 		RawPubKey:             pub.Marshal(),
 		PortForwardingBlocked: entry.PortForwardingBlocked,
 		PermittedDestinations: entry.PermittedDestinations,
+		PermittedTargets:      entry.PermittedTargets,
 	}, nil
 }
 
@@ -472,6 +473,7 @@ type AuthorizedKeyEntry struct {
 	Options               []string
 	PortForwardingBlocked bool
 	PermittedDestinations []string
+	PermittedTargets      []string
 }
 
 // ParseAuthorizedKeyOptions evaluates OpenSSH authorized_keys options according
@@ -480,10 +482,14 @@ type AuthorizedKeyEntry struct {
 //   - "permitopen=\"none\"" or "permitopen=\"\"": blocks all destination port forwarding.
 //   - "permitopen=\"host:port\"": specifies an allowed destination. Can appear
 //     multiple times or contain comma-separated destinations.
+//   - "permitlisten=\"none\"" or "permitlisten=\"\"": blocks all reverse relay registrations.
+//   - "permitlisten=\"target1,target2\"": specifies allowed targets for reverse relay agent registration.
 //   - "restrict": disables port forwarding unless explicitly enabled via "port-forwarding".
 //   - "port-forwarding": re-enables port forwarding when preceded or paired with "restrict".
-func ParseAuthorizedKeyOptions(options []string) (blocked bool, permitted []string) {
+func ParseAuthorizedKeyOptions(options []string) (blocked bool, permitted []string, permittedTargets []string) {
 	var permitOpenEntries []string
+	var permitListenEntries []string
+	hasPermitListen := false
 	restrict := false
 	allowPF := false
 
@@ -520,13 +526,34 @@ func ParseAuthorizedKeyOptions(options []string) (blocked bool, permitted []stri
 				}
 			}
 		}
+		if strings.HasPrefix(lower, "permitlisten=") {
+			hasPermitListen = true
+			val := opt[len("permitlisten="):]
+			val = strings.Trim(val, `"`)
+			val = strings.TrimSpace(val)
+			if val == "" || strings.EqualFold(val, "none") {
+				continue
+			}
+			for _, part := range strings.Split(val, ",") {
+				part = strings.TrimSpace(part)
+				if part != "" {
+					permitListenEntries = append(permitListenEntries, part)
+				}
+			}
+		}
 	}
 
 	if restrict && !allowPF {
 		blocked = true
+		permittedTargets = []string{}
+	} else if hasPermitListen {
+		permittedTargets = permitListenEntries
+		if permittedTargets == nil {
+			permittedTargets = []string{}
+		}
 	}
 
-	return blocked, permitOpenEntries
+	return blocked, permitOpenEntries, permittedTargets
 }
 
 // LoadAuthorizedKeyEntries reads and parses all OpenSSH public keys and options from path.
@@ -548,13 +575,14 @@ func LoadAuthorizedKeyEntries(path string) ([]AuthorizedKeyEntry, error) {
 		if err != nil {
 			continue
 		}
-		blocked, permitted := ParseAuthorizedKeyOptions(options)
+		blocked, permitted, targets := ParseAuthorizedKeyOptions(options)
 		entries = append(entries, AuthorizedKeyEntry{
 			PublicKey:             pub,
 			Comment:               comment,
 			Options:               options,
 			PortForwardingBlocked: blocked,
 			PermittedDestinations: permitted,
+			PermittedTargets:      targets,
 		})
 	}
 	return entries, nil

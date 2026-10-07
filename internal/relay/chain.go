@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"strconv"
@@ -18,6 +19,7 @@ import (
 	"github.com/remote-relay/relay/internal/config"
 	"github.com/remote-relay/relay/internal/crypto/kex"
 	"github.com/remote-relay/relay/internal/logging"
+	"github.com/remote-relay/relay/internal/obs"
 	"github.com/remote-relay/relay/internal/proto"
 	"github.com/remote-relay/relay/internal/session"
 	"github.com/remote-relay/relay/internal/transport"
@@ -44,18 +46,43 @@ func (s *Server) handleChain(ctx context.Context, conn transport.Conn, f proto.F
 		return
 	}
 
+	var span *obs.Span
+	if s.tracer != nil {
+		ctx, span = s.tracer.Start(ctx, "ChainHop", obs.WithParentTraceparent(ch.Traceparent), obs.WithAttribute("chainId", ch.ChainID), obs.WithAttribute("hops", strconv.Itoa(len(ch.Hops))))
+		defer span.End()
+	}
+	if s.metrics != nil {
+		s.metrics.HopChainDepth.Observe(float64(len(ch.Hops)))
+	}
+
 	selfAddr := conn.LocalAddr().String()
 	log := s.log.With("chainId", ch.ChainID, "self", selfAddr)
 
 	if perr := s.chainPolicy(ch, selfAddr); perr != nil {
 		s.chainRefused.Add(1)
+		if s.metrics != nil {
+			s.metrics.RBACRejections.WithLabelValues("hop_forbidden").Inc()
+		}
+		if span != nil {
+			span.SetStatus("ERROR", perr.Msg)
+		}
 		log.Warn("chain refused", "code", perr.Code, "reason", perr.Msg, "hops", len(ch.Hops))
 		writeErr(conn, perr.Code, perr.Msg)
 		return
 	}
-	if _, _, err := net.SplitHostPort(ch.Destination); err != nil {
-		writeErr(conn, proto.CodeProto, "bad destination")
-		return
+	isChainedTarget := (len(ch.Hops) > 0 && ch.Hops[len(ch.Hops)-1].Target != "") || strings.HasPrefix(ch.Destination, proto.DestTargetPrefix)
+	if isChainedTarget {
+		if ch.Destination != "" && !strings.HasPrefix(ch.Destination, proto.DestTargetPrefix) {
+			if _, _, err := net.SplitHostPort(ch.Destination); err != nil {
+				writeErr(conn, proto.CodeProto, "bad destination override")
+				return
+			}
+		}
+	} else {
+		if _, _, err := net.SplitHostPort(ch.Destination); err != nil {
+			writeErr(conn, proto.CodeProto, "bad destination")
+			return
+		}
 	}
 
 	next := ch.Hops[0]
@@ -86,7 +113,7 @@ func (s *Server) handleChain(ctx context.Context, conn transport.Conn, f proto.F
 		writeErr(conn, proto.CodeDestForbidden, "port forwarding is disabled for this key")
 		return
 	}
-	if len(id.PermittedDestinations) > 0 && !config.DestinationAllowed(ch.Destination, id.PermittedDestinations) {
+	if len(id.PermittedDestinations) > 0 && ch.Destination != "" && !strings.HasPrefix(ch.Destination, proto.DestTargetPrefix) && !config.DestinationAllowed(ch.Destination, id.PermittedDestinations) {
 		s.chainRefused.Add(1)
 		s.refused.Add(1)
 		writeErr(conn, proto.CodeDestForbidden, "destination not allowed by user policy")
@@ -127,6 +154,212 @@ func (s *Server) handleChain(ctx context.Context, conn transport.Conn, f proto.F
 		return
 	}
 
+	cfg := s.Config()
+	if next.Target != "" {
+		if id.PermittedTargets != nil {
+			allowed := false
+			for _, t := range id.PermittedTargets {
+				if t == "*" || t == next.Target {
+					allowed = true
+					break
+				}
+			}
+			if !allowed {
+				s.chainRefused.Add(1)
+				s.refused.Add(1)
+				if s.metrics != nil {
+					s.metrics.RBACRejections.WithLabelValues("user_target_forbidden").Inc()
+				}
+				if span != nil {
+					span.SetStatus("ERROR", "target not allowed by user policy")
+				}
+				writeErr(conn, proto.CodeDestForbidden, fmt.Sprintf("target %q not allowed by user policy", next.Target))
+				return
+			}
+		}
+		if _, ok := s.agentReg.GetTarget(next.Target); !ok {
+			s.chainRefused.Add(1)
+			s.refused.Add(1)
+			if span != nil {
+				span.SetStatus("ERROR", "target not found or agent offline")
+			}
+			writeErr(conn, proto.CodeDestRefused, fmt.Sprintf("target %q not found or agent offline", next.Target))
+			return
+		}
+
+		targetDestOverride := ch.Destination
+		if strings.HasPrefix(targetDestOverride, proto.DestTargetPrefix) {
+			targetDestOverride = ""
+		}
+		pb, clientPipe, err := s.agentReg.CreateBind(next.Target, targetDestOverride, originIP, conn.RemoteAddr())
+		if err != nil {
+			s.store.Remove(sess.ID)
+			writeErr(conn, proto.CodeDestRefused, err.Error())
+			return
+		}
+		dialTimeout := cfg.DialTimeout.Duration()
+		if dialTimeout <= 0 {
+			dialTimeout = 10 * time.Second
+		}
+		select {
+		case <-pb.ReadyCh:
+			if pb.Err != nil {
+				s.store.Remove(sess.ID)
+				_ = clientPipe.Close()
+				if span != nil {
+					span.SetStatus("ERROR", pb.Err.Error())
+				}
+				writeErr(conn, proto.CodeDestRefused, pb.Err.Error())
+				return
+			}
+		case <-time.After(dialTimeout):
+			s.agentReg.RemoveBind(pb.BindID)
+			s.store.Remove(sess.ID)
+			_ = clientPipe.Close()
+			if span != nil {
+				span.SetStatus("ERROR", "agent dial timeout")
+			}
+			writeErr(conn, proto.CodeDestRefused, "agent dial timeout")
+			return
+		case <-ctx.Done():
+			s.agentReg.RemoveBind(pb.BindID)
+			s.store.Remove(sess.ID)
+			_ = clientPipe.Close()
+			return
+		}
+
+		s.chainHops.Add(1)
+
+		inBuf := s.chainBufCap(0)
+		if inBuf <= 0 {
+			_ = clientPipe.Close()
+			s.store.Remove(sess.ID)
+			s.refused.Add(1)
+			writeErr(conn, proto.CodeNoCapacity, "buffer budget exhausted")
+			return
+		}
+		inWindow := cfg.SendWindow
+		if ch.Window > 0 && ch.Window < inWindow {
+			inWindow = ch.Window
+		}
+
+		sessLog := logging.WithSession(log, sess.ID)
+		rawConn := unwrapConn(conn)
+
+		inRing := session.NewTieredRing(session.RingConfig{
+			CapMax:   inBuf,
+			Budget:   s.budget,
+			L1Cap:    cfg.SpillL1Bytes,
+			SpillDir: cfg.SpillDir,
+			NoSpill:  cfg.NoSpill,
+		})
+		sIO := sessionIO{
+			conn:       rawConn,
+			src:        clientPipe,
+			sink:       clientPipe,
+			rawSrc:     clientPipe,
+			rawSink:    clientPipe,
+			closeWrite: clientPipe.CloseWrite,
+			closeSrc:   clientPipe.Close,
+			outDir:     proto.DirDown,
+			inDir:      proto.DirUp,
+		}
+		p := newPump(ctx, sIO, pumpConfig{
+			chunk:         cfg.DataChunkBytes,
+			window:        inWindow,
+			buffer:        inBuf,
+			keepalive:     cfg.KeepaliveInterval.Duration(),
+			idle:          cfg.IdleTimeout.Duration(),
+			switchTimeout: cfg.SwitchTimeout.Duration(),
+			heartbeat:     cfg.HeartbeatInterval.Duration(),
+			deadThreshold: cfg.DeadPeerThreshold,
+			log:           sessLog,
+			splice:        false,
+			metrics:       s.metrics,
+		}, inRing)
+
+		l := &live{
+			pump:            p,
+			id:              sess.ID,
+			srv:             s,
+			store:           s.store,
+			cfg:             cfg,
+			window:          inWindow,
+			holdTimeout:     cfg.HoldTimeout.Duration(),
+			nested:          nil,
+			releaseChain:    releaseChain,
+			log:             sessLog,
+			clientIP:        "",
+			releaseHelloTCP: releaseTCP,
+			attachCh:        make(chan attachReq, 4),
+			deadCh:          make(chan struct{}),
+		}
+		l.onPeerFrame = func() { l.store.ConfirmToken(l.id) }
+		p.cfg.onAuth = func(a proto.Auth) error { return l.deliverChainAuth(a) }
+		s.livesMu.Lock()
+		s.lives[sess.ID] = l
+		s.livesMu.Unlock()
+		chainReleased = true
+		defer func() {
+			s.livesMu.Lock()
+			delete(s.lives, sess.ID)
+			s.livesMu.Unlock()
+			l.cleanup(false)
+		}()
+
+		chainOK, err := proto.MarshalFrame(proto.TypeChainOK, proto.ChainHelloOK{
+			V:         1,
+			Hop:       nextHopIndex,
+			Addr:      proto.DestTargetPrefix + next.Target,
+			SessionID: pb.BindID,
+			Transport: "agent",
+			Limits: proto.Limits{
+				BufferBytes:     inBuf,
+				HoldTimeoutMs:   int(cfg.HoldTimeout.Duration() / time.Millisecond),
+				Window:          inWindow,
+				DataChunkBytes:  cfg.DataChunkBytes,
+				SwitchTimeoutMs: int(cfg.SwitchTimeout.Duration() / time.Millisecond),
+			},
+			SetupMs: time.Since(setupStart).Milliseconds(),
+		})
+		if err != nil {
+			return
+		}
+		if err := writeFrameDeadline(conn, chainOK); err != nil {
+			return
+		}
+
+		selected, udp := s.pickTransport(ch.Transport, sess.ID, conn.LocalAddr())
+		okMsg := proto.HelloOK{
+			V:           1,
+			SessionID:   sess.ID,
+			ResumeToken: token,
+			Transport:   selected,
+			UDP:         udp,
+			Limits: proto.Limits{
+				BufferBytes:     inBuf,
+				HoldTimeoutMs:   int(cfg.HoldTimeout.Duration() / time.Millisecond),
+				Window:          inWindow,
+				DataChunkBytes:  cfg.DataChunkBytes,
+				SwitchTimeoutMs: int(cfg.SwitchTimeout.Duration() / time.Millisecond),
+			},
+			ServerNonce: serverNonce,
+		}
+		fr, err := proto.MarshalFrame(proto.TypeHelloOK, okMsg)
+		if err != nil {
+			return
+		}
+		if err := writeFrameDeadline(conn, fr); err != nil {
+			return
+		}
+		sessLog.Info("chained target session started",
+			"target", next.Target, "dest", targetDestOverride, "peer", rawConn.RemoteAddr().String(),
+			"hop", ownHopIndex, "hops", len(ch.Hops)+1,
+			"originIp", originIP, "transport", selected)
+		l.run(ctx, rawConn)
+		return
+	}
+
 	nested, perr := s.negotiateOnward(ctx, conn, ch, next, tail, selfAddr, originIP, nextHopIndex, log)
 	if perr != nil {
 		s.store.Remove(sess.ID)
@@ -151,7 +384,6 @@ func (s *Server) handleChain(ctx context.Context, conn transport.Conn, f proto.F
 		writeErr(conn, proto.CodeNoCapacity, "buffer budget exhausted")
 		return
 	}
-	cfg := s.Config()
 	inWindow := cfg.SendWindow
 	if ch.Window > 0 && ch.Window < inWindow {
 		inWindow = ch.Window
@@ -170,7 +402,13 @@ func (s *Server) handleChain(ctx context.Context, conn transport.Conn, f proto.F
 	rawConn := unwrapConn(conn)
 	nested.log = sessLog
 
-	inRing := session.NewRing(inBuf, s.budget)
+	inRing := session.NewTieredRing(session.RingConfig{
+		CapMax:   inBuf,
+		Budget:   s.budget,
+		L1Cap:    cfg.SpillL1Bytes,
+		SpillDir: cfg.SpillDir,
+		NoSpill:  cfg.NoSpill,
+	})
 	p := newPump(ctx, sessionIO{
 		conn:       rawConn,
 		src:        nested.fromOnwardR,
@@ -189,6 +427,7 @@ func (s *Server) handleChain(ctx context.Context, conn transport.Conn, f proto.F
 		heartbeat:     cfg.HeartbeatInterval.Duration(),
 		deadThreshold: cfg.DeadPeerThreshold,
 		log:           sessLog,
+		metrics:       s.metrics,
 		// J-D13: the bridge is an in-memory pipe, not a socket, so there is no
 		// fd to splice from or to.
 		splice: false,
@@ -470,11 +709,26 @@ func (s *Server) chainPolicy(ch proto.ChainHello, selfAddr string) *proto.Error 
 		return proto.NewError(proto.CodeProto, "CHAIN without hops; send HELLO instead")
 	}
 	// J-D8: chaining is default-deny. Without this any authenticated client
+	// could use this server to dial further relays. A target hop is not an
+	// onward relay: it is a rendezvous with an agent registered here, the same
+	// as a direct --target, so a chain of only a target hop is not gated on
+	// allow_relay_hops.
 	cfg := s.Config()
-	if len(cfg.AllowRelayHops) == 0 {
-		return proto.NewError(proto.CodeHopForbidden, "chaining is not enabled on this server")
-	}
 	for _, h := range ch.Hops {
+		if h.Target == "" && len(cfg.AllowRelayHops) == 0 {
+			return proto.NewError(proto.CodeHopForbidden, "chaining is not enabled on this server")
+		}
+	}
+	for i, h := range ch.Hops {
+		if h.Target != "" {
+			if i != len(ch.Hops)-1 {
+				return proto.NewError(proto.CodeProto, "target hop must be the terminal hop in chain")
+			}
+			if !s.Config().TargetAllowed(h.Target) {
+				return proto.NewError(proto.CodeDestForbidden, "target not allowed: "+h.Target)
+			}
+			continue
+		}
 		if _, _, err := net.SplitHostPort(h.Addr); err != nil {
 			return proto.NewError(proto.CodeProto, "bad hop address "+h.Addr)
 		}
@@ -494,11 +748,11 @@ func (s *Server) chainPolicy(ch proto.ChainHello, selfAddr string) *proto.Error 
 		}
 	}
 	for i, h := range ch.Hops {
-		if addrsMatch(self, h.Addr) {
+		if h.Addr != "" && addrsMatch(self, h.Addr) {
 			return proto.NewError(proto.CodeChainLoop, "chain would loop back to this relay")
 		}
 		for j := i + 1; j < len(ch.Hops); j++ {
-			if addrEqual(h.Addr, ch.Hops[j].Addr) {
+			if h.Addr != "" && addrEqual(h.Addr, ch.Hops[j].Addr) {
 				return proto.NewError(proto.CodeChainLoop, "relay hop repeated in chain: "+h.Addr)
 			}
 		}
@@ -529,8 +783,9 @@ func addrsMatch(self []string, addr string) bool {
 }
 
 // addrEqual compares two host:port strings for loop detection. A wildcard bind
-// host matches any host on the same port: a server listening on 0.0.0.0:7443 is
-// reachable as every one of its local addresses.
+// host matches a host on the same port only when that host is one of this
+// machine's own addresses: a server listening on 0.0.0.0:7443 is reachable as
+// each of its local addresses, not as every host on the network.
 func addrEqual(a, b string) bool {
 	if a == "" || b == "" {
 		return false
@@ -543,14 +798,61 @@ func addrEqual(a, b string) bool {
 	if aerr != nil || berr != nil || ap != bp {
 		return false
 	}
-	return isWildcardHost(ah) || isWildcardHost(bh)
+	switch {
+	case isWildcardHost(ah):
+		return isLocalHost(bh)
+	case isWildcardHost(bh):
+		return isLocalHost(ah)
+	}
+	aip, bip := parseHostIP(ah), parseHostIP(bh)
+	return aip != nil && aip.Equal(bip)
+}
+
+func parseHostIP(h string) net.IP {
+	return net.ParseIP(strings.TrimSuffix(strings.TrimPrefix(h, "["), "]"))
+}
+
+// localIPs returns this host's interface addresses; a variable for tests.
+var localIPs = func() []net.IP {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return nil
+	}
+	out := make([]net.IP, 0, len(addrs))
+	for _, a := range addrs {
+		if ipn, ok := a.(*net.IPNet); ok {
+			out = append(out, ipn.IP)
+		}
+	}
+	return out
+}
+
+// isLocalHost reports whether h names this machine. Hostnames other than
+// localhost are not resolved.
+func isLocalHost(h string) bool {
+	if isWildcardHost(h) || strings.EqualFold(h, "localhost") {
+		return true
+	}
+	ip := parseHostIP(h)
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() {
+		return true
+	}
+	for _, l := range localIPs() {
+		if l.Equal(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 func isWildcardHost(h string) bool {
 	if h == "" {
 		return true
 	}
-	ip := net.ParseIP(strings.TrimSuffix(strings.TrimPrefix(h, "["), "]"))
+	ip := parseHostIP(h)
 	return ip != nil && ip.IsUnspecified()
 }
 

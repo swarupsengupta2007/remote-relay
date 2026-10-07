@@ -165,7 +165,14 @@ func (n *nestedHop) start(parent context.Context, bufCap, chunk, window int, swi
 	ctx, cancel := context.WithCancel(parent)
 	n.cancel = cancel
 
-	sendLog := session.NewRing(bufCap, n.srv.budget)
+	cfg := n.srv.Config()
+	sendLog := session.NewTieredRing(session.RingConfig{
+		CapMax:   bufCap,
+		Budget:   n.srv.budget,
+		L1Cap:    cfg.SpillL1Bytes,
+		SpillDir: cfg.SpillDir,
+		NoSpill:  cfg.NoSpill,
+	})
 	n.pump = newPump(ctx, sessionIO{
 		conn:       n.takeConn(),
 		src:        n.toOnwardR,
@@ -186,7 +193,9 @@ func (n *nestedHop) start(parent context.Context, bufCap, chunk, window int, swi
 		log:           n.log,
 		splice:        false,
 		resumeHook:    n.relayResumeChallenge,
+		metrics:       n.srv.metrics,
 	}, sendLog)
+	n.pump.tracer = n.srv.tracer
 
 	n.launch(ctx)
 }

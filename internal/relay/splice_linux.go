@@ -34,8 +34,8 @@ func ResetSplicedStats() {
 
 // pipePair manages an OS pipe used as an intermediate buffer for splice(2).
 type pipePair struct {
-	rfd int
-	wfd int
+	rfd atomic.Int32
+	wfd atomic.Int32
 }
 
 func newPipePair(bufSize int) (*pipePair, error) {
@@ -46,22 +46,31 @@ func newPipePair(bufSize int) (*pipePair, error) {
 	if bufSize > 0 {
 		_, _ = unix.FcntlInt(uintptr(fds[0]), unix.F_SETPIPE_SZ, bufSize)
 	}
-	return &pipePair{rfd: fds[0], wfd: fds[1]}, nil
+	p := &pipePair{}
+	p.rfd.Store(int32(fds[0]))
+	p.wfd.Store(int32(fds[1]))
+	return p, nil
+}
+
+func (p *pipePair) R() int {
+	return int(p.rfd.Load())
+}
+
+func (p *pipePair) W() int {
+	return int(p.wfd.Load())
 }
 
 func (p *pipePair) Close() error {
 	var errs []error
-	if p.rfd >= 0 {
-		if err := unix.Close(p.rfd); err != nil {
+	if r := p.rfd.Swap(-1); r >= 0 {
+		if err := unix.Close(int(r)); err != nil {
 			errs = append(errs, err)
 		}
-		p.rfd = -1
 	}
-	if p.wfd >= 0 {
-		if err := unix.Close(p.wfd); err != nil {
+	if w := p.wfd.Swap(-1); w >= 0 {
+		if err := unix.Close(int(w)); err != nil {
 			errs = append(errs, err)
 		}
-		p.wfd = -1
 	}
 	if len(errs) > 0 {
 		return errors.Join(errs...)
@@ -128,10 +137,31 @@ func isSocket(fd int) bool {
 	return (st.Mode & unix.S_IFMT) == unix.S_IFSOCK
 }
 
+// waitWritable blocks until fd is writable or reports an error/hangup.
+func waitWritable(fd int) error {
+	fds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLOUT}}
+	for {
+		_, err := unix.Poll(fds, 1000)
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if fds[0].Revents&(unix.POLLERR|unix.POLLHUP|unix.POLLNVAL) != 0 {
+			return syscall.EPIPE
+		}
+		if fds[0].Revents&unix.POLLOUT != 0 {
+			return nil
+		}
+	}
+}
+
 // spliceSocketToSink splices exactly count bytes from rawTCP to sinkFd.
+// It returns the number of bytes that reached sinkFd, even on error.
 // If sinkFd is a pipe, it splices directly socket -> sinkFd.
 // If sinkFd is not a pipe (e.g. destination TCP socket), it splices socket -> pipe -> sinkFd.
-func spliceSocketToSink(rawTCP *net.TCPConn, sinkFd int, p *pipePair, count int) (int64, error) {
+func spliceSocketToSink(rawTCP *net.TCPConn, sinkFd int, p *pipePair, count int, acct *byteAcct) (int64, error) {
 	if count <= 0 {
 		return 0, nil
 	}
@@ -168,13 +198,21 @@ func spliceSocketToSink(rawTCP *net.TCPConn, sinkFd int, p *pipePair, count int)
 			}
 			transferred += nSplice
 			splicedBytesIn.Add(uint64(nSplice))
+			if acct != nil {
+				acct.add(nSplice)
+			}
 		} else {
 			// Two-stage splice: socket -> intermediate pipe -> sinkFd
 			var nDrain int64
 			var sysErr error
 			err := rc.Read(func(sfd uintptr) bool {
 				spliceCallsTotal.Add(1)
-				nDrain, sysErr = unix.Splice(int(sfd), nil, p.wfd, nil, want, unix.SPLICE_F_NONBLOCK)
+				wfd := p.W()
+				if wfd < 0 {
+					sysErr = net.ErrClosed
+					return true
+				}
+				nDrain, sysErr = unix.Splice(int(sfd), nil, wfd, nil, want, unix.SPLICE_F_NONBLOCK)
 				if sysErr == unix.EAGAIN || sysErr == unix.EWOULDBLOCK {
 					return false
 				}
@@ -194,12 +232,24 @@ func spliceSocketToSink(rawTCP *net.TCPConn, sinkFd int, p *pipePair, count int)
 			var pumped int64
 			for pumped < nDrain {
 				spliceCallsTotal.Add(1)
-				nPump, err := unix.Splice(p.rfd, nil, sinkFd, nil, int(nDrain-pumped), 0)
+				rfd := p.R()
+				if rfd < 0 {
+					return transferred + pumped, net.ErrClosed
+				}
+				nPump, err := unix.Splice(rfd, nil, sinkFd, nil, int(nDrain-pumped), 0)
 				if nPump > 0 {
 					pumped += nPump
 				}
 				if err != nil {
 					if err == unix.EINTR {
+						continue
+					}
+					if err == unix.EAGAIN {
+						// Non-blocking sink is full; wait rather than strand
+						// drained bytes in the pipe.
+						if werr := waitWritable(sinkFd); werr != nil {
+							return transferred + pumped, werr
+						}
 						continue
 					}
 					return transferred + pumped, err
@@ -210,6 +260,9 @@ func spliceSocketToSink(rawTCP *net.TCPConn, sinkFd int, p *pipePair, count int)
 			}
 			transferred += nDrain
 			splicedBytesIn.Add(uint64(nDrain))
+			if acct != nil {
+				acct.add(nDrain)
+			}
 		}
 	}
 	return transferred, nil
@@ -218,14 +271,18 @@ func spliceSocketToSink(rawTCP *net.TCPConn, sinkFd int, p *pipePair, count int)
 // spliceSrcToSocket drains up to count bytes from srcFd into intermediate pipe p,
 // optionally duplicates pages to pRetain via tee(2) to retain unacknowledged data in sendLog,
 // writes the frame header via writeHdr, and splices the payload into rawTCP.
-func spliceSrcToSocket(srcFd int, rawTCP *net.TCPConn, p *pipePair, pRetain *pipePair, count int, writeHdr func(n int) error) (int64, []byte, error) {
+func spliceSrcToSocket(srcFd int, rawTCP *net.TCPConn, p *pipePair, pRetain *pipePair, count int, writeHdr func(n int) error, acct *byteAcct) (int64, []byte, error) {
 	if count <= 0 {
 		return 0, nil, nil
 	}
 
 	// Step 1: Drain from srcFd into intermediate pipe
 	spliceCallsTotal.Add(1)
-	nDrain, err := unix.Splice(srcFd, nil, p.wfd, nil, count, 0)
+	wfd := p.W()
+	if wfd < 0 {
+		return 0, nil, net.ErrClosed
+	}
+	nDrain, err := unix.Splice(srcFd, nil, wfd, nil, count, 0)
 	if err != nil {
 		if err == unix.EINTR {
 			return 0, nil, nil
@@ -240,11 +297,20 @@ func spliceSrcToSocket(srcFd int, rawTCP *net.TCPConn, p *pipePair, pRetain *pip
 	var retained []byte
 	if pRetain != nil {
 		spliceCallsTotal.Add(1)
-		_, tErr := unix.Tee(p.rfd, pRetain.wfd, int(nDrain), 0)
-		if tErr == nil {
-			buf := make([]byte, nDrain)
-			if _, rErr := io.ReadFull(os.NewFile(uintptr(pRetain.rfd), "retain"), buf); rErr == nil {
-				retained = buf
+		rfd := p.R()
+		rwfd := pRetain.W()
+		if rfd >= 0 && rwfd >= 0 {
+			_, tErr := unix.Tee(rfd, rwfd, int(nDrain), 0)
+			if tErr == nil {
+				buf := make([]byte, nDrain)
+				rrfd := pRetain.R()
+				if rrfd >= 0 {
+					// Read the pooled pipe directly. Wrapping rrfd in os.NewFile
+					// would let the runtime finalizer close the pooled descriptor.
+					if rErr := readFullFD(rrfd, buf); rErr == nil {
+						retained = buf
+					}
+				}
 			}
 		}
 	}
@@ -269,7 +335,12 @@ func spliceSrcToSocket(srcFd int, rawTCP *net.TCPConn, p *pipePair, pRetain *pip
 		var sysErr error
 		err := rc.Write(func(sfd uintptr) bool {
 			spliceCallsTotal.Add(1)
-			nPump, sysErr = unix.Splice(p.rfd, nil, int(sfd), nil, want, unix.SPLICE_F_NONBLOCK)
+			rfd := p.R()
+			if rfd < 0 {
+				sysErr = net.ErrClosed
+				return true
+			}
+			nPump, sysErr = unix.Splice(rfd, nil, int(sfd), nil, want, unix.SPLICE_F_NONBLOCK)
 			if sysErr == unix.EAGAIN || sysErr == unix.EWOULDBLOCK {
 				return false
 			}
@@ -285,11 +356,33 @@ func spliceSrcToSocket(srcFd int, rawTCP *net.TCPConn, p *pipePair, pRetain *pip
 	}
 
 	splicedBytesOut.Add(uint64(pumped))
+	if acct != nil {
+		acct.add(pumped)
+	}
 	return pumped, retained, nil
 }
 
+// readFullFD reads len(buf) bytes from a raw file descriptor.
+func readFullFD(fd int, buf []byte) error {
+	total := 0
+	for total < len(buf) {
+		n, err := unix.Read(fd, buf[total:])
+		if err != nil {
+			if err == unix.EINTR {
+				continue
+			}
+			return err
+		}
+		if n == 0 {
+			return io.ErrUnexpectedEOF
+		}
+		total += n
+	}
+	return nil
+}
+
 // spliceSliceToSocket sends data from a memory slice into rawTCP using vmsplice(2) and splice(2).
-func spliceSliceToSocket(rawTCP *net.TCPConn, p *pipePair, data []byte, writeHdr func() error) (int64, error) {
+func spliceSliceToSocket(rawTCP *net.TCPConn, p *pipePair, data []byte, writeHdr func() error, acct *byteAcct) (int64, error) {
 	if len(data) == 0 {
 		return 0, nil
 	}
@@ -308,7 +401,11 @@ func spliceSliceToSocket(rawTCP *net.TCPConn, p *pipePair, data []byte, writeHdr
 		},
 	}
 	spliceCallsTotal.Add(1)
-	nVmsplice, err := unix.Vmsplice(p.wfd, iov, 0)
+	wfd := p.W()
+	if wfd < 0 {
+		return 0, net.ErrClosed
+	}
+	nVmsplice, err := unix.Vmsplice(wfd, iov, 0)
 	if err != nil {
 		return 0, err
 	}
@@ -328,7 +425,12 @@ func spliceSliceToSocket(rawTCP *net.TCPConn, p *pipePair, data []byte, writeHdr
 		var sysErr error
 		err := rc.Write(func(sfd uintptr) bool {
 			spliceCallsTotal.Add(1)
-			nPump, sysErr = unix.Splice(p.rfd, nil, int(sfd), nil, want, unix.SPLICE_F_NONBLOCK)
+			rfd := p.R()
+			if rfd < 0 {
+				sysErr = net.ErrClosed
+				return true
+			}
+			nPump, sysErr = unix.Splice(rfd, nil, int(sfd), nil, want, unix.SPLICE_F_NONBLOCK)
 			if sysErr == unix.EAGAIN || sysErr == unix.EWOULDBLOCK {
 				return false
 			}
@@ -346,5 +448,8 @@ func spliceSliceToSocket(rawTCP *net.TCPConn, p *pipePair, data []byte, writeHdr
 		pumped += nPump
 	}
 	splicedBytesOut.Add(uint64(pumped))
+	if acct != nil {
+		acct.add(pumped)
+	}
 	return pumped, nil
 }

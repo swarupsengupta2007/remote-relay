@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,6 +25,7 @@ import (
 	"github.com/remote-relay/relay/internal/config"
 	"github.com/remote-relay/relay/internal/crypto/kex"
 	"github.com/remote-relay/relay/internal/logging"
+	"github.com/remote-relay/relay/internal/obs"
 	"github.com/remote-relay/relay/internal/proto"
 	"github.com/remote-relay/relay/internal/session"
 	"github.com/remote-relay/relay/internal/transport"
@@ -62,6 +64,8 @@ type Server struct {
 	ipSess     map[string]int
 	chainPeers map[string]int
 
+	agentReg *AgentRegistry
+
 	accepts atomic.Int64
 	refused atomic.Int64
 
@@ -74,10 +78,17 @@ type Server struct {
 	chainAttestFailures atomic.Int64
 	chainGone           atomic.Int64
 
-	debugMu    sync.Mutex
-	debug      []*http.Server
-	pprofAddr  string
-	expvarAddr string
+	debugMu sync.Mutex
+	debug   []*http.Server
+	// debugLns holds each bound debug listener by configured address so a
+	// hot restart can pass it on; adoptedDebug holds those received from one.
+	debugLns     map[string]net.Listener
+	adoptedDebug map[string]net.Listener
+	pprofAddr    string
+	expvarAddr   string
+	metricsAddr  string
+	metrics      *obs.Metrics
+	tracer       *obs.Tracer
 
 	udpMu    sync.Mutex
 	udpStart sync.Mutex
@@ -93,6 +104,7 @@ type Server struct {
 
 	wsMu       sync.Mutex
 	wsLn       net.Listener
+	wsRawLn    net.Listener // wsLn before any TLS wrapping
 	wsSrv      *http.Server
 	wsCertOnce sync.Once
 	wsCertVal  tls.Certificate
@@ -283,9 +295,16 @@ func NewServer(cfg config.Server, log *slog.Logger) *Server {
 		runCancel:      runCancel,
 		restartingDone: make(chan struct{}),
 		opts:           config.ServerOptions{ConfigPath: cfg.ConfigPath, AuthorizedKeys: cfg.AuthorizedKeys},
+		metrics:        obs.NewMetrics(),
+		tracer:         obs.NewTracer("remote-relay", cfg.OTELEndpoint),
+		agentReg:       NewAgentRegistry(),
 	}
 	s.cfgPtr.Store(&cfg)
 	return s
+}
+
+func (s *Server) AgentRegistry() *AgentRegistry {
+	return s.agentReg
 }
 
 func (s *Server) HostPublicKey() ed25519.PublicKey {
@@ -465,6 +484,44 @@ func (s *Server) adoptHandover() (bool, error) {
 		s.startKCPLocked()
 	}
 
+	if state.HasListenWS {
+		if nextFD >= len(files) {
+			return false, errors.New("missing WebSocket listener FD in handover")
+		}
+		wsFile := files[nextFD]
+		nextFD++
+		ln, err := net.FileListener(wsFile)
+		_ = wsFile.Close()
+		if err != nil {
+			return false, fmt.Errorf("adopt WebSocket listener from handover: %w", err)
+		}
+		if err := s.adoptWSListener(ln); err != nil {
+			s.log.Error("handover: adopt websocket listener", "err", err)
+		} else {
+			s.log.Info("handover: adopted websocket listener", "addr", ln.Addr().String())
+		}
+	}
+
+	for _, addr := range state.DebugListen {
+		if nextFD >= len(files) {
+			return false, errors.New("missing debug listener FD in handover")
+		}
+		dbgFile := files[nextFD]
+		nextFD++
+		ln, err := net.FileListener(dbgFile)
+		_ = dbgFile.Close()
+		if err != nil {
+			return false, fmt.Errorf("adopt debug listener %s from handover: %w", addr, err)
+		}
+		s.debugMu.Lock()
+		if s.adoptedDebug == nil {
+			s.adoptedDebug = make(map[string]net.Listener)
+		}
+		s.adoptedDebug[addr] = ln
+		s.debugMu.Unlock()
+		s.log.Info("handover: adopted debug listener", "addr", ln.Addr().String())
+	}
+
 	for _, hSess := range state.Sessions {
 		sess, err := session.RestoreSession(hSess.Session)
 		if err != nil {
@@ -495,9 +552,12 @@ func (s *Server) adoptHandover() (bool, error) {
 				continue
 			}
 		}
-
-		sendLog := session.RestoreRing(hSess.SendLogBase, hSess.SendLogData, hSess.SendLogCap, s.budget)
 		cfg := s.Config()
+		sendLog := session.RestoreTieredRing(hSess.SendLogBase, hSess.SendLogData, hSess.SendLogCap, s.budget, session.RingConfig{
+			L1Cap:    cfg.SpillL1Bytes,
+			SpillDir: cfg.SpillDir,
+			NoSpill:  cfg.NoSpill,
+		})
 		window := cfg.SendWindow
 		if window <= 0 {
 			window = 64
@@ -505,15 +565,22 @@ func (s *Server) adoptHandover() (bool, error) {
 		log := logging.WithSession(s.log, hSess.Session.ID)
 		var closeWrite func() error
 		var closeSrc func() error
+		var src io.Reader
+		var sink io.Writer
+		var rawSrc, rawSink any
 		if dtcp != nil {
 			closeWrite = dtcp.CloseWrite
 			closeSrc = func() error { return dtcp.Close() }
+			src = dtcp
+			sink = dtcp
+			rawSrc = dtcp
+			rawSink = dtcp
 		}
 		p := newPump(s.sessionContext(), sessionIO{
-			src:        dtcp,
-			sink:       dtcp,
-			rawSrc:     dtcp,
-			rawSink:    dtcp,
+			src:        src,
+			sink:       sink,
+			rawSrc:     rawSrc,
+			rawSink:    rawSink,
 			closeWrite: closeWrite,
 			closeSrc:   closeSrc,
 			outDir:     proto.DirDown,
@@ -529,6 +596,7 @@ func (s *Server) adoptHandover() (bool, error) {
 			deadThreshold: cfg.DeadPeerThreshold,
 			log:           log,
 			splice:        cfg.Splice,
+			metrics:       s.metrics,
 		}, sendLog)
 
 		p.delivered.Store(hSess.UpAcked)
@@ -622,6 +690,13 @@ func (s *Server) Listen() error {
 	s.mu.Unlock()
 
 	if s.tryAdoptSockets() {
+		// Adoption may not have supplied a WebSocket listener (systemd, or a
+		// parent that predates passing it); bind it here in that case.
+		if s.Config().ListenWS != "" {
+			if err := s.listenWS(); err != nil {
+				s.log.Error("websocket listen after socket adoption", "err", err)
+			}
+		}
 		return nil
 	}
 
@@ -822,6 +897,8 @@ func (s *Server) handleTransportConn(conn transport.Conn, ip string, n int, rele
 		s.handleHello(ctx, cipherConn, f, ip, releaseConn, kexNonce)
 	case proto.TypeChain:
 		s.handleChain(ctx, cipherConn, f, ip, releaseConn, kexNonce)
+	case proto.TypeAgentRegister:
+		s.handleAgentRegister(ctx, cipherConn, f, ip, releaseConn, kexNonce)
 	default:
 		writeErr(cipherConn, proto.CodeProto, "expected HELLO")
 	}
@@ -857,22 +934,93 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 		return
 	}
 
+	var span *obs.Span
+	if s.tracer != nil {
+		ctx, span = s.tracer.Start(ctx, "Handshake", obs.WithParentTraceparent(hello.Traceparent), obs.WithAttribute("ip", ip))
+		defer span.End()
+	}
+
 	dest := hello.Destination
 	isSocks := dest == proto.DestSOCKS5
+	isAgentData := hello.Role == proto.RoleAgentData || strings.HasPrefix(dest, "bind:")
+	isTarget := hello.Target != "" || strings.HasPrefix(dest, proto.DestTargetPrefix)
+	var targetName string
+	var targetDestOverride string
+	if isTarget {
+		if hello.Target != "" {
+			targetName = hello.Target
+			targetDestOverride = dest
+		} else {
+			val := strings.TrimPrefix(dest, proto.DestTargetPrefix)
+			if idx := strings.Index(val, "/"); idx != -1 {
+				targetName = val[:idx]
+				targetDestOverride = val[idx+1:]
+			} else {
+				targetName = val
+			}
+		}
+		if dest == "" {
+			dest = proto.DestTargetPrefix + targetName
+		}
+	}
+
 	if isSocks {
 		if cfg.DisableSOCKS {
+			if s.metrics != nil {
+				s.metrics.RBACRejections.WithLabelValues("socks_disabled").Inc()
+			}
+			if span != nil {
+				span.SetStatus("ERROR", "socks proxy mode disabled")
+			}
 			writeErr(conn, proto.CodeDestForbidden, "socks proxy mode disabled")
 			return
+		}
+	} else if isAgentData {
+		// Agent data session rendezvous
+	} else if isTarget {
+		if targetName == "" {
+			if span != nil {
+				span.SetStatus("ERROR", "empty target name")
+			}
+			writeErr(conn, proto.CodeProto, "empty target name")
+			return
+		}
+		if _, ok := s.agentReg.GetTarget(targetName); !ok {
+			s.refused.Add(1)
+			if span != nil {
+				span.SetStatus("ERROR", "target not found or agent offline")
+			}
+			writeErr(conn, proto.CodeDestRefused, fmt.Sprintf("target %q not found or agent offline", targetName))
+			return
+		}
+		if targetDestOverride != "" {
+			if _, _, err := net.SplitHostPort(targetDestOverride); err != nil {
+				if span != nil {
+					span.SetStatus("ERROR", "bad destination override")
+				}
+				writeErr(conn, proto.CodeProto, "bad destination override")
+				return
+			}
 		}
 	} else {
 		if dest == "" {
 			dest = cfg.DefaultDestination
 		}
 		if _, _, err := net.SplitHostPort(dest); err != nil {
+			if span != nil {
+				span.SetStatus("ERROR", "bad destination")
+			}
 			writeErr(conn, proto.CodeProto, "bad destination")
 			return
 		}
 		if !config.DestinationAllowed(dest, cfg.AllowDestinations) {
+			s.refused.Add(1)
+			if s.metrics != nil {
+				s.metrics.RBACRejections.WithLabelValues("dest_forbidden").Inc()
+			}
+			if span != nil {
+				span.SetStatus("ERROR", "destination not allowed")
+			}
 			writeErr(conn, proto.CodeDestForbidden, "destination not allowed")
 			return
 		}
@@ -880,6 +1028,12 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 
 	id, sess, token, serverNonce, ok := s.helloAuth(conn, hello, f.Payload, dest, kexNonce)
 	if !ok {
+		if s.metrics != nil {
+			s.metrics.RBACRejections.WithLabelValues("auth_failed").Inc()
+		}
+		if span != nil {
+			span.SetStatus("ERROR", "auth failed")
+		}
 		return
 	}
 	sess.Destination = dest
@@ -893,6 +1047,12 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 	// Check per-user RBAC restrictions from authorized_keys
 	if id.PortForwardingBlocked {
 		s.refused.Add(1)
+		if s.metrics != nil {
+			s.metrics.RBACRejections.WithLabelValues("port_forwarding_blocked").Inc()
+		}
+		if span != nil {
+			span.SetStatus("ERROR", "port forwarding blocked")
+		}
 		if isSocks {
 			writeErr(conn, proto.CodeDestForbidden, "socks proxy mode disabled for this key")
 		} else {
@@ -900,10 +1060,36 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 		}
 		return
 	}
-	if !isSocks && len(id.PermittedDestinations) > 0 {
+	if !isSocks && !isAgentData && !isTarget && len(id.PermittedDestinations) > 0 {
 		if !config.DestinationAllowed(dest, id.PermittedDestinations) {
 			s.refused.Add(1)
+			if s.metrics != nil {
+				s.metrics.RBACRejections.WithLabelValues("user_policy_forbidden").Inc()
+			}
+			if span != nil {
+				span.SetStatus("ERROR", "destination not allowed by user policy")
+			}
 			writeErr(conn, proto.CodeDestForbidden, "destination not allowed by user policy")
+			return
+		}
+	}
+	if isTarget && id.PermittedTargets != nil {
+		allowed := false
+		for _, t := range id.PermittedTargets {
+			if t == "*" || t == targetName {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			s.refused.Add(1)
+			if s.metrics != nil {
+				s.metrics.RBACRejections.WithLabelValues("user_target_forbidden").Inc()
+			}
+			if span != nil {
+				span.SetStatus("ERROR", "target not allowed by user policy")
+			}
+			writeErr(conn, proto.CodeDestForbidden, fmt.Sprintf("target %q not allowed by user policy", targetName))
 			return
 		}
 	}
@@ -955,6 +1141,70 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 			inDir:      proto.DirUp,
 		}
 		doSplice = false
+	} else if isAgentData {
+		bindID := hello.ResumeToken
+		if bindID == "" {
+			bindID = strings.TrimPrefix(hello.Destination, "bind:")
+		}
+		agentPipe, err := s.agentReg.CompleteBind(bindID)
+		if err != nil {
+			s.store.Remove(sess.ID)
+			writeErr(conn, proto.CodeDestRefused, "invalid or expired bind id: "+err.Error())
+			return
+		}
+		sIO = sessionIO{
+			src:        agentPipe,
+			sink:       agentPipe,
+			rawSrc:     agentPipe,
+			rawSink:    agentPipe,
+			closeWrite: agentPipe.CloseWrite,
+			closeSrc:   agentPipe.Close,
+			outDir:     proto.DirDown,
+			inDir:      proto.DirUp,
+		}
+		doSplice = false
+	} else if isTarget {
+		pb, clientPipe, err := s.agentReg.CreateBind(targetName, targetDestOverride, ip, conn.RemoteAddr())
+		if err != nil {
+			s.store.Remove(sess.ID)
+			writeErr(conn, proto.CodeDestRefused, err.Error())
+			return
+		}
+		dialTimeout := cfg.DialTimeout.Duration()
+		if dialTimeout <= 0 {
+			dialTimeout = 10 * time.Second
+		}
+		select {
+		case <-pb.ReadyCh:
+			if pb.Err != nil {
+				s.store.Remove(sess.ID)
+				_ = clientPipe.Close()
+				writeErr(conn, proto.CodeDestRefused, pb.Err.Error())
+				return
+			}
+		case <-time.After(dialTimeout):
+			s.agentReg.RemoveBind(pb.BindID)
+			s.store.Remove(sess.ID)
+			_ = clientPipe.Close()
+			writeErr(conn, proto.CodeDestRefused, "agent dial timeout")
+			return
+		case <-ctx.Done():
+			s.agentReg.RemoveBind(pb.BindID)
+			s.store.Remove(sess.ID)
+			_ = clientPipe.Close()
+			return
+		}
+		sIO = sessionIO{
+			src:        clientPipe,
+			sink:       clientPipe,
+			rawSrc:     clientPipe,
+			rawSink:    clientPipe,
+			closeWrite: clientPipe.CloseWrite,
+			closeSrc:   clientPipe.Close,
+			outDir:     proto.DirDown,
+			inDir:      proto.DirUp,
+		}
+		doSplice = false
 	} else {
 		var derr *proto.Error
 		dtcp, derr = s.dialDestination(ctx, dest)
@@ -996,6 +1246,9 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 		if smux != nil {
 			_ = smux.Close()
 		}
+		if sIO.closeSrc != nil {
+			_ = sIO.closeSrc()
+		}
 		s.store.Remove(sess.ID)
 		s.refused.Add(1)
 		writeErr(conn, proto.CodeNoCapacity, "buffer budget exhausted")
@@ -1025,13 +1278,22 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 		if smux != nil {
 			_ = smux.Close()
 		}
+		if sIO.closeSrc != nil {
+			_ = sIO.closeSrc()
+		}
 		s.store.Remove(sess.ID)
 		return
 	}
 
 	rawConn := unwrapConn(conn)
 	log := logging.WithSession(s.log, sess.ID)
-	sendLog := session.NewRing(bufCap, s.budget)
+	sendLog := session.NewTieredRing(session.RingConfig{
+		CapMax:   bufCap,
+		Budget:   s.budget,
+		L1Cap:    cfg.SpillL1Bytes,
+		SpillDir: cfg.SpillDir,
+		NoSpill:  cfg.NoSpill,
+	})
 	sIO.conn = rawConn
 	p := newPump(ctx, sIO, pumpConfig{
 		chunk:         cfg.DataChunkBytes,
@@ -1044,6 +1306,7 @@ func (s *Server) handleHello(ctx context.Context, conn transport.Conn, f proto.F
 		deadThreshold: cfg.DeadPeerThreshold,
 		log:           log,
 		splice:        doSplice,
+		metrics:       s.metrics,
 	}, sendLog)
 
 	l := &live{
@@ -1099,14 +1362,31 @@ func (s *Server) handleResume(ctx context.Context, conn transport.Conn, f proto.
 		return
 	}
 
+	resumeStart := time.Now()
+	var span *obs.Span
+	if s.tracer != nil {
+		ctx, span = s.tracer.Start(ctx, "Resume", obs.WithParentTraceparent(msg.Traceparent), obs.WithAttribute("sessionId", msg.SessionID))
+		defer span.End()
+	}
+
+	failResume := func(code, reason string) {
+		if s.metrics != nil {
+			s.metrics.ReconnectTotal.WithLabelValues("failure").Inc()
+		}
+		if span != nil {
+			span.SetStatus("ERROR", reason)
+		}
+		writeResumeFail(conn, code, reason)
+	}
+
 	s.livesMu.Lock()
 	l := s.lives[msg.SessionID]
 	s.livesMu.Unlock()
 	if l == nil {
 		if s.store.IsExpired(msg.SessionID) {
-			writeResumeFail(conn, proto.CodeExpired, "session expired")
+			failResume(proto.CodeExpired, "session expired")
 		} else {
-			writeResumeFail(conn, proto.CodeUnknownSession, "unknown session")
+			failResume(proto.CodeUnknownSession, "unknown session")
 		}
 		return
 	}
@@ -1122,7 +1402,7 @@ func (s *Server) handleResume(ctx context.Context, conn transport.Conn, f proto.
 			if errors.As(err, &pe) {
 				code, m = pe.Code, pe.Msg
 			}
-			writeResumeFail(conn, code, m)
+			failResume(code, m)
 			return
 		}
 	}
@@ -1130,6 +1410,12 @@ func (s *Server) handleResume(ctx context.Context, conn transport.Conn, f proto.
 	if fallback {
 		l.log.Info("resume token invalid or missing; initiating cryptographic fallback", "sessionId", msg.SessionID)
 		if !s.resumeAuth(conn, msg, f.Payload, kexNonce) {
+			if s.metrics != nil {
+				s.metrics.ReconnectTotal.WithLabelValues("failure").Inc()
+			}
+			if span != nil {
+				span.SetStatus("ERROR", "fallback auth failed")
+			}
 			return
 		}
 	}
@@ -1141,7 +1427,7 @@ func (s *Server) handleResume(ctx context.Context, conn transport.Conn, f proto.
 			if errors.As(err, &pe) {
 				code, m = pe.Code, pe.Msg
 			}
-			writeResumeFail(conn, code, m)
+			failResume(code, m)
 			return
 		}
 	}
@@ -1152,14 +1438,30 @@ func (s *Server) handleResume(ctx context.Context, conn transport.Conn, f proto.
 		if err := l.AttachStandby(req); err != nil {
 			var pe *proto.Error
 			if errors.As(err, &pe) {
-				writeResumeFail(conn, pe.Code, pe.Msg)
+				failResume(pe.Code, pe.Msg)
 				return
 			}
-			writeResumeFail(conn, proto.CodeExpired, "session closed")
+			failResume(proto.CodeExpired, "session closed")
 			return
 		}
 		select {
-		case <-req.done:
+		case err := <-req.done:
+			if err == nil {
+				if s.metrics != nil {
+					s.metrics.ReconnectTotal.WithLabelValues("success").Inc()
+					s.metrics.ReconnectDuration.Observe(time.Since(resumeStart).Seconds())
+				}
+				if span != nil {
+					span.SetStatus("OK", "")
+				}
+			} else {
+				if s.metrics != nil {
+					s.metrics.ReconnectTotal.WithLabelValues("failure").Inc()
+				}
+				if span != nil {
+					span.SetStatus("ERROR", err.Error())
+				}
+			}
 		case <-ctx.Done():
 		}
 		return
@@ -1168,14 +1470,30 @@ func (s *Server) handleResume(ctx context.Context, conn transport.Conn, f proto.
 	if err := l.Offer(req); err != nil {
 		var pe *proto.Error
 		if errors.As(err, &pe) {
-			writeResumeFail(conn, pe.Code, pe.Msg)
+			failResume(pe.Code, pe.Msg)
 			return
 		}
-		writeResumeFail(conn, proto.CodeExpired, "session closed")
+		failResume(proto.CodeExpired, "session closed")
 		return
 	}
 	select {
-	case <-req.done:
+	case err := <-req.done:
+		if err == nil {
+			if s.metrics != nil {
+				s.metrics.ReconnectTotal.WithLabelValues("success").Inc()
+				s.metrics.ReconnectDuration.Observe(time.Since(resumeStart).Seconds())
+			}
+			if span != nil {
+				span.SetStatus("OK", "")
+			}
+		} else {
+			if s.metrics != nil {
+				s.metrics.ReconnectTotal.WithLabelValues("failure").Inc()
+			}
+			if span != nil {
+				span.SetStatus("ERROR", err.Error())
+			}
+		}
 	case <-ctx.Done():
 	}
 }
@@ -1241,6 +1559,22 @@ func (l *live) notePath(c transport.Conn) {
 		l.srv.pathHist = append(l.srv.pathHist, info)
 		l.srv.histMu.Unlock()
 	}
+}
+
+func (l *live) currentTransport() string {
+	if l == nil || l.pump == nil {
+		return ""
+	}
+	return l.pump.currentTransport()
+}
+
+func (l *live) hasStandby() bool {
+	if l == nil {
+		return false
+	}
+	l.standbyMu.Lock()
+	defer l.standbyMu.Unlock()
+	return l.standbyConn != nil && l.standbyBFD != nil && l.standbyBFD.IsUp()
 }
 
 func (l *live) markDead() {
@@ -1443,6 +1777,7 @@ func (l *live) runStandby(ctx context.Context, conn transport.Conn, sess *bfd.Se
 				return
 			case now := <-t.C:
 				if sess.CheckTimeout(now) {
+					noteDeadPeer(l.log, l.srv.metrics, "standby", sess, now)
 					select {
 					case errc <- ErrDeadPeer:
 					default:
@@ -1571,8 +1906,12 @@ func (l *live) run(ctx context.Context, first transport.Conn) {
 			l.releaseHelloTCP()
 			l.releaseHelloTCP = nil
 		}
-	} else {
+	} else if endpointReady(l.io.src) && endpointReady(l.io.sink) {
 		l.startIO()
+		err = errors.New("carrier dropped for handover")
+	} else {
+		// SOCKS, reverse-agent, and jumphost sessions have no destination FD.
+		// Hold them for reconnect; do not start a pump Read on a nil endpoint.
 		err = errors.New("carrier dropped for handover")
 	}
 	for reconnectable(err) && ctx.Err() == nil && l.sessionErr() == nil {
@@ -1686,6 +2025,9 @@ func (l *live) heldMs() int {
 }
 
 func (l *live) writeResumeOK(req attachReq, heldMs int) error {
+	if l.srv != nil && l.srv.metrics != nil && heldMs > 0 {
+		l.srv.metrics.HeldDuration.Observe(float64(heldMs) / 1000.0)
+	}
 	var token string
 	if req.fallback {
 		var err error
@@ -2061,4 +2403,166 @@ func (s *Server) hasStandby() bool {
 		}
 	}
 	return false
+}
+
+func (s *Server) handleAgentRegister(ctx context.Context, conn transport.Conn, f proto.Frame, ip string, releaseConn func(), kexNonce string) {
+	if releaseConn != nil {
+		defer releaseConn()
+	}
+	conn = newSafeConn(conn)
+	var reg proto.AgentRegister
+	if err := json.Unmarshal(f.Payload, &reg); err != nil {
+		writeErr(conn, proto.CodeProto, "malformed AGENT_REGISTER")
+		return
+	}
+	if reg.Name == "" {
+		writeErr(conn, proto.CodeProto, "empty agent name")
+		return
+	}
+	if !s.Config().TargetAllowed(reg.Name) {
+		writeErr(conn, proto.CodeDestForbidden, fmt.Sprintf("target %q forbidden by server policy", reg.Name))
+		return
+	}
+
+	a := s.getAuth()
+	targetDest := proto.DestTargetPrefix + reg.Name
+	serverNonce, err := authServerNonce(kexNonce)
+	if err != nil {
+		writeErr(conn, proto.CodeInternal, "nonce error")
+		return
+	}
+
+	ch := auth.Challenge{
+		SessionID:   "agent:" + reg.Name,
+		Destination: targetDest,
+		ClientNonce: reg.ClientNonce,
+		ServerNonce: serverNonce,
+		Canonical:   f.Payload,
+		Offer:       reg.Auth,
+	}
+
+	var id auth.Identity
+	if a.RequiresChallenge() {
+		var offer auth.Offer
+		if err := json.Unmarshal(bytesOrEmpty(reg.Auth), &offer); err != nil || offer.Method != auth.MethodPublicKey {
+			s.authFail(conn, time.Time{})
+			return
+		}
+		if !s.issueChallenge(conn, ch) {
+			return
+		}
+		raw, ok := s.readAuth(conn)
+		if !ok {
+			s.authFail(conn, time.Time{})
+			return
+		}
+		started := time.Now()
+		var vErr error
+		id, vErr = a.Verify(ch, raw)
+		if vErr != nil {
+			s.authFail(conn, started)
+			return
+		}
+	} else {
+		var vErr error
+		id, vErr = a.Verify(ch, reg.Auth)
+		if vErr != nil {
+			writeErr(conn, proto.CodeAuth, "auth failed")
+			return
+		}
+	}
+
+	// Verify RBAC permitlisten
+	if id.PermittedTargets != nil {
+		allowed := false
+		for _, t := range id.PermittedTargets {
+			if t == "*" || t == reg.Name {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			writeErr(conn, proto.CodeDestForbidden, fmt.Sprintf("key not permitted to register target %q", reg.Name))
+			return
+		}
+	}
+
+	dest := reg.Dest
+	if dest == "" {
+		dest = "127.0.0.1:22"
+	}
+	_, err = s.agentReg.Register(reg.Name, id.Fingerprint, id.RawPubKey, dest, reg.AllowDest, id.PermittedTargets, conn)
+	if err != nil {
+		writeErr(conn, proto.CodeDestForbidden, err.Error())
+		return
+	}
+
+	okPayload, err := proto.MarshalFrame(proto.TypeAgentRegisterOK, proto.AgentRegisterOK{
+		V:            1,
+		Target:       reg.Name,
+		ServerNonce:  serverNonce,
+		ExpiresInSec: 0,
+	})
+	if err != nil {
+		writeErr(conn, proto.CodeInternal, "marshal register ok")
+		return
+	}
+	if err := conn.WriteFrame(okPayload); err != nil {
+		s.agentReg.OnControlDisconnect(reg.Name, s.Config().AgentHoldTimeout.Duration(), conn)
+		return
+	}
+
+	s.runAgentControlLoop(ctx, conn, reg.Name)
+}
+
+func (s *Server) runAgentControlLoop(ctx context.Context, conn transport.Conn, targetName string) {
+	defer func() {
+		_ = conn.Close()
+		s.agentReg.OnControlDisconnect(targetName, s.Config().AgentHoldTimeout.Duration(), conn)
+	}()
+
+	hb := s.Config().HeartbeatInterval.Duration()
+	if hb <= 0 {
+		hb = 750 * time.Millisecond
+	}
+	// A silent control connection is not healthy past two heartbeat intervals.
+	idleLimit := hb * 2
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		if ag, ok := s.agentReg.GetTarget(targetName); ok {
+			ag.noteControlRead(conn, true)
+		}
+		_ = conn.SetDeadline(time.Now().Add(idleLimit))
+		f, err := conn.ReadFrame()
+		if ag, ok := s.agentReg.GetTarget(targetName); ok {
+			ag.noteControlRead(conn, false)
+		}
+		_ = conn.SetDeadline(time.Time{})
+		if err != nil {
+			s.log.Debug("agent control conn read closed", "target", targetName, "err", err)
+			return
+		}
+
+		switch f.Type {
+		case proto.TypeAgentBindOK:
+			var okMsg proto.AgentBindOK
+			if err := json.Unmarshal(f.Payload, &okMsg); err == nil {
+				if okMsg.Status != "ok" {
+					s.agentReg.FailBind(okMsg.BindID, fmt.Errorf("agent bind failed: %s", okMsg.Msg))
+				}
+			}
+		case proto.TypePing:
+			_ = conn.WriteFrame(proto.Frame{Type: proto.TypePong, Payload: f.Payload})
+		case proto.TypePong:
+			// Pong acknowledgment
+		case proto.TypeBye:
+			return
+		}
+	}
 }

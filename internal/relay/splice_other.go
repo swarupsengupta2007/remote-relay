@@ -37,14 +37,14 @@ func isSocket(fd int) bool {
 	return false
 }
 
-func spliceSocketToSink(rawTCP *net.TCPConn, sinkFd int, p *pipePair, count int) (int64, error) {
+func spliceSocketToSink(rawTCP *net.TCPConn, sinkFd int, p *pipePair, count int, acct *byteAcct) (int64, error) {
 	return 0, errors.New("splice is not supported on non-linux systems")
 }
 
-func spliceSrcToSocket(srcFd int, rawTCP *net.TCPConn, p *pipePair, pRetain *pipePair, count int, writeHdr func(n int) error) (int64, []byte, error) {
+func spliceSrcToSocket(srcFd int, rawTCP *net.TCPConn, p *pipePair, pRetain *pipePair, count int, writeHdr func(n int) error, acct *byteAcct) (int64, []byte, error) {
 	return 0, nil, errors.New("splice is not supported on non-linux systems")
 }
 
-func spliceSliceToSocket(rawTCP *net.TCPConn, p *pipePair, data []byte, writeHdr func() error) (int64, error) {
+func spliceSliceToSocket(rawTCP *net.TCPConn, p *pipePair, data []byte, writeHdr func() error, acct *byteAcct) (int64, error) {
 	return 0, errors.New("splice is not supported on non-linux systems")
 }

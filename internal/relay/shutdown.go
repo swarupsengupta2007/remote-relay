@@ -79,6 +79,9 @@ func (s *Server) finishShutdown() {
 		s.forceCloseLives()
 		s.closeUDP()
 		s.stopDebug()
+		if s.agentReg != nil {
+			s.agentReg.Close()
+		}
 		s.log.Info("shutdown complete")
 	})
 }

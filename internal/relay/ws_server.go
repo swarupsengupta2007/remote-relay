@@ -18,8 +18,9 @@ import (
 func (s *Server) handleWebSocket(ws *websocket.Conn) {
 	defer ws.Close()
 	req := ws.Request()
-	remoteAddr := transport.ExtractRemoteAddr(req, ws)
-	ip := transport.ExtractClientIP(req, ws.RemoteAddr())
+	trusted := s.Config().TrustedProxies
+	remoteAddr := transport.ExtractRemoteAddr(req, ws, trusted)
+	ip := transport.ExtractClientIP(req, ws.RemoteAddr(), trusted)
 	n := s.incIPConn(ip)
 	var once sync.Once
 	releaseWS := func() { once.Do(func() { s.decIPConn(ip) }) }
@@ -106,21 +107,46 @@ func (s *Server) listenWS() error {
 	if err != nil {
 		return fmt.Errorf("listen websocket %q: %w", hostPort, err)
 	}
+	return s.installWSListener(ln, isWSS)
+}
 
-	if isWSS || cfg.WSCert != "" {
+// installWSListener wraps raw in TLS when configured and makes it the
+// WebSocket listener. raw is kept unwrapped so a hot restart can pass it on.
+func (s *Server) installWSListener(raw net.Listener, isWSS bool) error {
+	ln := raw
+	if isWSS || s.Config().WSCert != "" {
 		cert, err := s.wsCert()
 		if err != nil {
-			_ = ln.Close()
+			_ = raw.Close()
 			return fmt.Errorf("websocket tls cert: %w", err)
 		}
 		tlsConf := transport.ServerTLSConfig(cert)
-		ln = tls.NewListener(ln, tlsConf)
+		ln = tls.NewListener(raw, tlsConf)
 	}
 
 	s.wsMu.Lock()
+	defer s.wsMu.Unlock()
+	if s.wsLn != nil {
+		_ = raw.Close()
+		return nil
+	}
 	s.wsLn = ln
-	s.wsMu.Unlock()
+	s.wsRawLn = raw
 	return nil
+}
+
+// adoptWSListener installs a WebSocket listener received from a hot restart.
+func (s *Server) adoptWSListener(raw net.Listener) error {
+	listenAddr := s.Config().ListenWS
+	if listenAddr == "" {
+		_ = raw.Close()
+		return nil
+	}
+	_, _, isWSS, err := transport.ParseWebSocketURL(listenAddr)
+	if err != nil {
+		isWSS = false
+	}
+	return s.installWSListener(raw, isWSS)
 }
 
 // startWS starts the HTTP server on the WebSocket listener.
@@ -165,6 +191,7 @@ func (s *Server) closeWS() {
 	if s.wsLn != nil {
 		_ = s.wsLn.Close()
 		s.wsLn = nil
+		s.wsRawLn = nil
 	}
 }
 

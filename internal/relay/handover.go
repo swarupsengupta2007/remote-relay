@@ -25,11 +25,16 @@ type HandoverSession struct {
 
 // HandoverState is the root JSON structure passed across process re-exec.
 type HandoverState struct {
-	Version      int               `json:"v"`
-	Timestamp    time.Time         `json:"timestamp"`
-	HasListenTCP bool              `json:"has_listen_tcp"`
-	HasListenUDP bool              `json:"has_listen_udp"`
-	Sessions     []HandoverSession `json:"sessions"`
+	Version      int       `json:"v"`
+	Timestamp    time.Time `json:"timestamp"`
+	HasListenTCP bool      `json:"has_listen_tcp"`
+	HasListenUDP bool      `json:"has_listen_udp"`
+	// HasListenWS marks a WebSocket listener FD after the UDP one.
+	HasListenWS bool `json:"has_listen_ws,omitempty"`
+	// DebugListen names, in FD order after the WebSocket one, the configured
+	// addresses of the metrics/pprof/expvar listeners being passed.
+	DebugListen []string          `json:"debug_listen,omitempty"`
+	Sessions    []HandoverSession `json:"sessions"`
 }
 
 // SendHandover transmits the HandoverState and associated file descriptors

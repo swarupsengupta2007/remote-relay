@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/remote-relay/relay/internal/proto"
@@ -20,6 +21,14 @@ const (
 const maxUDP = 64 * 1024
 
 var errMuxClosed = errors.New("udp mux closed")
+
+// probeNonceSeq gives each Probe call its own nonce so two waits on one mux
+// cannot share a waiter.
+var probeNonceSeq atomic.Uint64
+
+func nextProbeNonce() uint64 {
+	return probeNonceSeq.Add(1)
+}
 
 type datagram struct {
 	buf  []byte
@@ -284,7 +293,7 @@ func Probe(ctx context.Context, mux *UDPMux, addr net.Addr, token [16]byte, atte
 	if timeout <= 0 {
 		timeout = 2 * time.Second
 	}
-	const nonce = uint64(1)
+	nonce := nextProbeNonce()
 	ch := mux.armProbeWait(nonce, addr)
 	defer mux.disarmProbeWait(nonce)
 	var last error

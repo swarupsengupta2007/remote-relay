@@ -91,8 +91,14 @@ func TestUnknownTypeGap(t *testing.T) {
 	if !TypeChainOK.Known() || TypeChainOK != 0x0F {
 		t.Fatalf("TypeChainOK = 0x%02x known=%v, want 0x0f known=true", uint8(TypeChainOK), TypeChainOK.Known())
 	}
+	if !TypeAgentRegister.Known() || TypeAgentRegister != 0x17 {
+		t.Fatalf("TypeAgentRegister = 0x%02x known=%v, want 0x17 known=true", uint8(TypeAgentRegister), TypeAgentRegister.Known())
+	}
+	if !TypeAgentBind.Known() || TypeAgentBind != 0x19 {
+		t.Fatalf("TypeAgentBind = 0x%02x known=%v, want 0x19 known=true", uint8(TypeAgentBind), TypeAgentBind.Known())
+	}
 
-	for _, typ := range []byte{0x00, 0x17, 0x99} {
+	for _, typ := range []byte{0x00, 0x1B, 0x99} {
 		var buf bytes.Buffer
 		buf.WriteByte(typ)
 		buf.Write([]byte{0, 0, 0, 0})
@@ -179,6 +185,10 @@ func TestControlRoundTrip(t *testing.T) {
 		{name: "limits", typ: TypeHelloOK, v: Limits{BufferBytes: 2, HoldTimeoutMs: 3, Window: 4, DataChunkBytes: 5, SwitchTimeoutMs: 6}},
 		{name: "session_state", typ: TypeResumeOK, v: SessionState{UpClosed: true, DownClosed: true, HeldMs: 7}},
 		{name: "udp_info", typ: TypeHelloOK, v: UdpInfo{Addr: "a:1", ProbeToken: "x", ProbeTimeoutMs: 1, ProbeAttempts: 2}},
+		{name: "agent_register", typ: TypeAgentRegister, v: AgentRegister{V: 1, Name: "homelab", Dest: "127.0.0.1:22", AllowDest: []string{"127.0.0.1:22"}}},
+		{name: "agent_register_ok", typ: TypeAgentRegisterOK, v: AgentRegisterOK{V: 1, Target: "homelab", ExpiresInSec: 3600}},
+		{name: "agent_bind", typ: TypeAgentBind, v: AgentBind{V: 1, BindID: "b-123", Target: "homelab", Destination: "127.0.0.1:22", ClientIP: "1.2.3.4"}},
+		{name: "agent_bind_ok", typ: TypeAgentBindOK, v: AgentBindOK{V: 1, BindID: "b-123", Status: "ok"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -766,6 +766,8 @@ func TestKillTwiceAfterReconnectBudget(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer destLn.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	go func() {
 		c, err := destLn.Accept()
 		if err != nil {
@@ -787,6 +789,7 @@ func TestKillTwiceAfterReconnectBudget(t *testing.T) {
 			gotUpCh <- b
 		}()
 		wg.Wait()
+		<-ctx.Done()
 	}()
 
 	cfg := config.DefaultServer()
@@ -794,14 +797,20 @@ func TestKillTwiceAfterReconnectBudget(t *testing.T) {
 	cfg.DefaultDestination = destLn.Addr().String()
 	cfg.AllowDestinations = []string{destLn.Addr().String(), "*"}
 	cfg.Transports = []string{"tcp"}
-	cfg.HoldTimeout = config.Duration(20 * time.Second)
-	cfg.IdleTimeout = config.Duration(30 * time.Second)
-	srv, relayAddr, _ := startRelayCfg(t, cfg)
+	srvLog := logging.New(io.Discard, "error", "text")
+	srv := NewServer(cfg, srvLog)
+	if err := srv.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	relayAddr := srv.Addr()
+	errcServe := make(chan error, 1)
+	go func() { errcServe <- srv.Serve(ctx) }()
+	defer func() {
+		_ = srv.Close()
+	}()
 
 	inR, inW := io.Pipe()
 	outR, outW := io.Pipe()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
 
 	ccfg := config.DefaultClient()
 	ccfg.StrictHostKeyChecking = "no"
