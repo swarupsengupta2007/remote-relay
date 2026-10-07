@@ -239,32 +239,39 @@ func (n *nestedHop) run(ctx context.Context, first transport.Conn) {
 		}
 	}()
 
-	var err error
-	if (target == "quic" || target == "kcp") && udp != nil {
+	// serve runs the carrier and, while it is TCP, races a QUIC/KCP upgrade
+	// alongside it. It runs after the first connect and after every resume,
+	// since resume always lands on TCP.
+	serve := func() error {
 		upgCh, upgCancel := startUpgrade(ctx, n.pump, n.resumeCfg, conn, n.sessionID, token, target, udp, n.log)
-		err = n.pump.serveConn(ctx, conn, sendFrom)
+		err := n.pump.serveConn(ctx, conn, sendFrom)
 		upg := takeUpgrade(upgCh, upgCancel, n.pump)
-		if upg.conn != nil {
-			udpHold = upg.hold
-			conn = upg.conn
-			n.setConn(conn)
-			sendFrom = upg.rok.UpAcked
-			token = upg.rok.ResumeToken
-			n.token = token
-			if upg.rok.UDP != nil {
-				udp = upg.rok.UDP
+		if upg.conn == nil {
+			if upg.hold != nil {
+				_ = upg.hold.Close()
 			}
-			if upg.rok.Transport != "" {
-				target = upg.rok.Transport
-			}
-			n.pump.sendLog.AdvanceTo(sendFrom)
-			err = n.pump.serveConn(ctx, conn, sendFrom)
-		} else if upg.hold != nil {
-			_ = upg.hold.Close()
+			return err
 		}
-	} else {
-		err = n.pump.serveConn(ctx, conn, sendFrom)
+		if udpHold != nil {
+			_ = udpHold.Close()
+		}
+		udpHold = upg.hold
+		conn = upg.conn
+		n.setConn(conn)
+		sendFrom = upg.rok.UpAcked
+		token = upg.rok.ResumeToken
+		n.token = token
+		if upg.rok.UDP != nil {
+			udp = upg.rok.UDP
+		}
+		if upg.rok.Transport != "" {
+			target = upg.rok.Transport
+		}
+		n.pump.sendLog.AdvanceTo(sendFrom)
+		return n.pump.serveConn(ctx, conn, sendFrom)
 	}
+
+	err := serve()
 
 	for reconnectable(err) && ctx.Err() == nil && n.pump.sessionErr() == nil {
 		deadline := time.Now().Add(maxElapsed)
@@ -313,7 +320,7 @@ func (n *nestedHop) run(ctx context.Context, first transport.Conn) {
 		if !resumed {
 			break
 		}
-		err = n.pump.serveConn(ctx, conn, sendFrom)
+		err = serve()
 	}
 
 	if se := n.pump.sessionErr(); se != nil {

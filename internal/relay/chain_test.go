@@ -1317,3 +1317,71 @@ func TestVerifyRelayedChallengeHop1(t *testing.T) {
 		t.Fatal("hop 0 on a chained path must be refused")
 	}
 }
+
+// TestChainNestedHopReupgradesAfterResume: the jumphost's onward leg to the
+// terminal upgrades to KCP, the carrier drops, the leg resumes on TCP, and
+// it must upgrade to KCP again rather than staying on TCP.
+func TestChainNestedHopReupgradesAfterResume(t *testing.T) {
+	dest := echoDest(t)
+	termCfg := chainServerCfg(dest)
+	termCfg.Transports = []string{"kcp"}
+	termCfg.ProbeTimeout = config.Duration(400 * time.Millisecond)
+	termCfg.ProbeAttempts = 2
+	termCfg.KeepaliveInterval = config.Duration(200 * time.Millisecond)
+	term, termAddr, _ := startRelayCfg(t, termCfg)
+
+	jCfg := chainServerCfg(dest)
+	jCfg.Transports = []string{"kcp"}
+	jCfg.ProbeTimeout = config.Duration(400 * time.Millisecond)
+	jCfg.ProbeAttempts = 2
+	jCfg.KeepaliveInterval = config.Duration(200 * time.Millisecond)
+	jCfg.AllowRelayHops = []string{termAddr}
+	jCfg.MaxChainDepth = 2
+	_, head, _ := startRelayCfg(t, jCfg)
+
+	// Both legs run KCP; strict mode would abort if hop 1 had no UDP.
+	ccfg := chainClientCfg(termAddr, dest, []string{head + "?transport=kcp"})
+	ccfg.Transport = "kcp"
+	ccfg.ProbeTimeout = config.Duration(400 * time.Millisecond)
+
+	kcpAttaches := func() int {
+		n := 0
+		for _, p := range term.pathHistory() {
+			if p.Kind == transport.KindKCP {
+				n++
+			}
+		}
+		return n
+	}
+
+	payload := makePattern(256 << 10)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	inR, inW := io.Pipe()
+	var out bytes.Buffer
+	errc := make(chan error, 1)
+	go func() {
+		errc <- RunClient(ctx, ccfg, inR, &out, logging.New(io.Discard, "error", "text"))
+	}()
+	waitUntil(t, 8*time.Second, func() bool { return kcpAttaches() == 1 })
+	if _, err := inW.Write(payload[:len(payload)/2]); err != nil {
+		t.Fatal(err)
+	}
+	term.dropLiveTransports()
+	waitUntil(t, 8*time.Second, func() bool { return kcpAttaches() >= 2 })
+	if _, err := inW.Write(payload[len(payload)/2:]); err != nil {
+		t.Fatal(err)
+	}
+	_ = inW.Close()
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatalf("client: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("timeout")
+	}
+	if !bytes.Equal(out.Bytes(), payload) {
+		t.Fatalf("echo mismatch got=%d want=%d", out.Len(), len(payload))
+	}
+}
