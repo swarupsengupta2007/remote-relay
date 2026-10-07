@@ -17,7 +17,6 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		panic(err)
 	}
-	defer os.RemoveAll(dir)
 
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -51,5 +50,7 @@ func TestMain(m *testing.M) {
 	_ = os.Unsetenv("RELAY_TEST_AUTHORIZED_KEYS")
 	_ = os.Unsetenv("RELAY_TEST_KNOWN_HOSTS")
 
+	// Not deferred: os.Exit skips deferred calls.
+	_ = os.RemoveAll(dir)
 	os.Exit(code)
 }
