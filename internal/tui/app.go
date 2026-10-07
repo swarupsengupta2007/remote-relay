@@ -127,7 +127,7 @@ func runInteractive(opts AppOptions) error {
 	defer cleanup()
 
 	sigCh := make(chan os.Signal, 2)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGWINCH)
+	signal.Notify(sigCh, append([]os.Signal{syscall.SIGINT, syscall.SIGTERM}, resizeSignals...)...)
 	defer signal.Stop(sigCh)
 
 	cfg := DashboardConfig{
@@ -176,10 +176,10 @@ func runInteractive(opts AppOptions) error {
 		select {
 		case sig := <-sigCh:
 			switch sig {
-			case syscall.SIGWINCH:
-				render()
 			case syscall.SIGINT, syscall.SIGTERM:
 				return nil
+			default: // terminal resize
+				render()
 			}
 
 		case r := <-keyCh:
