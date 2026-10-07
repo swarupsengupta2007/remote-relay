@@ -30,9 +30,18 @@ See **Authentication** and **Security** below.
 | FEAT-ROB-03 Dual-Stack Happy Eyeballs v2 (RFC 8305) | yes |
 | FEAT-PERF-01 Linux Kernel Zero-Copy Stream Splicing (`splice(2)`) | yes |
 | FEAT-PERF-02 Adaptive KCP Dynamic ARQ & Congestion Tuning | yes |
-| FEAT-UTL-05 Multi-Hop Jumphost Chaining (`-J`) | yes (Phase 1: TCP hops; inner stale-token re-auth deferred) |
+| FEAT-UTL-05 Multi-Hop Jumphost Chaining (`-J`) | yes (per-hop QUIC/KCP and stale-token re-auth; no `splice(2)` on nested hops) |
 | FEAT-ROB-02 Zero-Downtime Server Restarts & Socket Handover (`SIGUSR2` / `SCM_RIGHTS` / `LISTEN_FDS`) | yes |
 | Single-Session KCP Repeated-Kills Soak & Netns Harness | yes |
+| FEAT-ROB-04 Tiered Disk-Spill Storage for Ring Buffers | yes |
+| FEAT-UTL-01 OpenSSH Agent (`SSH_AUTH_SOCK`) Integration | yes |
+| FEAT-UTL-02 Reconnection HUD & Desktop Notifications | yes |
+| FEAT-UTL-03 SOCKS5 Dynamic Forwarding (`relay socks`) | yes |
+| FEAT-UTL-04 Reverse Relay / NAT Gateway (`relay agent`) | yes |
+| FEAT-UTL-06 Chained Jumphost Rendezvous to a NATed Terminal | yes |
+| FEAT-SEC-02 WebSocket & HTTPS Port 443 Fallback Transport | yes |
+| FEAT-SEC-03 Per-User RBAC & Live `SIGHUP` Reload | yes |
+| FEAT-OBS-01 Prometheus Metrics, OpenTelemetry Tracing, `relay top` | yes |
 
 ### Netem & BFD Benchmarks (dual-netns veth)
 
@@ -49,14 +58,23 @@ random link kills). Mixed KCP at that kill rate expired instead of resuming
 `conv` identity bug). A smaller 8+8 KCP/QUIC test uses the M3 idle/keepalive
 settings. A 60s mixed soak is not run in default CI.
 
+## Install
+
+Prebuilt binaries for Linux, macOS, and Windows (amd64/arm64) are attached to
+each [GitHub release](https://github.com/swarupsengupta2007/remote-relay/releases),
+with a `SHA256SUMS` file.
+
 ## Build
 
-Go 1.23 or later.
+Go 1.26 or later.
 
 ```
 go build -o relay ./cmd/relay
 ./relay version
 ```
+
+Release builds stamp the version with
+`-ldflags "-X github.com/remote-relay/relay/internal/version.Version=vX.Y.Z"`.
 
 ## Server
 
@@ -378,6 +396,5 @@ If both are set to the same address, one HTTP server serves both.
 - The relayed payload is typically already an end-to-end authenticated and encrypted SSH connection.
 
 ## License
- 
-See the repository. Emulated WAN network benchmarks (`tc netem`) are
-recorded under **Status** above.
+
+GNU General Public License v3.0. See [LICENSE](LICENSE).
