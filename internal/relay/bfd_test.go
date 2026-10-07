@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -413,9 +414,7 @@ func TestDualPathClientStandbyPromotion(t *testing.T) {
 	// Stream 64 KiB on active QUIC
 	const chunk = 64 << 10
 	offset := 0
-	if _, err := inW.Write(upWant[offset : offset+chunk]); err != nil {
-		t.Fatalf("write chunk 1: %v", err)
-	}
+	writeWithin(t, inW, upWant[offset:offset+chunk], 5*time.Second)
 	offset += chunk
 
 	// Allow client standby manager time to establish standby TCP connection and converge BFD to Up
@@ -430,9 +429,7 @@ func TestDualPathClientStandbyPromotion(t *testing.T) {
 	waitKind(t, srv, transport.KindTCP, 8*time.Second)
 
 	// Stream second chunk over promoted TCP
-	if _, err := inW.Write(upWant[offset : offset+chunk]); err != nil {
-		t.Fatalf("write chunk 2: %v", err)
-	}
+	writeWithin(t, inW, upWant[offset:offset+chunk], 5*time.Second)
 	offset += chunk
 
 	// 3. Restore UDP -> client upgrades back to QUIC
@@ -445,18 +442,58 @@ func TestDualPathClientStandbyPromotion(t *testing.T) {
 		_, _ = inW.Write(upWant[offset:])
 	}()
 
-	gotDown := <-downCh
-	gotUp := <-gotUpCh
-
-	if err := <-errc; err != nil {
+	gotDown := recvWithin(t, downCh, 20*time.Second, "downstream")
+	gotUp := recvWithin(t, gotUpCh, 20*time.Second, "upstream")
+	if err := recvWithin(t, errc, 20*time.Second, "client exit"); err != nil {
 		t.Fatalf("client error: %v", err)
 	}
 
 	if got := sha256.Sum256(gotUp); got != upHash {
-		t.Fatalf("upstream payload mismatch: got %x want %x", got, upHash)
+		t.Fatalf("upstream payload mismatch: %s", describeMismatch(gotUp, upWant))
 	}
 	if got := sha256.Sum256(gotDown); got != downHash {
-		t.Fatalf("downstream payload mismatch: got %x want %x", got, downHash)
+		t.Fatalf("downstream payload mismatch: %s", describeMismatch(gotDown, downWant))
+	}
+}
+
+// describeMismatch reports lengths and the first differing offset.
+func describeMismatch(got, want []byte) string {
+	n := min(len(got), len(want))
+	for i := 0; i < n; i++ {
+		if got[i] != want[i] {
+			return fmt.Sprintf("len got=%d want=%d, first diff at %d", len(got), len(want), i)
+		}
+	}
+	return fmt.Sprintf("len got=%d want=%d, common prefix matches", len(got), len(want))
+}
+
+// writeWithin fails the test instead of blocking forever when the client
+// stops draining its input pipe.
+func writeWithin(t *testing.T, w io.Writer, b []byte, d time.Duration) {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() {
+		_, err := w.Write(b)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	case <-time.After(d):
+		t.Fatalf("write of %d bytes blocked for %s", len(b), d)
+	}
+}
+
+func recvWithin[T any](t *testing.T, ch <-chan T, d time.Duration, what string) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(d):
+		t.Fatalf("%s: nothing within %s", what, d)
+		panic("unreachable")
 	}
 }
 
