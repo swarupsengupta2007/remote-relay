@@ -238,17 +238,49 @@ func (cmux *clientMux) handleClientConn(ctx context.Context, c net.Conn) {
 		return
 	}
 
+	st, resp := cmux.openStream(ctx, c, req.Dest)
+	if !resp.ok {
+		_ = socks5.WriteReply(c, resp.rep, "")
+		return
+	}
+	if err := socks5.WriteReply(c, socks5.RepSucceeded, resp.bndAddr); err != nil {
+		cmux.closeStream(st.id)
+		return
+	}
+	cmux.pumpStream(st)
+}
+
+// handleForwardConn relays a connection accepted on a -L listener to the
+// fixed destination dest. There is no handshake with the local peer, so an
+// open failure is reported only by closing the connection.
+func (cmux *clientMux) handleForwardConn(ctx context.Context, c net.Conn, dest string) {
+	defer c.Close()
+
+	st, resp := cmux.openStream(ctx, c, dest)
+	if !resp.ok {
+		cmux.log.Warn("local forward open failed", "dest", dest, "peer", c.RemoteAddr().String(), "err", resp.msg)
+		return
+	}
+	cmux.pumpStream(st)
+}
+
+// openStream registers a stream for c and asks the server to dial dest. On
+// failure the stream is already removed, c is left open for the caller to
+// reply on, and resp carries the SOCKS5 reply code and reason.
+func (cmux *clientMux) openStream(ctx context.Context, c net.Conn, dest string) (*clientStream, openResp) {
+	fail := func(msg string) openResp {
+		return openResp{rep: socks5.RepGeneralFailure, msg: msg}
+	}
+
 	cmux.mu.Lock()
 	if cmux.closed.Load() {
 		cmux.mu.Unlock()
-		_ = socks5.WriteReply(c, socks5.RepGeneralFailure, "")
-		return
+		return nil, fail("tunnel closed")
 	}
 	if len(cmux.streams) >= cmux.maxStreams {
 		cmux.mu.Unlock()
 		cmux.log.Warn("socks max streams exceeded on client", "limit", cmux.maxStreams)
-		_ = socks5.WriteReply(c, socks5.RepGeneralFailure, "")
-		return
+		return nil, fail("max streams exceeded")
 	}
 
 	streamID := cmux.nextStreamID.Add(1)
@@ -263,38 +295,49 @@ func (cmux *clientMux) handleClientConn(ctx context.Context, c net.Conn) {
 	cmux.streams[streamID] = st
 	cmux.mu.Unlock()
 
+	// Not closeStream: that closes c, and the caller still owns it.
+	abort := func() {
+		cmux.mu.Lock()
+		delete(cmux.streams, streamID)
+		cmux.mu.Unlock()
+		st.once.Do(func() {
+			st.closed.Store(true)
+			close(st.resetCh)
+		})
+	}
+
 	// Send STREAM_OPEN to server
 	if err := cmux.sendFrame(socks5.MuxFrame{
 		StreamID: streamID,
 		Type:     socks5.TypeStreamOpen,
-		Payload:  []byte(req.Dest),
+		Payload:  []byte(dest),
 	}); err != nil {
-		_ = socks5.WriteReply(c, socks5.RepGeneralFailure, "")
-		cmux.closeStream(streamID)
-		return
+		abort()
+		return nil, fail(err.Error())
 	}
 
 	// Wait for server response
 	select {
 	case <-ctx.Done():
-		_ = socks5.WriteReply(c, socks5.RepGeneralFailure, "")
-		cmux.closeStream(streamID)
-		return
+		abort()
+		return nil, fail(ctx.Err().Error())
 	case <-cmux.closedCh:
-		_ = socks5.WriteReply(c, socks5.RepGeneralFailure, "")
-		cmux.closeStream(streamID)
-		return
+		abort()
+		return nil, fail("tunnel closed")
 	case resp := <-st.openCh:
 		if !resp.ok {
-			_ = socks5.WriteReply(c, resp.rep, "")
-			cmux.closeStream(streamID)
-			return
+			abort()
+			return nil, resp
 		}
-		if err := socks5.WriteReply(c, socks5.RepSucceeded, resp.bndAddr); err != nil {
-			cmux.closeStream(streamID)
-			return
-		}
+		return st, resp
 	}
+}
+
+// pumpStream relays bytes between an opened stream and its local connection
+// until both directions finish or either side resets.
+func (cmux *clientMux) pumpStream(st *clientStream) {
+	c := st.conn
+	streamID := st.id
 
 	// Stream established! Start background socket writer
 	writerDone := make(chan struct{})
@@ -395,11 +438,6 @@ func (cmux *clientMux) handleClientConn(ctx context.Context, c net.Conn) {
 // It starts a local SOCKS5 TCP listener, connects a resilient relay tunnel to the server,
 // and multiplexes local client streams over the tunnel.
 func RunSocks(ctx context.Context, socksCfg SocksConfig, clientCfg config.Client) error {
-	log := socksCfg.Log
-	if log == nil {
-		log = logging.New(nil, clientCfg.LogLevel, clientCfg.LogFormat)
-	}
-
 	listenAddr := socksCfg.Listen
 	if listenAddr == "" {
 		listenAddr = clientCfg.SocksListen
@@ -407,29 +445,90 @@ func RunSocks(ctx context.Context, socksCfg SocksConfig, clientCfg config.Client
 	if listenAddr == "" {
 		listenAddr = "127.0.0.1:1080"
 	}
-
-	ln, err := net.Listen("tcp", listenAddr)
-	if err != nil {
-		return fmt.Errorf("socks listen on %s failed: %w", listenAddr, err)
+	fwdCfg := ForwardConfig{
+		SocksListen: listenAddr,
+		MaxStreams:  socksCfg.MaxStreams,
+		Log:         socksCfg.Log,
+		ReadyCh:     socksCfg.ReadyCh,
 	}
-	defer ln.Close()
-	boundAddr := ln.Addr().String()
-	log.Info("socks5 dynamic proxy listening", "addr", boundAddr)
-
 	if socksCfg.OnBound != nil {
-		socksCfg.OnBound(boundAddr)
+		fwdCfg.OnBound = func(addrs []string) { socksCfg.OnBound(addrs[0]) }
 	}
-	if socksCfg.ReadyCh != nil {
-		close(socksCfg.ReadyCh)
+	return RunForward(ctx, fwdCfg, clientCfg)
+}
+
+// ForwardConfig defines the local listeners of a forwarding client: any
+// number of fixed ssh -L style forwards and an optional SOCKS5 (-D) listener.
+type ForwardConfig struct {
+	Locals      []config.LocalForward
+	SocksListen string // empty = no SOCKS5 listener
+	MaxStreams  int
+	Log         *slog.Logger
+	ReadyCh     chan struct{}
+	// OnBound receives the bound listener addresses: one per entry of
+	// Locals in order, then the SOCKS5 listener if any.
+	OnBound func(addrs []string)
+}
+
+type forwardListener struct {
+	ln   net.Listener
+	dest string // empty = SOCKS5
+}
+
+// RunForward binds every listener in fwdCfg, connects one resilient relay
+// tunnel to the server and multiplexes all accepted connections over it as
+// mux streams. -L connections are opened to their fixed destination; SOCKS5
+// connections to the destination they request. The server applies the same
+// allow_destinations and per-key policy to both.
+func RunForward(ctx context.Context, fwdCfg ForwardConfig, clientCfg config.Client) error {
+	log := fwdCfg.Log
+	if log == nil {
+		log = logging.New(nil, clientCfg.LogLevel, clientCfg.LogFormat)
+	}
+	if len(fwdCfg.Locals) == 0 && fwdCfg.SocksListen == "" {
+		return errors.New("no local forwards or SOCKS listener configured")
 	}
 
-	// Force SOCKS5 mode destination
+	var listeners []forwardListener
+	defer func() {
+		for _, fl := range listeners {
+			_ = fl.ln.Close()
+		}
+	}()
+	var bound []string
+	for _, fwd := range fwdCfg.Locals {
+		ln, err := net.Listen("tcp", fwd.Listen)
+		if err != nil {
+			return fmt.Errorf("local forward listen on %s failed: %w", fwd.Listen, err)
+		}
+		listeners = append(listeners, forwardListener{ln: ln, dest: fwd.Dest})
+		bound = append(bound, ln.Addr().String())
+		log.Info("local forward listening", "addr", ln.Addr().String(), "dest", fwd.Dest)
+	}
+	if fwdCfg.SocksListen != "" {
+		ln, err := net.Listen("tcp", fwdCfg.SocksListen)
+		if err != nil {
+			return fmt.Errorf("socks listen on %s failed: %w", fwdCfg.SocksListen, err)
+		}
+		listeners = append(listeners, forwardListener{ln: ln})
+		bound = append(bound, ln.Addr().String())
+		log.Info("socks5 dynamic proxy listening", "addr", ln.Addr().String())
+	}
+
+	if fwdCfg.OnBound != nil {
+		fwdCfg.OnBound(bound)
+	}
+	if fwdCfg.ReadyCh != nil {
+		close(fwdCfg.ReadyCh)
+	}
+
+	// Streams ride the server's SOCKS5 mux mode whatever the listener kind.
 	clientCfg.Destination = proto.DestSOCKS5
 
 	toRelayR, toRelayW := io.Pipe()
 	fromRelayR, fromRelayW := io.Pipe()
 
-	cmux := newClientMux(ctx, log, toRelayR, toRelayW, fromRelayR, fromRelayW, socksCfg.MaxStreams)
+	cmux := newClientMux(ctx, log, toRelayR, toRelayW, fromRelayR, fromRelayW, fwdCfg.MaxStreams)
 	defer cmux.Close()
 
 	go cmux.readTunnelLoop()
@@ -449,31 +548,55 @@ func RunSocks(ctx context.Context, socksCfg SocksConfig, clientCfg config.Client
 	go func() {
 		select {
 		case <-ctx.Done():
-			_ = ln.Close()
 		case err := <-tunnelErrCh:
 			if err != nil {
 				tunnelErr.Store(&err)
-				log.Error("socks tunnel terminated", "err", err)
+				log.Error("forward tunnel terminated", "err", err)
 			}
-			_ = ln.Close()
+		}
+		for _, fl := range listeners {
+			_ = fl.ln.Close()
 		}
 	}()
 
+	errCh := make(chan error, len(listeners))
+	for _, fl := range listeners {
+		go func() {
+			errCh <- acceptForward(ctx, fl, cmux, &tunnelErr, log)
+		}()
+	}
+	// The first accept loop to stop has seen every listener close (or a
+	// fatal error); close the rest so their loops return too.
+	err := <-errCh
+	for _, fl := range listeners {
+		_ = fl.ln.Close()
+	}
+	for range len(listeners) - 1 {
+		<-errCh
+	}
+	return err
+}
+
+func acceptForward(ctx context.Context, fl forwardListener, cmux *clientMux, tunnelErr *atomic.Pointer[error], log *slog.Logger) error {
 	for {
-		c, err := ln.Accept()
+		c, err := fl.ln.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
 			if ep := tunnelErr.Load(); ep != nil && *ep != nil {
-				return fmt.Errorf("socks tunnel error: %w", *ep)
+				return fmt.Errorf("forward tunnel error: %w", *ep)
 			}
 			if errors.Is(err, net.ErrClosed) {
 				return ctx.Err()
 			}
-			log.Debug("socks accept error", "err", err)
+			log.Debug("forward accept error", "addr", fl.ln.Addr().String(), "err", err)
 			continue
 		}
-		go cmux.handleClientConn(ctx, c)
+		if fl.dest == "" {
+			go cmux.handleClientConn(ctx, c)
+		} else {
+			go cmux.handleForwardConn(ctx, c, fl.dest)
+		}
 	}
 }

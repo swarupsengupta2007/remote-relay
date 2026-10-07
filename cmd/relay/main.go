@@ -39,6 +39,8 @@ func run(args []string) int {
 		return runAgent(args[1:])
 	case "socks":
 		return runSocks(args[1:])
+	case "forward":
+		return runForward(args[1:])
 	case "top":
 		return runTop(args[1:])
 	case "stats":
@@ -57,11 +59,12 @@ func run(args []string) int {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `usage: relay <server|client|agent|socks|top|stats|version> [flags]
+	fmt.Fprintf(os.Stderr, `usage: relay <server|client|agent|forward|socks|top|stats|version> [flags]
 
   relay server [--config PATH] [--listen HOST:PORT] [--metrics-listen HOST:PORT] [--otel-endpoint URL] [--listen-ws HOST:PORT] [--websocket-path PATH] [--host-key PATH] [--splice|--no-splice] [--adaptive-kcp|--no-adaptive-kcp] [--spill-dir DIR] [--spill-l1-bytes BYTES] [--no-spill] [--log-level LVL]
   relay client [--server HOST:PORT] [--target NAME] [-J|--jumphost|--chain HOST:PORT] [--dest HOST:PORT] [--tcp|--kcp|--ws] [--insecure] [--allow-ha] [--splice|--no-splice] [--adaptive-kcp|--no-adaptive-kcp] [--spill-dir DIR] [--spill-l1-bytes BYTES] [--no-spill] [--hud|--no-hud] [--interface NAME[@proto]] [--source-ip IP[@proto]] [--auth-sock PATH] [--server-fingerprint FP] [--known-hosts PATH] [--config PATH] [--log-level LVL] [%%h %%p]
   relay agent --server HOST:PORT --name NAME [--dest HOST:PORT] [--allow-dest DEST,...] [--tcp|--kcp|--ws] [--insecure] [--identity PATH|-i PATH|--key PATH] [--auth-sock PATH] [--server-fingerprint FP] [--known-hosts PATH] [--spill-dir DIR] [--spill-l1-bytes BYTES] [--no-spill] [--config PATH] [--log-level LVL]
+  relay forward -L [BIND:]PORT:HOST:HOSTPORT [-L ...] [-D [BIND:]PORT] --server HOST:PORT [-J|--jumphost|--chain HOST:PORT] [--tcp|--kcp|--ws] [--insecure] [--allow-ha] [--max-streams N] [--interface NAME[@proto]] [--source-ip IP[@proto]] [--auth-sock PATH] [--server-fingerprint FP] [--known-hosts PATH] [--config PATH] [--log-level LVL]
   relay socks [--listen HOST:PORT] --server HOST:PORT [-J|--jumphost|--chain HOST:PORT] [--tcp|--kcp|--ws] [--insecure] [--allow-ha] [--spill-dir DIR] [--spill-l1-bytes BYTES] [--no-spill] [--hud|--no-hud] [--interface NAME[@proto]] [--source-ip IP[@proto]] [--auth-sock PATH] [--server-fingerprint FP] [--known-hosts PATH] [--config PATH] [--log-level LVL]
   relay top [--endpoint URL] [--interval DURATION] [--color=auto|always|never] [--batch]
   relay stats [--endpoint URL] [--color=auto|always|never]
@@ -462,11 +465,32 @@ func runAgent(args []string) int {
 }
 
 func runSocks(args []string) int {
-	fs := flag.NewFlagSet("socks", flag.ContinueOnError)
+	return runMuxClient("socks", args)
+}
+
+func runForward(args []string) int {
+	return runMuxClient("forward", args)
+}
+
+// runMuxClient runs `relay socks` or `relay forward`. Both multiplex local
+// connections over one resumable tunnel: socks has a single SOCKS5 listener,
+// forward has ssh -L style fixed forwards (-L) plus an optional SOCKS5
+// listener (-D).
+func runMuxClient(cmd string, args []string) int {
+	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	configPath := fs.String("config", "", "path to client TOML config")
-	listen := fs.String("listen", "127.0.0.1:1080", "local SOCKS5 listen address")
-	fs.StringVar(listen, "l", "127.0.0.1:1080", "local SOCKS5 listen address (shorthand)")
+	listen := new(string)
+	var localForwards stringSliceFlag
+	if cmd == "socks" {
+		fs.StringVar(listen, "listen", "127.0.0.1:1080", "local SOCKS5 listen address")
+		fs.StringVar(listen, "l", "127.0.0.1:1080", "local SOCKS5 listen address (shorthand)")
+	} else {
+		fs.Var(&localForwards, "L", "local forward [bind_address:]port:host:hostport (repeatable or comma-separated)")
+		fs.Var(&localForwards, "local-forward", "alias of -L")
+		fs.StringVar(listen, "D", "", "also run a SOCKS5 dynamic proxy on [bind_address:]port")
+		fs.StringVar(listen, "dynamic", "", "alias of -D")
+	}
 	server := fs.String("server", "", "relay server host:port")
 	tcp := fs.Bool("tcp", false, "use TCP data plane")
 	kcp := fs.Bool("kcp", false, "use KCP data plane")
@@ -484,7 +508,7 @@ func runSocks(args []string) int {
 	identity := fs.String("identity", "", "path to client private key identity file")
 	fs.StringVar(identity, "i", "", "path to client private key identity file (shorthand)")
 	authSock := fs.String("auth-sock", "", "path to ssh-agent Unix socket (overrides $SSH_AUTH_SOCK)")
-	maxStreams := fs.Int("max-streams", 512, "maximum active SOCKS streams")
+	maxStreams := fs.Int("max-streams", 512, "maximum active forwarded streams")
 	var interfaces stringSliceFlag
 	var sourceIPs stringSliceFlag
 	var jumphost stringSliceFlag
@@ -543,11 +567,11 @@ func runSocks(args []string) int {
 	})
 
 	if *tcp && *allowHA {
-		fmt.Fprintf(os.Stderr, "relay socks: --allow-ha cannot be used with --tcp\n")
+		fmt.Fprintf(os.Stderr, "relay %s: --allow-ha cannot be used with --tcp\n", cmd)
 		return 2
 	}
 	if *ws && *allowHA {
-		fmt.Fprintf(os.Stderr, "relay socks: --allow-ha cannot be used with --ws\n")
+		fmt.Fprintf(os.Stderr, "relay %s: --allow-ha cannot be used with --ws\n", cmd)
 		return 2
 	}
 
@@ -583,12 +607,13 @@ func runSocks(args []string) int {
 		HUD:                   hudOpt,
 		SocksListen:           *listen,
 		MaxSocksStreams:       *maxStreams,
+		LocalForwards:         localForwards,
 		SpillDir:              *spillDir,
 		SpillL1Bytes:          *spillL1Bytes,
 		NoSpill:               noSpillOpt,
 	})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "relay socks: %v\n", err)
+		fmt.Fprintf(os.Stderr, "relay %s: %v\n", cmd, err)
 		return 2
 	}
 
@@ -596,12 +621,33 @@ func runSocks(args []string) int {
 	defer cancel()
 
 	log := logging.NewClient(cfg.LogLevel, cfg.LogFormat)
-	if err := relay.RunSocks(ctx, relay.SocksConfig{
-		Listen:     *listen,
-		MaxStreams: *maxStreams,
-		Log:        log,
-	}, cfg); err != nil && !errors.Is(err, context.Canceled) {
-		fmt.Fprintf(os.Stderr, "relay socks: %v\n", err)
+	if cmd == "socks" {
+		err = relay.RunSocks(ctx, relay.SocksConfig{
+			Listen:     *listen,
+			MaxStreams: *maxStreams,
+			Log:        log,
+		}, cfg)
+	} else {
+		var locals []config.LocalForward
+		locals, err = config.ParseLocalForwards(cfg.LocalForwards)
+		if *listen != "" && !strings.Contains(*listen, ":") {
+			*listen = "127.0.0.1:" + *listen // ssh -D PORT binds loopback
+		}
+		if err == nil && len(locals) == 0 && *listen == "" {
+			fmt.Fprintf(os.Stderr, "relay forward: need at least one -L (or local_forwards in config) or -D\n")
+			return 2
+		}
+		if err == nil {
+			err = relay.RunForward(ctx, relay.ForwardConfig{
+				Locals:      locals,
+				SocksListen: *listen,
+				MaxStreams:  *maxStreams,
+				Log:         log,
+			}, cfg)
+		}
+	}
+	if err != nil && !errors.Is(err, context.Canceled) {
+		fmt.Fprintf(os.Stderr, "relay %s: %v\n", cmd, err)
 		return 1
 	}
 	return 0

@@ -37,6 +37,7 @@ See **Authentication** and **Security** below.
 | FEAT-UTL-01 OpenSSH Agent (`SSH_AUTH_SOCK`) Integration | yes |
 | FEAT-UTL-02 Reconnection HUD & Desktop Notifications | yes |
 | FEAT-UTL-03 SOCKS5 Dynamic Forwarding (`relay socks`) | yes |
+| Local Port Forwarding (`relay forward -L`, like `ssh -L`) | yes |
 | FEAT-UTL-04 Reverse Relay / NAT Gateway (`relay agent`) | yes |
 | FEAT-UTL-06 Chained Jumphost Rendezvous to a NATed Terminal | yes |
 | FEAT-SEC-02 WebSocket & HTTPS Port 443 Fallback Transport | yes |
@@ -200,6 +201,7 @@ auth_user             = ""              # empty = current user
 identity_files        = []              # empty = try ~/.ssh/id_ed25519, id_ecdsa, id_rsa
 jumphost              = []              # same value as -J; --server is still the terminal
 sshd_alive_budget     = "2m"            # warn when Σ hold_timeout across hops exceeds this
+local_forwards        = []              # relay forward: -L specs, used when no -L is given
 ```
 
 ### SSH ProxyCommand
@@ -258,6 +260,35 @@ Manual smoke test without SSH (needs an echo/discard listener on the dest):
 relay server --config server.toml --log-level debug
 printf 'hello\n' | relay client --server 127.0.0.1:7443 --dest 127.0.0.1:7
 ```
+
+### Local port forwarding (`relay forward`)
+
+`relay forward` runs the client standalone, without SSH on top: it opens
+ports on the client and relays every connection accepted on them to a fixed
+destination that the server dials, like `ssh -L`.
+
+```
+relay forward --server relay.example.com:7443 -i ~/.ssh/id_ed25519 \
+    -L 8080:intranet.lan:80 \
+    -L 0.0.0.0:5432:db.lan:5432 \
+    -D 1080
+```
+
+`-L [bind_address:]port:host:hostport` uses OpenSSH syntax: the bind address
+defaults to `127.0.0.1`, `*` or an empty bind address listens on every
+interface, and IPv6 addresses go in brackets (`-L '[::1]:8443:[fd00::5]:443'`).
+`-L` is repeatable or comma-separated; `local_forwards` in `client.toml`
+is used when no `-L` is given. `-D [bind_address:]port` adds a SOCKS5 listener
+as `relay socks` would.
+
+All listeners share **one** resumable tunnel, multiplexed exactly like `relay
+socks`, so every transport, `-J`, `--allow-ha` and spill flag applies and open
+connections survive link breaks. On the server each connection is a SOCKS-mode
+stream: it needs `disable_socks = false`, and the destination must pass
+`allow_destinations` and any per-key `permitopen` / `no-port-forwarding`.
+A refused destination closes the local connection and logs the reason on the
+client. Every listener is bound before the tunnel is dialled; a port that is
+already in use is a startup error.
 
 ## Authentication
 

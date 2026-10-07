@@ -177,6 +177,10 @@ type Client struct {
 	SocksListen     string `toml:"socks_listen"`
 	MaxSocksStreams int    `toml:"max_socks_streams"`
 
+	// relay forward: ssh -L style [bind_address:]port:host:hostport specs,
+	// parsed with ParseLocalForwards.
+	LocalForwards []string `toml:"local_forwards"`
+
 	// FEAT-SEC-02 WebSocket transport.
 	WS            bool   `toml:"ws"`
 	WebSocketPath string `toml:"websocket_path"`
@@ -421,6 +425,7 @@ type ClientOptions struct {
 	HUDIsTerminal         *bool
 	SocksListen           string
 	MaxSocksStreams       int
+	LocalForwards         []string
 	TLSInsecure           bool
 
 	// FEAT-ROB-04 Tiered Disk-Spill Storage
@@ -648,6 +653,9 @@ func LoadClient(opts ClientOptions) (Client, error) {
 	if opts.MaxSocksStreams > 0 {
 		cfg.MaxSocksStreams = opts.MaxSocksStreams
 	}
+	if len(opts.LocalForwards) > 0 {
+		cfg.LocalForwards = opts.LocalForwards
+	}
 	if opts.Target != "" {
 		cfg.Target = opts.Target
 	}
@@ -825,6 +833,9 @@ func (s Server) Validate() error {
 func (c Client) Validate() error {
 	if c.MaxSocksStreams < 0 {
 		return fmt.Errorf("max_socks_streams must not be negative")
+	}
+	if _, err := ParseLocalForwards(c.LocalForwards); err != nil {
+		return err
 	}
 	if strings.TrimSpace(c.Transport) == "" {
 		return fmt.Errorf("empty transports")

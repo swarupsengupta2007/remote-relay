@@ -207,6 +207,7 @@ Because stdout is reserved exclusively for the raw SSH byte stream, the client p
 - Converts `remote-relay` into an unbreakable mobile proxy for all TCP application traffic.
 - **Verification**: Point `curl --socks5 127.0.0.1:1080 https://example.com` through the proxy while injecting link breaks, verify HTTP request completes successfully.
 - **Related**: [FEAT-UTL-05](feat-impl/FEAT-UTL-05.md) is the *static* analogue of this *dynamic* forwarding — a named path of relay servers rather than a SOCKS5 multiplexer.
+- **Local port forwarding** (`relay forward`): `-L [bind_address:]port:host:hostport` listeners (and an optional `-D` SOCKS5 listener) share the same stream mux and tunnel. Each accepted connection sends `STREAM_OPEN` with its fixed destination, skipping the SOCKS5 handshake; the server side is unchanged.
 
 ---
 
