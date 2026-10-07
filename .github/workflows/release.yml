@@ -69,11 +69,16 @@ jobs:
             -ldflags "-s -w -X github.com/remote-relay/relay/internal/version.Version=${VERSION}" \
             -o "dist/$name/relay$ext" ./cmd/relay
           cp LICENSE README.md "dist/$name/"
+          # Reproducible archives: pin every timestamp to the tagged commit
+          # so rebuilding a tag yields the same checksums.
+          epoch=$(git log -1 --format=%ct)
           cd dist
+          find "$name" -exec touch -h -d "@$epoch" {} +
           if [ "$GOOS" = windows ]; then
-            zip -qr "$name.zip" "$name"
+            find "$name" | LC_ALL=C sort | zip -qX "$name.zip" -@
           else
-            tar -czf "$name.tar.gz" "$name"
+            tar --sort=name --mtime="@$epoch" --owner=0 --group=0 --numeric-owner \
+              -cf - "$name" | gzip -n > "$name.tar.gz"
           fi
       - uses: actions/upload-artifact@v7
         with:
