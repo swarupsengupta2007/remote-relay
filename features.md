@@ -21,20 +21,19 @@ Each proposal includes:
 | [**FEAT-ROB-01**](.feat-impl/FEAT-ROB-01.md) | Sub-Second Dead-Peer Detection & Dual-Path BFD | Tier 1: Robustness | **P1** | Complete | RFC 5880 BFD engine, sub-second drop detection & instant hot-standby failover |
 | [**FEAT-ROB-02**](.feat-impl/FEAT-ROB-02.md) | Zero-Downtime Server Restart & Socket Handover | Tier 1: Robustness | **P1** | Complete | Upgrades server without dropping active SSH sessions via SIGUSR2 & SCM_RIGHTS |
 | [**FEAT-ROB-03**](.feat-impl/FEAT-ROB-03.md) | Dual-Stack Happy Eyeballs v2 (RFC 8305) | Tier 1: Robustness | **P2** | Complete | Instant connection racing across IPv4/IPv6 networks |
-| **FEAT-ROB-04** | Tiered Disk-Spill Storage for Ring Buffers | Tier 1: Robustness | **P3** | High | Prevents buffer exhaustion during prolonged outages |
+| [**FEAT-ROB-04**](.feat-impl/FEAT-ROB-04.md) | Tiered Disk-Spill Storage for Ring Buffers | Tier 1: Robustness | **P3** | Complete | Encrypted L2 disk spill storage with AES-256-GCM, fallocate hole punching & zero-memory-growth streaming |
 | [**FEAT-UTL-01**](.feat-impl/FEAT-UTL-01.md) | Native OpenSSH Agent (`SSH_AUTH_SOCK`) Support | Tier 2: Utility | **P1** | Complete | Passphrase-protected keys & FIDO2/YubiKey support |
 | [**FEAT-UTL-02**](.feat-impl/FEAT-UTL-02.md) | Terminal Reconnection HUD & Desktop Notifications | Tier 2: Utility | **P1** | Complete | In-place status line (\r) and OSC 9/777 desktop notifications |
-| [**FEAT-UTL-03**](.feat-impl/FEAT-UTL-03.md) | SOCKS5 Dynamic Forwarding Mode (`relay socks`) | Tier 2: Utility | **P2** | Complete | RFC 1928 dynamic proxy with multiplexed stream hold and resume |
-| **FEAT-UTL-04** | Reverse Relay & NAT Gateway Mode (Inverted Tunnel) | Tier 2: Utility | **P2** | High | Reaches home labs and private VPCs behind NAT |
+| [**FEAT-UTL-04**](.feat-impl/FEAT-UTL-04.md) | Reverse Relay & NAT Gateway Mode (Inverted Tunnel) | Tier 2: Utility | **P2** | Complete | Reaches home labs and private VPCs behind NAT |
 | [**FEAT-UTL-05**](.feat-impl/FEAT-UTL-05.md) | Multi-Hop Jumphost Chaining (`-J`) | Tier 2: Utility | **P1** | Complete | Server-side chaining with per-hop resume, relayed signatures, and KEX attestation |
-| **FEAT-UTL-06** | Chained Jumphost Rendezvous to NATed Terminal (`HopSpec.Target`) | Tier 2: Utility | **P2** | High | Traverses NAT/CGNAT terminals via reverse agent rendezvous (depends on FEAT-UTL-04) |
+| [**FEAT-UTL-06**](.feat-impl/FEAT-UTL-06.md) | Chained Jumphost Rendezvous to NATed Terminal (`HopSpec.Target`) | Tier 2: Utility | **P2** | Complete | Traverses NAT/CGNAT terminals via reverse agent rendezvous (unblocked by FEAT-UTL-04) |
 | [**FEAT-SEC-01**](.feat-impl/FEAT-SEC-01.md) | Encrypted Handshake Control Plane (X25519 / ChaCha20-Poly1305) | Tier 3: Security | **P1** | Complete | SSH-style X25519 ECDH + Ed25519 host keys + ChaCha20-Poly1305 control encryption |
 | [**FEAT-SEC-02**](.feat-impl/FEAT-SEC-02.md) | WebSocket & HTTPS Port 443 Fallback Transport | Tier 3: Security | **P3** | Complete | Bypasses restrictive enterprise firewalls & DPI |
 | [**FEAT-SEC-03**](.feat-impl/FEAT-SEC-03.md) | Per-User RBAC & Live `SIGHUP` Configuration Reload | Tier 3: Security | **P2** | Complete | Hot updates to `authorized_keys` & destination ACLs |
 | [**FEAT-PERF-01**](.feat-impl/FEAT-PERF-01.md)| Linux Kernel Zero-Copy Stream Splicing (`splice(2)`) | Tier 4: Performance | **P3** | Complete | Halves CPU & memory bus overhead on multi-gigabit links |
 | [**FEAT-PERF-02**](.feat-impl/FEAT-PERF-02.md)| Adaptive KCP Dynamic ARQ & Congestion Tuning | Tier 4: Performance | **P3** | Complete | Dynamic packet retransmission on fluctuating mobile links |
 | [**FEAT-PERF-03**](.feat-impl/FEAT-PERF-03.md)| Fast 3-RTT Token-Authorized Resumption in AEAD Plane | Tier 4: Performance | **P1** | Complete | Cuts 1 RTT per resume, eliminates flaky link RTO stalls & enables silent standby |
-| **FEAT-OBS-01** | Prometheus Exporter, OpenTelemetry Tracing & Live Metrics TUI Dashboard | Tier 4: Observability| **P2** | Medium | Production-grade SLA alerting, Prometheus scraping, & interactive terminal metrics dashboard (`relay top`) |
+| [**FEAT-OBS-01**](.feat-impl/FEAT-OBS-01.md) | Prometheus Exporter, OpenTelemetry Tracing & Live Metrics TUI Dashboard | Tier 4: Observability| **P2** | Complete | Production-grade SLA alerting, Prometheus scraping, & interactive terminal metrics dashboard (`relay top`) |
 
 ---
 
@@ -106,24 +105,26 @@ Client connection establishment in [`clientHello`](file:///root/remote-relay/int
 
 ---
 
-### FEAT-ROB-04: Tiered Disk-Spill Storage for Ring Buffers
+### [FEAT-ROB-04](.feat-impl/FEAT-ROB-04.md): Tiered Disk-Spill Storage for Ring Buffers
 * **Priority**: `P3` (Low)
-* **Status**: Proposed
-* **Target Package**: `internal/session`
+* **Status**: Complete ([`.feat-impl/FEAT-ROB-04.md`](.feat-impl/FEAT-ROB-04.md))
+* **Target Package**: `internal/session`, `internal/relay`, `internal/config`, `cmd/relay`
 
 #### 1. Problem Statement
 Session ring buffers in [`session.Ring`](file:///root/remote-relay/internal/session/ringbuf.go) are strictly backed by RAM slices. Under the default configuration, per-session capacity is capped at 64 MiB and global budget at 512 MiB ([`session.Budget`](file:///root/remote-relay/internal/session/budget.go)). During prolonged disconnections (e.g. 5–10 minutes) during massive bulk transfers, the ring buffer saturates quickly, pausing upstream reads and risking session drop if memory limits are exceeded.
 
 #### 2. Technical Specification
 - **Tiered Ring Architecture**:
-  - Split [`session.Ring`](file:///root/remote-relay/internal/session/ringbuf.go) into an in-memory L1 cache (e.g. up to 8 MiB) and an on-demand L2 spill storage.
-  - When in-memory data exceeds the L1 threshold, sequentially write overflow data blocks to an encrypted temporary disk file (using `O_TMPFILE` or unlink-on-open on Linux).
-  - Encrypt spilled blocks using AES-GCM with an ephemeral per-session key generated at startup.
-  - During retransmission on `RESUME`, stream unacknowledged bytes sequentially from the spill file, purging acknowledged segments via `fallocate(FALLOC_FL_PUNCH_HOLE)`.
+  - Split [`session.Ring`](file:///root/remote-relay/internal/session/ringbuf.go) into an in-memory L1 cache (up to 8 MiB) and an on-demand L2 spill storage.
+  - When in-memory data exceeds the L1 threshold, sequentially write overflow data blocks to an encrypted temporary disk file (using unlink-on-open on Linux).
+  - Encrypt spilled blocks using AES-256-GCM with an ephemeral per-session key generated at startup and securely zeroed on close.
+  - Fixed 64 KiB blocks with 65556-byte on-disk stride for O(1) arithmetic indexing.
+  - During retransmission on `RESUME`, stream unacknowledged bytes sequentially from the spill file with single-block caching, purging acknowledged segments via `fallocate(FALLOC_FL_PUNCH_HOLE)`.
+  - Seamless zero-downtime hot restart handover integration (`RestoreTieredRing`).
 
 #### 3. Benefits & Verification
 - Enables sustained gigabyte-scale hold buffers across multi-minute outages without exhausting server RAM or causing OOM kills.
-- **Verification**: Stream 2 GiB through a paused reader session with `buffer_bytes = 1073741824`, verify RAM consumption remains <32 MiB and payload matches byte-for-byte upon resumption.
+- **Verification**: Verified via unit tests (`internal/session/spill_test.go`) and end-to-end relay disconnection tests (`TestRelayTieredSpillResume`) streaming 512 KiB through a 128 KiB L1 threshold, verifying byte-exact SHA-256 matching.
 
 ---
 
@@ -209,10 +210,10 @@ Because stdout is reserved exclusively for the raw SSH byte stream, the client p
 
 ---
 
-### FEAT-UTL-04: Reverse Relay & NAT Gateway Mode (Inverted Tunnel)
+### [FEAT-UTL-04](.feat-impl/FEAT-UTL-04.md): Reverse Relay & NAT Gateway Mode (Inverted Tunnel)
 * **Priority**: `P2` (Medium)
-* **Status**: Proposed
-* **Target Package**: `cmd/relay`, `internal/relay`
+* **Status**: Implemented (Complete)
+* **Target Package**: `cmd/relay`, `internal/relay`, `internal/proto`, `internal/config`, `internal/auth`
 
 #### 1. Problem Statement
 The current architecture assumes the server has a public IP address and the destination is reachable from the server. If the target machine is located behind NAT, CGNAT, or firewall (such as a home lab server, IoT appliance, or private cloud instance), external access typically requires reverse forwarding.
@@ -268,9 +269,9 @@ The relay is strictly two-party: `client → server → destination`. Reaching a
 
 ---
 
-### FEAT-UTL-06: Chained Jumphost Rendezvous to NATed Terminal (`HopSpec.Target`)
+### [FEAT-UTL-06](.feat-impl/FEAT-UTL-06.md): Chained Jumphost Rendezvous to NATed Terminal (`HopSpec.Target`)
 * **Priority**: `P2` (Medium)
-* **Status**: Proposed (Blocked on [FEAT-UTL-04](#feat-utl-04-reverse-relay--nat-gateway-mode-inverted-tunnel))
+* **Status**: Implemented (Complete)
 * **Target Package**: `cmd/relay`, `internal/relay`, `internal/proto`, `internal/config`
 
 #### 1. Problem Statement
@@ -467,7 +468,7 @@ However, with the completion of [**FEAT-SEC-01**](.feat-impl/FEAT-SEC-01.md), ev
 
 ### FEAT-OBS-01: Prometheus Metrics Exporter, OpenTelemetry Tracing & Live Metrics TUI Dashboard (`relay top`)
 * **Priority**: `P2` (Medium)
-* **Status**: Proposed
+* **Status**: Complete
 * **Target Package**: `internal/obs`, `internal/tui`, `cmd/relay`
 
 #### 1. Problem Statement
@@ -521,7 +522,7 @@ Phase 1: Usability & Resiliency Quick-Wins (1–2 weeks)
 
 Phase 2: Enterprise Operations, Zero-Downtime & Security (2–4 weeks)
 ├── FEAT-ROB-02: Zero-Downtime Server Restarts (SCM_RIGHTS) [COMPLETED] (.feat-impl/FEAT-ROB-02.md)
-├── FEAT-OBS-01: Prometheus Metrics Endpoint & Live TUI Dashboard
+├── FEAT-OBS-01: Prometheus Metrics Endpoint & Live TUI Dashboard [COMPLETED] (.feat-impl/FEAT-OBS-01.md)
 ├── FEAT-SEC-03: Per-User RBAC & SIGHUP Reload [COMPLETED] (.feat-impl/FEAT-SEC-03.md)
 ├── FEAT-SEC-01: Encrypted Handshake Control Plane [COMPLETED] (.feat-impl/FEAT-SEC-01.md)
 ├── FEAT-UTL-05: Multi-Hop Jumphost Chaining (-J) [COMPLETED] (.feat-impl/FEAT-UTL-05.md)
@@ -529,8 +530,8 @@ Phase 2: Enterprise Operations, Zero-Downtime & Security (2–4 weeks)
 
 Phase 3: Expanded Utility & High Availability (4–6 weeks)
 ├── FEAT-UTL-03: SOCKS5 Dynamic Forwarding Mode [COMPLETED] (.feat-impl/FEAT-UTL-03.md)
-├── FEAT-UTL-04: Reverse Relay & NAT Gateway Mode
-├── FEAT-UTL-06: Chained Jumphost Rendezvous to NATed Terminal (depends on FEAT-UTL-04)
+├── FEAT-UTL-04: Reverse Relay & NAT Gateway Mode [COMPLETED] (.feat-impl/FEAT-UTL-04.md)
+├── FEAT-UTL-06: Chained Jumphost Rendezvous to NATed Terminal (unblocked by FEAT-UTL-04)
 └── FEAT-SEC-02: WebSocket & HTTPS Port 443 Fallback [COMPLETED] (.feat-impl/FEAT-SEC-02.md)
 
 Phase 4: Advanced Optimizations (Ongoing)

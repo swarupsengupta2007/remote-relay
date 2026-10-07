@@ -4,7 +4,7 @@ Hand-off log. Each agent writes **only its own work** under its heading.
 Do not rewrite another agent's section. Do not replace this file with a
 snapshot of the tree; later agents append below.
 
-Last updated: 2026-09-12 (Antigravity).
+Last updated: 2026-10-06 (Antigravity).
 
 ---
 
@@ -686,6 +686,87 @@ Implemented **FEAT-SEC-02**: WebSocket & HTTPS Port 443 Fallback Transport.
 - Unit tests: frame round-trips, TLS handshakes, HTTP CONNECT proxy traversal, Basic Auth, proxy 403 refusal, bad gateway 502, invalid upgrade responses, client IP extraction, buffer resets.
 - Integration tests: direct end-to-end streaming, TLS end-to-end streaming, reverse proxy multiplexing with `/health`, forward HTTP CONNECT proxy tunneling, jumphost chaining with WebSocket hops, session resumption, host key fingerprint pinning/verification, and sad paths (closed ports, untrusted TLS certificates).
 
+---
 
+Implemented **FEAT-ROB-04**: Tiered Disk-Spill Storage for Ring Buffers.
 
+### 1. Architectural Implementation (`internal/session/spill.go`, `fallocate_linux.go`, `fallocate_other.go`, `ringbuf.go`)
+- Implemented temporary disk spill storage for buffering sessions exceeding `spill_l1_bytes` memory threshold.
+- Sparse file creation in `spill_dir` with encrypted payload storage and automatic cleanup on process termination.
+- Hole-punching via `fallocate(FALLOC_FL_PUNCH_HOLE)` to deallocate disk blocks immediately as client ACKs advance the send log.
+- Tiered ring buffer reconstruction (`RestoreTieredRing`) preserving disk-spilled offsets without memory budget starvation or startup deadlocks.
+- TOML and CLI configuration flags: `--spill-dir`, `--spill-l1-bytes`, `--no-spill`.
 
+### 2. Verification & Testing (`internal/session/spill_test.go`, `internal/relay/spill_test.go`)
+- 100% test pass across unit and integration suites:
+  - Spill block allocation, write, read, and boundary traversal.
+  - Hole-punching block reclamation and zero-read verification on Linux.
+  - End-to-end streaming under severe backpressure spilling gigabytes to disk with byte-exact integrity.
+  - Fast session resumption with state restored from disk spill storage.
+
+---
+
+Implemented **FEAT-UTL-04**: Reverse Relay & NAT Gateway Mode / Agent.
+
+### 1. Architectural Implementation (`internal/relay/agent.go`, `agent_registry.go`, `server.go`)
+- Implemented `relay agent` mode allowing hosts behind NAT/firewalls to register named endpoints (`--name homelab`) with the relay server.
+- Server-side `AgentRegistry` managing active agent registrations, public keys, and RBAC policies.
+- Reverse rendezvous workflow: client specifies `--target homelab`, server dispatches `AgentBind` frame to registered agent, agent opens local TCP connection and initiates secondary rendezvous channel to relay server, server bridges data streams.
+- Disconnection hold grace period (`agent_hold_timeout`, default 15s) enabling agent auto-reconnect without terminating pending client sessions.
+
+### 2. Verification & Testing (`internal/relay/agent_test.go`, `agent_control_test.go`)
+- Tests passing: agent registration, direct target forwarding, rendezvous binding, concurrent client sessions to a single agent, agent reconnect during hold window, RBAC target permission filtering (`permitagent`), and heartbeat timeout detection.
+
+---
+
+Implemented **FEAT-UTL-06**: Chained Jumphost Rendezvous to NATed Terminal (`HopSpec.Target`).
+
+### 1. Architectural Implementation (`internal/relay/chain.go`)
+- Extended multi-hop jumphost traversal (`-J`) to support terminal hops terminating at a reverse agent name (`HopSpec.Target`).
+- Intermediate jumphosts route to the final relay holding the agent registration and trigger reverse rendezvous binding seamlessly.
+
+### 2. Verification & Testing (`internal/relay/chain_target_test.go`)
+- Multi-hop integration tests passing: client -> relay 1 -> relay 2 -> NATed agent terminal with full bidirectional data streaming, carrier kill recovery, and RBAC policy enforcement across intermediate hops.
+
+---
+
+Implemented **FEAT-OBS-01**: Prometheus Metrics Exporter, OpenTelemetry Tracing & Live TUI Dashboard (`relay top`).
+
+### 1. Prometheus Metrics Exporter (`internal/obs/metrics.go`, `registry.go`, `internal/relay/obs.go`)
+- Built lockless Prometheus metrics registry exposing standard `/metrics` endpoint on `--metrics-listen` (default `:9100`).
+- Core metric vectors:
+  - Counters: `relay_connections_total`, `relay_bytes_transferred_total` (by direction & transport), `relay_reconnect_total`, `relay_switch_total`, `relay_auth_failures_total`.
+  - Gauges: `relay_sessions_active`, `relay_sessions_held`, `relay_buffer_bytes_allocated`.
+  - Histograms: `relay_handshake_duration_seconds`, `relay_reconnect_duration_seconds`, `relay_round_trip_time_seconds`, `relay_hop_chain_depth`.
+
+### 2. OpenTelemetry Distributed Tracing (`internal/obs/tracer.go`, `span.go`)
+- Lightweight W3C Trace Context propagator (`traceparent` header injection/extraction).
+- Spans: `Handshake`, `Resume`, `Upgrade`, `ChainHop` with timing, status codes, and network metadata.
+- Configurable OTLP export via `--otel-endpoint`.
+
+### 3. Terminal Live Dashboard (`relay top`, `internal/tui/`)
+- Interactive real-time TUI dashboard using Bubbletea and Lipgloss.
+- Live active session table, upload/download bandwidth gauges, ASCII sparklines, and latency distribution charts.
+- Direct CLI invocation: `relay top --metrics-url http://127.0.0.1:9100/metrics`.
+
+---
+
+Conducted **Comprehensive 17-Feature Codebase Audit & Gap Analysis** ([`fixes.md`](file:///root/remote-relay/fixes.md)) and Implemented Critical Fixes:
+
+### 1. Comprehensive Audit Probe (`fixes.md`)
+- Probed all 17 core features from `features.md` against the implementation.
+- Evaluated protocol compliance, concurrency safety, edge-case resilience, and happy/sad path handling.
+- Documented complete gap analysis, deviation inventory, and unhandled failure paths in [`fixes.md`](file:///root/remote-relay/fixes.md).
+
+### 2. Critical Bug Fixes & Stability Hardening
+- **Hot Restart Crash on Virtual Streams (BUG-01)**: Fixed `adoptHandover` in [`internal/relay/server.go`](file:///root/remote-relay/internal/relay/server.go) crashing when `HasDestFD` is false for SOCKS5, reverse agent, and chained hops; ensured proper session state adoption without nil pointer dereference ([`handover_adopt_test.go`](file:///root/remote-relay/internal/relay/handover_adopt_test.go)).
+- **Splice Pipe Descriptor Corruption (BUG-02)**: Replaced `io.ReadFull(os.NewFile(...))` in [`internal/relay/splice_linux.go`](file:///root/remote-relay/internal/relay/splice_linux.go) with direct `unix.Read` syscalls, preventing GC finalizers from closing pooled pipe descriptors ([`splice_retain_test.go`](file:///root/remote-relay/internal/relay/splice_retain_test.go)).
+- **Asymmetric UDP BFD Loss Data Drop (BUG-03)**: Updated `clientStandby` in [`internal/relay/standby.go`](file:///root/remote-relay/internal/relay/standby.go) to prefetch non-ping frames and trigger immediate promotion upon receiving downstream data on the standby connection ([`standby_promote_test.go`](file:///root/remote-relay/internal/relay/standby_promote_test.go)).
+- **Happy Eyeballs UDP Probe Nonce Collisions (BUG-04)**: Changed probe nonce generation in [`internal/transport/udpmux.go`](file:///root/remote-relay/internal/transport/udpmux.go) to dynamic atomic nonces, preventing collision when racing concurrent probes to multi-address endpoints ([`udpmux_test.go`](file:///root/remote-relay/internal/transport/udpmux_test.go)).
+- **SOCKS5 Head-of-Line Blocking (BUG-05)**: Decoupled stream frame dispatching in [`internal/relay/socks_server.go`](file:///root/remote-relay/internal/relay/socks_server.go) from slow target socket writes to prevent 3-second stalls across all concurrent multiplexed streams ([`socks_mux_test.go`](file:///root/remote-relay/internal/relay/socks_mux_test.go)).
+- **WebSocket IP Spoofing Prevention (BUG-06)**: Added trusted proxy validation in [`internal/transport/websocket.go`](file:///root/remote-relay/internal/transport/websocket.go) to prevent untrusted clients from spoofing `X-Forwarded-For` headers and evading rate limits ([`websocket_test.go`](file:///root/remote-relay/internal/transport/websocket_test.go)).
+- **Agent Control Loop Deadlock & Heartbeat Timeout (BUG-07)**: Added read deadlines and active keepalive verification in [`internal/relay/server.go`](file:///root/remote-relay/internal/relay/server.go) to promptly evict silently disconnected agents ([`agent_control_test.go`](file:///root/remote-relay/internal/relay/agent_control_test.go)).
+- **Throughput Metrics Tracking (BUG-08)**: Wired up `BytesTransferred` counter updates in [`internal/relay/pump.go`](file:///root/remote-relay/internal/relay/pump.go) and [`splice_linux.go`](file:///root/remote-relay/internal/relay/splice_linux.go), enabling live bandwidth tracking in `relay top` ([`pump_bytes_test.go`](file:///root/remote-relay/internal/relay/pump_bytes_test.go), [`splice_bytes_test.go`](file:///root/remote-relay/internal/relay/splice_bytes_test.go)).
+- **SIGHUP Reload CLI Flag Retention**: Fixed `ReloadConfig` in [`internal/relay/server.go`](file:///root/remote-relay/internal/relay/server.go) preserving CLI flag overrides across live reloads ([`reload_cli_test.go`](file:///root/remote-relay/cmd/relay/reload_cli_test.go)).
+- **Tracing Span Completeness**: Added missing `Upgrade` OpenTelemetry span in [`internal/relay/upgrade.go`](file:///root/remote-relay/internal/relay/upgrade.go) ([`upgrade_span_test.go`](file:///root/remote-relay/internal/relay/upgrade_span_test.go)).
+- **KCP Multi-Session Metrics Isolation**: Replaced global SNMP counter sampling with per-session metric tracking in [`internal/transport/kcp_adaptive.go`](file:///root/remote-relay/internal/transport/kcp_adaptive.go) ([`kcp_loss_test.go`](file:///root/remote-relay/internal/transport/kcp_loss_test.go)).
