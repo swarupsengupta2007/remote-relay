@@ -2,14 +2,14 @@
 
 ## 1. Executive Summary
 
-In complex network topologies (such as multi-tier enterprise DMZs, hybrid cloud VPCs, and isolated lab environments), machines are often separated by multiple intermediate bastion/jumphost relays and situated behind strict NAT, CGNAT, or firewall boundaries. [FEAT-UTL-05](.feat-impl/FEAT-UTL-05.md) provided arbitrary multi-hop jumphost chaining (`-J`) for dialable IP/hostname endpoints, while [FEAT-UTL-04](.feat-impl/FEAT-UTL-04.md) introduced reverse relay agent rendezvous for single-server setups.
+In complex network topologies (such as multi-tier enterprise DMZs, hybrid cloud VPCs, and isolated lab environments), machines are often separated by multiple intermediate bastion/jumphost relays and situated behind strict NAT, CGNAT, or firewall boundaries. [FEAT-UTL-05](FEAT-UTL-05.md) provided arbitrary multi-hop jumphost chaining (`-J`) for dialable IP/hostname endpoints, while [FEAT-UTL-04](FEAT-UTL-04.md) introduced reverse relay agent rendezvous for single-server setups.
 
 **FEAT-UTL-06** unifies these two capabilities by enabling **Chained Jumphost Rendezvous to NATed Terminals**. Clients can traverse one or more intermediate jumphost relays and terminate directly at a private NATed agent registered via `relay agent` using the wire-reserved `HopSpec.Target` field.
 
 ### Key Architectural Capabilities:
 1. **Zero-Port-Forwarding Chained Access**: Private servers behind NAT/CGNAT need no public IP or listening port to be reached across arbitrary multi-hop relay bastions.
-2. **Seamless Wire Protocol Integration**: Utilizes the wire-declared [`proto.HopSpec.Target`](file:///root/remote-relay/internal/proto/messages.go#L94) field, ensuring complete backwards compatibility with existing framing (`TypeChain`, `TypeChainOK`, `TypeHelloOK`).
-3. **End-to-End Cryptographic Security**: Retains per-hop cryptographic KEX attestation ([J-D3](file:///root/remote-relay/features.md#L258)) and relayed challenge signing ([J-D2](file:///root/remote-relay/features.md#L258)) across all intermediate relays.
+2. **Seamless Wire Protocol Integration**: Utilizes the wire-declared [`proto.HopSpec.Target`](../../internal/proto/messages.go#L94) field, ensuring complete backwards compatibility with existing framing (`TypeChain`, `TypeChainOK`, `TypeHelloOK`).
+3. **End-to-End Cryptographic Security**: Retains per-hop cryptographic KEX attestation ([J-D3](../features.md#L258)) and relayed challenge signing ([J-D2](../features.md#L258)) across all intermediate relays.
 4. **Independent Hop Resilience & Per-Hop Resume**: Carrier drop on any leg (client $\leftrightarrow$ jumphost 1, jumphost 1 $\leftrightarrow$ jumphost 2, or agent $\leftrightarrow$ jumphost 2) triggers independent reconnects and seamless retransmission from local ring buffers without dropping the end-to-end session.
 5. **Flexible CLI Syntax**:
    - `relay client -J jump.example.com:7443 --target homelab [--dest 127.0.0.1:22]`
@@ -78,14 +78,14 @@ sequenceDiagram
 
 ### 3.1 Hop Specification & CLI Parsing (`internal/config`)
 
-- **`ParseHopSpec`** ([`internal/config/chain.go`](file:///root/remote-relay/internal/config/chain.go)):
+- **`ParseHopSpec`** ([`internal/config/chain.go`](../../internal/config/chain.go)):
   - Added support for `target:<name>` tokens in `-J` entries.
   - Strips optional query/fragment metadata and populates `hop.Target = <name>`.
-- **`Client.validateChain`** ([`internal/config/chain.go`](file:///root/remote-relay/internal/config/chain.go)):
+- **`Client.validateChain`** ([`internal/config/chain.go`](../../internal/config/chain.go)):
   - Enforces that a target hop must be the terminal hop in the chain (`i == len(hops)-1`).
   - Ensures a target is not specified simultaneously in both `--target` and inline `-J`.
   - Disallows standalone single-hop target chains without at least one intermediate relay (`len(hops) >= 2`).
-- **`Client.hasTargetChain` & `Client.Validate`** ([`internal/config/config.go`](file:///root/remote-relay/internal/config/config.go)):
+- **`Client.hasTargetChain` & `Client.Validate`** ([`internal/config/config.go`](../../internal/config/config.go)):
   - When `--target <name>` is provided with `-J`, `--server` is optional: the client connects to the intermediate jumphosts and names the NATed agent as the terminal target.
 
 ### 3.2 Client Chain Assembly (`internal/relay/client_chain.go`, `client.go`)
@@ -95,7 +95,7 @@ sequenceDiagram
   - Determines canonical destination: if `--dest` is not specified, defaults to `proto.DestTargetPrefix + targetName` (`target:<name>`).
   - Originator verifies host-key attestations for each intermediate relay while respecting that the terminal target is served via agent rendezvous.
 - **Data-Plane Relayed Authentication**:
-  - Populates `chainHops` and `dest` in [`client.go`](file:///root/remote-relay/internal/relay/client.go) so that mid-session relayed authentication challenges match the destination and hop structure.
+  - Populates `chainHops` and `dest` in [`client.go`](../../internal/relay/client.go) so that mid-session relayed authentication challenges match the destination and hop structure.
 
 ### 3.3 Server-Side Chain Rendezvous (`internal/relay/chain.go`)
 
@@ -119,7 +119,7 @@ sequenceDiagram
 
 ## 4. Verification & Testing
 
-Comprehensive tests in [`internal/relay/chain_target_test.go`](file:///root/remote-relay/internal/relay/chain_target_test.go) and [`internal/config/chain_test.go`](file:///root/remote-relay/internal/config/chain_test.go):
+Comprehensive tests in [`internal/relay/chain_target_test.go`](../../internal/relay/chain_target_test.go) and [`internal/config/chain_test.go`](../../internal/config/chain_test.go):
 
 | Test Case | Description | Result |
 | :--- | :--- | :--- |

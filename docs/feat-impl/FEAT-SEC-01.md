@@ -2,7 +2,7 @@
 
 ## 1. Executive Summary
 
-In the current `remote-relay` architecture ([`design.md` §10.1](design.md)), the TCP control plane connection is conducted in cleartext JSON. Before a session is promoted or switched to a data carrier, `HELLO`, `HELLO_OK`, `AUTH`, `AUTH_OK`, `RESUME`, and `RESUME_OK` frames are sent in the clear.
+In the current `remote-relay` architecture ([`design.md` §10.1](../design.md)), the TCP control plane connection is conducted in cleartext JSON. Before a session is promoted or switched to a data carrier, `HELLO`, `HELLO_OK`, `AUTH`, `AUTH_OK`, `RESUME`, and `RESUME_OK` frames are sent in the clear.
 
 Although inner application traffic (e.g. SSH) is independently encrypted end-to-end, the unencrypted control plane exposes sensitive metadata to on-path passive eavesdroppers and network middleboxes:
 - Target destination endpoints (`host:port`).

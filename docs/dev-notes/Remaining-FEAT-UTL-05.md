@@ -2,7 +2,7 @@
 
 **Status:** Implemented in-tree (Case C, Case D, J-D4). Nested splice remains deferred (R-D4). Phase 3 remains out of scope (R-D5).
 **Date:** 2026-09-16
-**Source:** interview over the leftover of [`.feat-impl/FEAT-UTL-05.md`](.feat-impl/FEAT-UTL-05.md) / `jumphost_plan.md` §6 Phase 2–3, against the Phase 1 tree.
+**Source:** interview over the leftover of [`.feat-impl/FEAT-UTL-05.md`](../feat-impl/FEAT-UTL-05.md) / `jumphost_plan.md` §6 Phase 2–3, against the Phase 1 tree.
 **Target packages:** `internal/relay` (`pump.go`, `chain.go`, `chain_nested.go`, `client.go`, `client_chain.go`, `upgrade.go`), `internal/config` (no new knobs required)
 
 > Phase 1 is in the working tree and is **not** re-litigated here. This document is the shared understanding of what is still missing, why it hurts, and how we will build it.
@@ -361,12 +361,12 @@ None that block writing code. Engineering choices implementers may take without 
 
 ## References
 
-- [`.feat-impl/FEAT-UTL-05.md`](.feat-impl/FEAT-UTL-05.md) — Phase 1 spec (J-D1…J-D16, JR1…JR11, §2.10 Cases A–D)
+- [`.feat-impl/FEAT-UTL-05.md`](../feat-impl/FEAT-UTL-05.md) — Phase 1 spec (J-D1…J-D16, JR1…JR11, §2.10 Cases A–D)
 - [`jumphost_plan.md`](jumphost_plan.md) — original plan
 - [`jump_todo.md`](jump_todo.md) — Phase 1 execution ledger
-- [`design.md`](design.md) §3 D11–D16, §7.1 I6, §15 JR1–JR11
-- [`internal/relay/chain_nested.go`](internal/relay/chain_nested.go) — nested runner (token-only resume)
-- [`internal/relay/upgrade.go`](internal/relay/upgrade.go) `writeResumeRole` — AUTH_OK branch to hook
-- [`internal/relay/pump.go`](internal/relay/pump.go) `netReader` / `startQuiesce` / `handleSwitch`
-- [`.feat-impl/FEAT-PERF-01.md`](.feat-impl/FEAT-PERF-01.md) — why nested splice is not “splice two TCPs”
-- [`.feat-impl/FEAT-PERF-03.md`](.feat-impl/FEAT-PERF-03.md) — token resume vs cryptographic fallback (the AUTH_OK Case C intercepts)
+- [`design.md`](../design.md) §3 D11–D16, §7.1 I6, §15 JR1–JR11
+- [`internal/relay/chain_nested.go`](../../internal/relay/chain_nested.go) — nested runner (token-only resume)
+- [`internal/relay/upgrade.go`](../../internal/relay/upgrade.go) `writeResumeRole` — AUTH_OK branch to hook
+- [`internal/relay/pump.go`](../../internal/relay/pump.go) `netReader` / `startQuiesce` / `handleSwitch`
+- [`.feat-impl/FEAT-PERF-01.md`](../feat-impl/FEAT-PERF-01.md) — why nested splice is not “splice two TCPs”
+- [`.feat-impl/FEAT-PERF-03.md`](../feat-impl/FEAT-PERF-03.md) — token resume vs cryptographic fallback (the AUTH_OK Case C intercepts)

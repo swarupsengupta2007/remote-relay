@@ -10,7 +10,7 @@ Each proposal includes:
 - **Expected Impact & Validation Strategy**.
 
 > [!NOTE]
-> Detailed technical specifications, task breakdowns, and verification matrices for implemented features are archived in the [`.feat-impl/`](.feat-impl) directory (e.g. [`FEAT-ROB-01.md`](.feat-impl/FEAT-ROB-01.md), [`FEAT-SEC-01.md`](.feat-impl/FEAT-SEC-01.md)).
+> Detailed technical specifications, task breakdowns, and verification matrices for implemented features are archived in the [`.feat-impl/`](feat-impl) directory (e.g. [`FEAT-ROB-01.md`](feat-impl/FEAT-ROB-01.md), [`FEAT-SEC-01.md`](feat-impl/FEAT-SEC-01.md)).
 
 ---
 
@@ -18,28 +18,28 @@ Each proposal includes:
 
 | Feature ID | Feature Name | Tier | Priority | Complexity | Target Impact |
 |:---|:---|:---:|:---:|:---:|:---|
-| [**FEAT-ROB-01**](.feat-impl/FEAT-ROB-01.md) | Sub-Second Dead-Peer Detection & Dual-Path BFD | Tier 1: Robustness | **P1** | Complete | RFC 5880 BFD engine, sub-second drop detection & instant hot-standby failover |
-| [**FEAT-ROB-02**](.feat-impl/FEAT-ROB-02.md) | Zero-Downtime Server Restart & Socket Handover | Tier 1: Robustness | **P1** | Complete | Upgrades server without dropping active SSH sessions via SIGUSR2 & SCM_RIGHTS |
-| [**FEAT-ROB-03**](.feat-impl/FEAT-ROB-03.md) | Dual-Stack Happy Eyeballs v2 (RFC 8305) | Tier 1: Robustness | **P2** | Complete | Instant connection racing across IPv4/IPv6 networks |
-| [**FEAT-ROB-04**](.feat-impl/FEAT-ROB-04.md) | Tiered Disk-Spill Storage for Ring Buffers | Tier 1: Robustness | **P3** | Complete | Encrypted L2 disk spill storage with AES-256-GCM, fallocate hole punching & zero-memory-growth streaming |
-| [**FEAT-UTL-01**](.feat-impl/FEAT-UTL-01.md) | Native OpenSSH Agent (`SSH_AUTH_SOCK`) Support | Tier 2: Utility | **P1** | Complete | Passphrase-protected keys & FIDO2/YubiKey support |
-| [**FEAT-UTL-02**](.feat-impl/FEAT-UTL-02.md) | Terminal Reconnection HUD & Desktop Notifications | Tier 2: Utility | **P1** | Complete | In-place status line (\r) and OSC 9/777 desktop notifications |
-| [**FEAT-UTL-04**](.feat-impl/FEAT-UTL-04.md) | Reverse Relay & NAT Gateway Mode (Inverted Tunnel) | Tier 2: Utility | **P2** | Complete | Reaches home labs and private VPCs behind NAT |
-| [**FEAT-UTL-05**](.feat-impl/FEAT-UTL-05.md) | Multi-Hop Jumphost Chaining (`-J`) | Tier 2: Utility | **P1** | Complete | Server-side chaining with per-hop resume, relayed signatures, and KEX attestation |
-| [**FEAT-UTL-06**](.feat-impl/FEAT-UTL-06.md) | Chained Jumphost Rendezvous to NATed Terminal (`HopSpec.Target`) | Tier 2: Utility | **P2** | Complete | Traverses NAT/CGNAT terminals via reverse agent rendezvous (unblocked by FEAT-UTL-04) |
-| [**FEAT-SEC-01**](.feat-impl/FEAT-SEC-01.md) | Encrypted Handshake Control Plane (X25519 / ChaCha20-Poly1305) | Tier 3: Security | **P1** | Complete | SSH-style X25519 ECDH + Ed25519 host keys + ChaCha20-Poly1305 control encryption |
-| [**FEAT-SEC-02**](.feat-impl/FEAT-SEC-02.md) | WebSocket & HTTPS Port 443 Fallback Transport | Tier 3: Security | **P3** | Complete | Bypasses restrictive enterprise firewalls & DPI |
-| [**FEAT-SEC-03**](.feat-impl/FEAT-SEC-03.md) | Per-User RBAC & Live `SIGHUP` Configuration Reload | Tier 3: Security | **P2** | Complete | Hot updates to `authorized_keys` & destination ACLs |
-| [**FEAT-PERF-01**](.feat-impl/FEAT-PERF-01.md)| Linux Kernel Zero-Copy Stream Splicing (`splice(2)`) | Tier 4: Performance | **P3** | Complete | Halves CPU & memory bus overhead on multi-gigabit links |
-| [**FEAT-PERF-02**](.feat-impl/FEAT-PERF-02.md)| Adaptive KCP Dynamic ARQ & Congestion Tuning | Tier 4: Performance | **P3** | Complete | Dynamic packet retransmission on fluctuating mobile links |
-| [**FEAT-PERF-03**](.feat-impl/FEAT-PERF-03.md)| Fast 3-RTT Token-Authorized Resumption in AEAD Plane | Tier 4: Performance | **P1** | Complete | Cuts 1 RTT per resume, eliminates flaky link RTO stalls & enables silent standby |
-| [**FEAT-OBS-01**](.feat-impl/FEAT-OBS-01.md) | Prometheus Exporter, OpenTelemetry Tracing & Live Metrics TUI Dashboard | Tier 4: Observability| **P2** | Complete | Production-grade SLA alerting, Prometheus scraping, & interactive terminal metrics dashboard (`relay top`) |
+| [**FEAT-ROB-01**](feat-impl/FEAT-ROB-01.md) | Sub-Second Dead-Peer Detection & Dual-Path BFD | Tier 1: Robustness | **P1** | Complete | RFC 5880 BFD engine, sub-second drop detection & instant hot-standby failover |
+| [**FEAT-ROB-02**](feat-impl/FEAT-ROB-02.md) | Zero-Downtime Server Restart & Socket Handover | Tier 1: Robustness | **P1** | Complete | Upgrades server without dropping active SSH sessions via SIGUSR2 & SCM_RIGHTS |
+| [**FEAT-ROB-03**](feat-impl/FEAT-ROB-03.md) | Dual-Stack Happy Eyeballs v2 (RFC 8305) | Tier 1: Robustness | **P2** | Complete | Instant connection racing across IPv4/IPv6 networks |
+| [**FEAT-ROB-04**](feat-impl/FEAT-ROB-04.md) | Tiered Disk-Spill Storage for Ring Buffers | Tier 1: Robustness | **P3** | Complete | Encrypted L2 disk spill storage with AES-256-GCM, fallocate hole punching & zero-memory-growth streaming |
+| [**FEAT-UTL-01**](feat-impl/FEAT-UTL-01.md) | Native OpenSSH Agent (`SSH_AUTH_SOCK`) Support | Tier 2: Utility | **P1** | Complete | Passphrase-protected keys & FIDO2/YubiKey support |
+| [**FEAT-UTL-02**](feat-impl/FEAT-UTL-02.md) | Terminal Reconnection HUD & Desktop Notifications | Tier 2: Utility | **P1** | Complete | In-place status line (\r) and OSC 9/777 desktop notifications |
+| [**FEAT-UTL-04**](feat-impl/FEAT-UTL-04.md) | Reverse Relay & NAT Gateway Mode (Inverted Tunnel) | Tier 2: Utility | **P2** | Complete | Reaches home labs and private VPCs behind NAT |
+| [**FEAT-UTL-05**](feat-impl/FEAT-UTL-05.md) | Multi-Hop Jumphost Chaining (`-J`) | Tier 2: Utility | **P1** | Complete | Server-side chaining with per-hop resume, relayed signatures, and KEX attestation |
+| [**FEAT-UTL-06**](feat-impl/FEAT-UTL-06.md) | Chained Jumphost Rendezvous to NATed Terminal (`HopSpec.Target`) | Tier 2: Utility | **P2** | Complete | Traverses NAT/CGNAT terminals via reverse agent rendezvous (unblocked by FEAT-UTL-04) |
+| [**FEAT-SEC-01**](feat-impl/FEAT-SEC-01.md) | Encrypted Handshake Control Plane (X25519 / ChaCha20-Poly1305) | Tier 3: Security | **P1** | Complete | SSH-style X25519 ECDH + Ed25519 host keys + ChaCha20-Poly1305 control encryption |
+| [**FEAT-SEC-02**](feat-impl/FEAT-SEC-02.md) | WebSocket & HTTPS Port 443 Fallback Transport | Tier 3: Security | **P3** | Complete | Bypasses restrictive enterprise firewalls & DPI |
+| [**FEAT-SEC-03**](feat-impl/FEAT-SEC-03.md) | Per-User RBAC & Live `SIGHUP` Configuration Reload | Tier 3: Security | **P2** | Complete | Hot updates to `authorized_keys` & destination ACLs |
+| [**FEAT-PERF-01**](feat-impl/FEAT-PERF-01.md)| Linux Kernel Zero-Copy Stream Splicing (`splice(2)`) | Tier 4: Performance | **P3** | Complete | Halves CPU & memory bus overhead on multi-gigabit links |
+| [**FEAT-PERF-02**](feat-impl/FEAT-PERF-02.md)| Adaptive KCP Dynamic ARQ & Congestion Tuning | Tier 4: Performance | **P3** | Complete | Dynamic packet retransmission on fluctuating mobile links |
+| [**FEAT-PERF-03**](feat-impl/FEAT-PERF-03.md)| Fast 3-RTT Token-Authorized Resumption in AEAD Plane | Tier 4: Performance | **P1** | Complete | Cuts 1 RTT per resume, eliminates flaky link RTO stalls & enables silent standby |
+| [**FEAT-OBS-01**](feat-impl/FEAT-OBS-01.md) | Prometheus Exporter, OpenTelemetry Tracing & Live Metrics TUI Dashboard | Tier 4: Observability| **P2** | Complete | Production-grade SLA alerting, Prometheus scraping, & interactive terminal metrics dashboard (`relay top`) |
 
 ---
 
 ## Tier 1: Core Robustness & Network Fault Tolerance
 
-### [FEAT-ROB-01](.feat-impl/FEAT-ROB-01.md): Sub-Second Dead-Peer Detection & Dual-Path BFD Architecture
+### [FEAT-ROB-01](feat-impl/FEAT-ROB-01.md): Sub-Second Dead-Peer Detection & Dual-Path BFD Architecture
 * **Priority**: `P1` (High)
 * **Status**: Implemented (Complete)
 * **Target Package**: `internal/bfd`, `internal/relay`, `internal/transport`, `internal/proto`, `cmd/relay`
@@ -59,19 +59,19 @@ WAN links drop unpredictably due to Wi-Fi roaming, cell-tower handoffs, and inte
 
 ---
 
-### [FEAT-ROB-02](.feat-impl/FEAT-ROB-02.md): Zero-Downtime Server Restarts & Socket Handover (`LISTEN_FDS` / `SCM_RIGHTS`)
+### [FEAT-ROB-02](feat-impl/FEAT-ROB-02.md): Zero-Downtime Server Restarts & Socket Handover (`LISTEN_FDS` / `SCM_RIGHTS`)
 * **Priority**: `P1` (High)
-* **Status**: Complete ([`.feat-impl/FEAT-ROB-02.md`](.feat-impl/FEAT-ROB-02.md))
+* **Status**: Complete ([`.feat-impl/FEAT-ROB-02.md`](feat-impl/FEAT-ROB-02.md))
 * **Target Package**: `internal/relay`, `cmd/relay`, `internal/session`
 
 #### 1. Problem Statement
-As documented in [`README.md`](README.md), session hold state and destination TCP sockets live strictly in memory inside [`Server`](internal/relay/server.go). If the relay server process restarts (for software updates or configuration changes), all active destination sockets are closed immediately. When clients reconnect, they receive `ERR_UNKNOWN_SESSION` and all SSH sessions terminate.
+As documented in [`README.md`](../README.md), session hold state and destination TCP sockets live strictly in memory inside [`Server`](../internal/relay/server.go). If the relay server process restarts (for software updates or configuration changes), all active destination sockets are closed immediately. When clients reconnect, they receive `ERR_UNKNOWN_SESSION` and all SSH sessions terminate.
 
 #### 2. Technical Specification
 - **Socket Passing via `SCM_RIGHTS`**: Support hot re-exec on `SIGUSR2`:
   1. The existing server process listens for `SIGUSR2`.
   2. The parent process forks and executes the updated `relay server` binary.
-  3. The parent serializes active session metadata from [`Store`](internal/session/store.go) (session IDs, token hashes, stream offsets, and unacknowledged ring buffers) into an IPC stream.
+  3. The parent serializes active session metadata from [`Store`](../internal/session/store.go) (session IDs, token hashes, stream offsets, and unacknowledged ring buffers) into an IPC stream.
   4. The parent passes listening file descriptors (`listen_tcp`, `udp_listen`) and connected destination TCP socket FDs to the child process via Unix domain socket `SCM_RIGHTS`.
   5. The child initializes its internal state from the serialized data, resumes destination polling, and takes over incoming traffic.
   6. The parent exits cleanly without sending `BYE{ERR_SHUTDOWN}` or closing destination sockets.
@@ -85,11 +85,11 @@ As documented in [`README.md`](README.md), session hold state and destination TC
 
 ### FEAT-ROB-03: Dual-Stack Happy Eyeballs v2 (RFC 8305)
 * **Priority**: `P2` (Medium)
-* **Status**: Complete ([`.feat-impl/FEAT-ROB-03.md`](.feat-impl/FEAT-ROB-03.md))
+* **Status**: Complete ([`.feat-impl/FEAT-ROB-03.md`](feat-impl/FEAT-ROB-03.md))
 * **Target Package**: `internal/relay`, `internal/transport`
 
 #### 1. Problem Statement
-Client connection establishment in [`clientHello`](file:///root/remote-relay/internal/relay/client.go) and UDP probing in [`upgrade.go`](file:///root/remote-relay/internal/relay/upgrade.go) use standard `net.Dial`, which attempts resolved IP addresses sequentially. In dual-stack environments where IPv6 is broken, route-filtered, or where corporate firewalls block IPv4 UDP while allowing IPv6 UDP, sequential connection attempts cause multi-second stalls or outright failures.
+Client connection establishment in [`clientHello`](../internal/relay/client.go) and UDP probing in [`upgrade.go`](../internal/relay/upgrade.go) use standard `net.Dial`, which attempts resolved IP addresses sequentially. In dual-stack environments where IPv6 is broken, route-filtered, or where corporate firewalls block IPv4 UDP while allowing IPv6 UDP, sequential connection attempts cause multi-second stalls or outright failures.
 
 #### 2. Technical Specification
 - **Concurrent Address Resolution**: Resolve both `A` (IPv4) and `AAAA` (IPv6) records in parallel.
@@ -97,7 +97,7 @@ Client connection establishment in [`clientHello`](file:///root/remote-relay/int
   - Start dialing IPv6 first.
   - If IPv6 does not establish within `ConnectionAttemptDelay` (250ms), launch concurrent IPv4 dial.
   - The first socket to successfully complete the handshake wins and becomes the session transport; the other socket is closed immediately.
-- **Probe Racing**: Apply the same Happy Eyeballs racing logic to the UDP probe phase in [`transport.Probe`](file:///root/remote-relay/internal/transport/conn.go).
+- **Probe Racing**: Apply the same Happy Eyeballs racing logic to the UDP probe phase in [`transport.Probe`](../internal/transport/conn.go).
 
 #### 3. Benefits & Verification
 - Eliminates connection hangs on broken IPv6 networks and optimizes connection latency across heterogeneous network links.
@@ -105,17 +105,17 @@ Client connection establishment in [`clientHello`](file:///root/remote-relay/int
 
 ---
 
-### [FEAT-ROB-04](.feat-impl/FEAT-ROB-04.md): Tiered Disk-Spill Storage for Ring Buffers
+### [FEAT-ROB-04](feat-impl/FEAT-ROB-04.md): Tiered Disk-Spill Storage for Ring Buffers
 * **Priority**: `P3` (Low)
-* **Status**: Complete ([`.feat-impl/FEAT-ROB-04.md`](.feat-impl/FEAT-ROB-04.md))
+* **Status**: Complete ([`.feat-impl/FEAT-ROB-04.md`](feat-impl/FEAT-ROB-04.md))
 * **Target Package**: `internal/session`, `internal/relay`, `internal/config`, `cmd/relay`
 
 #### 1. Problem Statement
-Session ring buffers in [`session.Ring`](file:///root/remote-relay/internal/session/ringbuf.go) are strictly backed by RAM slices. Under the default configuration, per-session capacity is capped at 64 MiB and global budget at 512 MiB ([`session.Budget`](file:///root/remote-relay/internal/session/budget.go)). During prolonged disconnections (e.g. 5–10 minutes) during massive bulk transfers, the ring buffer saturates quickly, pausing upstream reads and risking session drop if memory limits are exceeded.
+Session ring buffers in [`session.Ring`](../internal/session/ringbuf.go) are strictly backed by RAM slices. Under the default configuration, per-session capacity is capped at 64 MiB and global budget at 512 MiB ([`session.Budget`](../internal/session/budget.go)). During prolonged disconnections (e.g. 5–10 minutes) during massive bulk transfers, the ring buffer saturates quickly, pausing upstream reads and risking session drop if memory limits are exceeded.
 
 #### 2. Technical Specification
 - **Tiered Ring Architecture**:
-  - Split [`session.Ring`](file:///root/remote-relay/internal/session/ringbuf.go) into an in-memory L1 cache (up to 8 MiB) and an on-demand L2 spill storage.
+  - Split [`session.Ring`](../internal/session/ringbuf.go) into an in-memory L1 cache (up to 8 MiB) and an on-demand L2 spill storage.
   - When in-memory data exceeds the L1 threshold, sequentially write overflow data blocks to an encrypted temporary disk file (using unlink-on-open on Linux).
   - Encrypt spilled blocks using AES-256-GCM with an ephemeral per-session key generated at startup and securely zeroed on close.
   - Fixed 64 KiB blocks with 65556-byte on-disk stride for O(1) arithmetic indexing.
@@ -130,13 +130,13 @@ Session ring buffers in [`session.Ring`](file:///root/remote-relay/internal/sess
 
 ## Tier 2: Practical Utility & Developer Workflows
 
-### [FEAT-UTL-01](.feat-impl/FEAT-UTL-01.md): Native OpenSSH Agent (`SSH_AUTH_SOCK`) Integration
+### [FEAT-UTL-01](feat-impl/FEAT-UTL-01.md): Native OpenSSH Agent (`SSH_AUTH_SOCK`) Integration
 * **Priority**: `P1` (High)
-* **Status**: Complete ([`.feat-impl/FEAT-UTL-01.md`](.feat-impl/FEAT-UTL-01.md))
+* **Status**: Complete ([`.feat-impl/FEAT-UTL-01.md`](feat-impl/FEAT-UTL-01.md))
 * **Target Package**: `internal/auth`, `internal/config`, `cmd/relay`, `internal/relay`
 
 #### 1. Problem Statement
-The current SSH public key authenticator in [`ssh.go`](file:///root/remote-relay/internal/auth/ssh.go) directly parses unencrypted private keys from disk files (`identity_files = ["~/.ssh/id_ed25519"]`). It cannot use:
+The current SSH public key authenticator in [`ssh.go`](../internal/auth/ssh.go) directly parses unencrypted private keys from disk files (`identity_files = ["~/.ssh/id_ed25519"]`). It cannot use:
 1. Passphrase-protected private keys (fails with decryption errors).
 2. Keys loaded into the user's running `ssh-agent`.
 3. Hardware tokens such as YubiKey / FIDO2 security keys (`sk-ssh-ed25519@openssh.com`).
@@ -144,7 +144,7 @@ The current SSH public key authenticator in [`ssh.go`](file:///root/remote-relay
 #### 2. Technical Specification
 - **Agent Dialing**: Connect to the local Unix domain socket specified by the environment variable `$SSH_AUTH_SOCK`.
 - **`ssh.Agent` Key Discovery**: Use `golang.org/x/crypto/ssh/agent` to enumerate available signers.
-- **Signature Delegation**: When responding to the server's cryptographic challenge in [`auth.PublicKey.Respond`](file:///root/remote-relay/internal/auth/ssh.go), delegate the signature operation directly to `agent.Sign(key, challengeDigest)`.
+- **Signature Delegation**: When responding to the server's cryptographic challenge in [`auth.PublicKey.Respond`](../internal/auth/ssh.go), delegate the signature operation directly to `agent.Sign(key, challengeDigest)`.
 - **Fallback Chain**:
   1. Try active `ssh-agent` keys.
   2. Fall back to unencrypted files specified in `identity_files`.
@@ -156,9 +156,9 @@ The current SSH public key authenticator in [`ssh.go`](file:///root/remote-relay
 
 ---
 
-### [FEAT-UTL-02](.feat-impl/FEAT-UTL-02.md): Terminal Reconnection HUD & Desktop Notifications
+### [FEAT-UTL-02](feat-impl/FEAT-UTL-02.md): Terminal Reconnection HUD & Desktop Notifications
 * **Priority**: `P1` (High)
-* **Status**: Complete ([`.feat-impl/FEAT-UTL-02.md`](.feat-impl/FEAT-UTL-02.md))
+* **Status**: Complete ([`.feat-impl/FEAT-UTL-02.md`](feat-impl/FEAT-UTL-02.md))
 * **Target Package**: `internal/relay`, `cmd/relay`, `internal/config`
 
 #### 1. Problem Statement
@@ -184,7 +184,7 @@ Because stdout is reserved exclusively for the raw SSH byte stream, the client p
 
 ---
 
-### [FEAT-UTL-03](.feat-impl/FEAT-UTL-03.md): SOCKS5 Dynamic Forwarding Mode (`relay socks`)
+### [FEAT-UTL-03](feat-impl/FEAT-UTL-03.md): SOCKS5 Dynamic Forwarding Mode (`relay socks`)
 * **Priority**: `P2` (Medium)
 * **Status**: Implemented (Complete)
 * **Target Package**: `cmd/relay`, `internal/relay`, `internal/proto`, `internal/socks5`
@@ -206,11 +206,11 @@ Because stdout is reserved exclusively for the raw SSH byte stream, the client p
 #### 3. Benefits & Verification
 - Converts `remote-relay` into an unbreakable mobile proxy for all TCP application traffic.
 - **Verification**: Point `curl --socks5 127.0.0.1:1080 https://example.com` through the proxy while injecting link breaks, verify HTTP request completes successfully.
-- **Related**: [FEAT-UTL-05](.feat-impl/FEAT-UTL-05.md) is the *static* analogue of this *dynamic* forwarding — a named path of relay servers rather than a SOCKS5 multiplexer.
+- **Related**: [FEAT-UTL-05](feat-impl/FEAT-UTL-05.md) is the *static* analogue of this *dynamic* forwarding — a named path of relay servers rather than a SOCKS5 multiplexer.
 
 ---
 
-### [FEAT-UTL-04](.feat-impl/FEAT-UTL-04.md): Reverse Relay & NAT Gateway Mode (Inverted Tunnel)
+### [FEAT-UTL-04](feat-impl/FEAT-UTL-04.md): Reverse Relay & NAT Gateway Mode (Inverted Tunnel)
 * **Priority**: `P2` (Medium)
 * **Status**: Implemented (Complete)
 * **Target Package**: `cmd/relay`, `internal/relay`, `internal/proto`, `internal/config`, `internal/auth`
@@ -225,7 +225,7 @@ The current architecture assumes the server has a public IP address and the dest
 >     -o ProxyCommand="relay client --server jump.example:7443 --kcp -i ~/.ssh/id_ed25519"
 > ```
 > The relay transparently carries the opaque SSH session across NAT with full KCP resilience, BFD dead-peer detection, and hot-standby failover. OpenSSH on the jump host owns the port listener and enforces `authorized_keys` `permitlisten=` restrictions.
-> `FEAT-UTL-04` specifically provides a dedicated agent/client rendezvous protocol (`relay agent` / `--target`) for environments where operators do not want OpenSSH reverse listeners or multi-session forward ports on the relay host. Phase 3 of [FEAT-UTL-05](.feat-impl/FEAT-UTL-05.md) jumphost chaining depends on this rendezvous so a NATed terminal can be named by `HopSpec.Target` instead of a dialable `addr`.
+> `FEAT-UTL-04` specifically provides a dedicated agent/client rendezvous protocol (`relay agent` / `--target`) for environments where operators do not want OpenSSH reverse listeners or multi-session forward ports on the relay host. Phase 3 of [FEAT-UTL-05](feat-impl/FEAT-UTL-05.md) jumphost chaining depends on this rendezvous so a NATed terminal can be named by `HopSpec.Target` instead of a dialable `addr`.
 
 #### 2. Technical Specification
 - **Agent Subcommand (`relay agent`)**:
@@ -247,7 +247,7 @@ The current architecture assumes the server has a public IP address and the dest
 
 ---
 
-### [FEAT-UTL-05](.feat-impl/FEAT-UTL-05.md): Multi-Hop Jumphost Chaining (`-J`)
+### [FEAT-UTL-05](feat-impl/FEAT-UTL-05.md): Multi-Hop Jumphost Chaining (`-J`)
 * **Priority**: `P1` (High)
 * **Status**: Implemented (Complete; Phase 3 split into [FEAT-UTL-06](#feat-utl-06-chained-jumphost-rendezvous-to-nated-terminal-hopspectarget))
 * **Target Package**: `cmd/relay`, `internal/relay`, `internal/proto`, `internal/config`, `internal/crypto/kex`
@@ -269,13 +269,13 @@ The relay is strictly two-party: `client → server → destination`. Reaching a
 
 ---
 
-### [FEAT-UTL-06](.feat-impl/FEAT-UTL-06.md): Chained Jumphost Rendezvous to NATed Terminal (`HopSpec.Target`)
+### [FEAT-UTL-06](feat-impl/FEAT-UTL-06.md): Chained Jumphost Rendezvous to NATed Terminal (`HopSpec.Target`)
 * **Priority**: `P2` (Medium)
 * **Status**: Implemented (Complete)
 * **Target Package**: `cmd/relay`, `internal/relay`, `internal/proto`, `internal/config`
 
 #### 1. Problem Statement
-[FEAT-UTL-05](.feat-impl/FEAT-UTL-05.md) enables arbitrary multi-hop jumphost chaining (`relay client -J j1,j2 --server S`), but requires every intermediate hop to directly dial the outbound IP/hostname and port of the subsequent hop (`HopSpec.Addr`). When the terminal server (or an intermediate hop) is located behind NAT, CGNAT, or firewall (such as an internal home lab server or private VPC instance), direct inbound dialing from the preceding relay fails because the node has no public routable address or listening ports.
+[FEAT-UTL-05](feat-impl/FEAT-UTL-05.md) enables arbitrary multi-hop jumphost chaining (`relay client -J j1,j2 --server S`), but requires every intermediate hop to directly dial the outbound IP/hostname and port of the subsequent hop (`HopSpec.Addr`). When the terminal server (or an intermediate hop) is located behind NAT, CGNAT, or firewall (such as an internal home lab server or private VPC instance), direct inbound dialing from the preceding relay fails because the node has no public routable address or listening ports.
 
 #### 2. Technical Specification
 - **Rendezvous-Based Hop Resolution**:
@@ -301,13 +301,13 @@ The relay is strictly two-party: `client → server → destination`. Reaching a
 
 ## Tier 3: Security & Network Traversal Hardening
 
-### [FEAT-SEC-01](.feat-impl/FEAT-SEC-01.md): Encrypted Handshake Control Plane (X25519 & ChaCha20-Poly1305)
+### [FEAT-SEC-01](feat-impl/FEAT-SEC-01.md): Encrypted Handshake Control Plane (X25519 & ChaCha20-Poly1305)
 * **Priority**: `P1` (High)
 * **Status**: Implemented (Complete)
 * **Target Package**: `internal/crypto/kex`, `internal/proto`, `internal/config`, `internal/relay`, `cmd/relay`
 
 #### 1. Problem Statement
-As noted in [`design.md` §10.1](file:///root/remote-relay/design.md#L500-L511), the TCP control plane was originally sent in cleartext JSON. Although SSH payloads are encrypted, on-path network observers could inspect `HELLO`, `RESUME`, `sessionId`, `resumeToken`, destination IPs/ports, and authentication tokens. This enabled metadata tracking, session token interception, and targeted middlebox DPI filtering.
+As noted in [`design.md` §10.1](design.md#L500-L511), the TCP control plane was originally sent in cleartext JSON. Although SSH payloads are encrypted, on-path network observers could inspect `HELLO`, `RESUME`, `sessionId`, `resumeToken`, destination IPs/ports, and authentication tokens. This enabled metadata tracking, session token interception, and targeted middlebox DPI filtering.
 
 #### 2. Technical Specification
 - **SSH-Style Ephemeral Key Exchange (`internal/crypto/kex`)**:
@@ -335,7 +335,7 @@ As noted in [`design.md` §10.1](file:///root/remote-relay/design.md#L500-L511),
 
 ---
 
-### [FEAT-SEC-02](.feat-impl/FEAT-SEC-02.md): WebSocket & HTTPS Port 443 Fallback Transport
+### [FEAT-SEC-02](feat-impl/FEAT-SEC-02.md): WebSocket & HTTPS Port 443 Fallback Transport
 * **Priority**: `P3` (Medium)
 * **Status**: Implemented (Complete)
 * **Target Package**: `internal/transport`, `internal/config`, `internal/relay`
@@ -366,20 +366,20 @@ Strict enterprise firewalls, corporate proxies, and public Wi-Fi portals (e.g. h
 
 ---
 
-### [FEAT-SEC-03](.feat-impl/FEAT-SEC-03.md): Per-User RBAC & Live `SIGHUP` Configuration Reload
+### [FEAT-SEC-03](feat-impl/FEAT-SEC-03.md): Per-User RBAC & Live `SIGHUP` Configuration Reload
 * **Priority**: `P2` (Medium)
 * **Status**: Implemented (Complete)
 * **Target Package**: `internal/auth`, `internal/config`, `internal/relay`
 
 #### 1. Problem Statement
-[`allow_destinations`](file:///root/remote-relay/internal/config/config.go) is a single global list. Any authenticated user can access any allowed destination. In addition, updating access keys or destinations requires restarting the server process, which terminates active sessions.
+[`allow_destinations`](../internal/config/config.go) is a single global list. Any authenticated user can access any allowed destination. In addition, updating access keys or destinations requires restarting the server process, which terminates active sessions.
 
 #### 2. Technical Specification
 - **Role-Based Access Policies**:
   - Associate destinations with authorized keys or groups in `authorized_keys` (using OpenSSH options format, e.g. `permitopen="10.0.1.*:22,127.0.0.1:22"`).
   - Enforce destination filtering during `HELLO` validation prior to dialing.
 - **`SIGHUP` Configuration Reload**:
-  - Intercept `syscall.SIGHUP` in [`Server`](file:///root/remote-relay/internal/relay/server.go).
+  - Intercept `syscall.SIGHUP` in [`Server`](../internal/relay/server.go).
   - Re-read `server.toml` and `authorized_keys`.
   - Atomically swap the configuration pointer using `atomic.Pointer[config.Server]`.
   - Existing sessions remain active; new sessions immediately adopt the updated rules.
@@ -392,7 +392,7 @@ Strict enterprise firewalls, corporate proxies, and public Wi-Fi portals (e.g. h
 
 ## Tier 4: Performance & Enterprise Observability
 
-### [FEAT-PERF-01](.feat-impl/FEAT-PERF-01.md): Linux Kernel Zero-Copy Stream Splicing (`splice(2)`)
+### [FEAT-PERF-01](feat-impl/FEAT-PERF-01.md): Linux Kernel Zero-Copy Stream Splicing (`splice(2)`)
 * **Priority**: `P3` (Low)
 * **Status**: Implemented (Complete)
 * **Target Package**: `internal/relay`, `internal/transport`, `internal/config`, `cmd/relay`
@@ -417,13 +417,13 @@ In TCP mode, data transfer previously involved reading bytes from the carrier ne
 
 ---
 
-### [FEAT-PERF-02](.feat-impl/FEAT-PERF-02.md): Adaptive KCP Congestion & Dynamic ARQ Tuning
+### [FEAT-PERF-02](feat-impl/FEAT-PERF-02.md): Adaptive KCP Congestion & Dynamic ARQ Tuning
 * **Priority**: `P3` (Low)
 * **Status**: Implemented (Complete)
 * **Target Package**: `internal/transport`
 
 #### 1. Problem Statement
-[`transport/kcp.go`](file:///root/remote-relay/internal/transport/kcp.go) previously used fixed parameters (`nodelay=1, interval=10ms, resend=2, nc=1`). While this provided throughput on lossy links, it caused packet bloat and bandwidth saturation on clean and narrow mobile links.
+[`transport/kcp.go`](../internal/transport/kcp.go) previously used fixed parameters (`nodelay=1, interval=10ms, resend=2, nc=1`). While this provided throughput on lossy links, it caused packet bloat and bandwidth saturation on clean and narrow mobile links.
 
 #### 2. Technical Specification
 - **Dynamic Link Probing & Moving Loss Rate**:
@@ -439,7 +439,7 @@ In TCP mode, data transfer previously involved reading bytes from the carrier ne
 
 ---
 
-### [FEAT-PERF-03](.feat-impl/FEAT-PERF-03.md): Fast 3-RTT Token-Authorized Resumption in Encrypted AEAD Plane
+### [FEAT-PERF-03](feat-impl/FEAT-PERF-03.md): Fast 3-RTT Token-Authorized Resumption in Encrypted AEAD Plane
 * **Priority**: `P1` (High)
 * **Status**: Implemented (Complete)
 * **Target Package**: `internal/relay`, `internal/proto`, `internal/auth`, `internal/session`
@@ -447,7 +447,7 @@ In TCP mode, data transfer previously involved reading bytes from the carrier ne
 #### 1. Problem Statement
 In the original Milestone 5 design, reconnection forced a complete public key challenge-response exchange (`RESUME` $\to$ `AUTH_OK` $\to$ `AUTH` $\to$ `RESUME_OK`) to prevent session hijacking because the control plane was sent in cleartext JSON.
 
-However, with the completion of [**FEAT-SEC-01**](.feat-impl/FEAT-SEC-01.md), every reconnection begins with ephemeral X25519 ECDH and Ed25519 host key verification, wrapping all subsequent frames in a ChaCha20-Poly1305 AEAD cipher. Retaining the full public key challenge-response inside this encrypted tunnel imposes severe performance penalties:
+However, with the completion of [**FEAT-SEC-01**](feat-impl/FEAT-SEC-01.md), every reconnection begins with ephemeral X25519 ECDH and Ed25519 host key verification, wrapping all subsequent frames in a ChaCha20-Poly1305 AEAD cipher. Retaining the full public key challenge-response inside this encrypted tunnel imposes severe performance penalties:
 1. **Serialization Overhead (4 RTTs / 8 Frame Turns)**: Every reconnection takes 4 sequential network turns before data streams (TCP SYN $\to$ KEX $\to$ RESUME/AUTH_OK $\to$ AUTH/RESUME_OK). On an 80ms RTT WAN link, empirical dual-netns benchmarks show an unconditional **+82ms (+34%) baseline penalty** (323ms vs 241ms).
 2. **TCP RTO Amplification on Flaky Links**: Under loss, a dropped frame during the 8-turn sequence forces TCP Retransmission Timeouts (RTOs). Dual-netns simulations at 5% packet loss demonstrated severe stalls up to **7,008ms** (mean 1,166ms vs 284ms for token-only).
 3. **Hardware Token & Standby Stalls ([FEAT-UTL-01](#feat-utl-01-native-openssh-agent-ssh_auth_sock-integration))**: YubiKey / FIDO2 security keys (`sk-ssh-ed25519@openssh.com`) and keys with confirmation (`ssh-add -c`) require physical touch or confirmation prompts. In `--allow-ha` dual-path mode, background standby reconnects continuously trigger intrusive prompts or exceed the 5-second dial timeout.
@@ -472,7 +472,7 @@ However, with the completion of [**FEAT-SEC-01**](.feat-impl/FEAT-SEC-01.md), ev
 * **Target Package**: `internal/obs`, `internal/tui`, `cmd/relay`
 
 #### 1. Problem Statement
-[`obs.go`](file:///root/remote-relay/internal/relay/obs.go) currently only exposes basic `expvar` variables (`sessions`, `held`, `buffer_used`, `accepts`, `refused`). It lacks dimensional labels, histograms, latency percentiles, and compatibility with industry-standard monitoring systems (Prometheus, Grafana, Datadog). Furthermore, operators, developers, and SREs troubleshooting live connections on remote jumphosts or servers currently have no interactive terminal observability tool (analogous to `top`, `htop`, or `iftop`) to inspect live relay health, buffer occupancy, active session counts by transport, and real-time throughput without setting up an external Prometheus/Grafana stack.
+[`obs.go`](../internal/relay/obs.go) currently only exposes basic `expvar` variables (`sessions`, `held`, `buffer_used`, `accepts`, `refused`). It lacks dimensional labels, histograms, latency percentiles, and compatibility with industry-standard monitoring systems (Prometheus, Grafana, Datadog). Furthermore, operators, developers, and SREs troubleshooting live connections on remote jumphosts or servers currently have no interactive terminal observability tool (analogous to `top`, `htop`, or `iftop`) to inspect live relay health, buffer occupancy, active session counts by transport, and real-time throughput without setting up an external Prometheus/Grafana stack.
 
 #### 2. Technical Specification
 - **Prometheus Exporter (`/metrics`)**:

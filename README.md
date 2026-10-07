@@ -395,6 +395,14 @@ If both are set to the same address, one HTTP server serves both.
   overhead with inner SSH streams.
 - The relayed payload is typically already an end-to-end authenticated and encrypted SSH connection.
 
+## Documentation
+
+- [docs/design.md](docs/design.md): protocol and architecture.
+- [docs/features.md](docs/features.md): feature roadmap and status, with
+  per-feature specs in [docs/feat-impl/](docs/feat-impl/).
+- [docs/dev-notes/](docs/dev-notes/): development logs, audit reports, and
+  test-run records kept for history. Not maintained as reference docs.
+
 ## License
 
 GNU General Public License v3.0. See [LICENSE](LICENSE).

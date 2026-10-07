@@ -7,8 +7,8 @@ Production deployment of `remote-relay` in enterprise environments demands both 
 Previously, `remote-relay` only exposed basic `expvar` variables (`sessions`, `held`, `buffer_used`, `accepts`, `refused`). It lacked dimensional label vectors, histograms with latency percentiles, W3C distributed trace context propagation, and terminal diagnostic tools analogous to `top`, `htop`, or `iftop`.
 
 **FEAT-OBS-01** introduces:
-1. **Zero-Dependency Native Prometheus Exporter (`/metrics`)**: Built in [`internal/obs`](file:///root/remote-relay/internal/obs) using Go standard library and atomic primitives. Exposes dimensional gauges, counters, and histograms adhering strictly to Prometheus 0.0.4 text exposition format with zero third-party dependencies.
-2. **W3C OpenTelemetry Distributed Tracing**: Generates W3C TraceContext spans (`traceparent` header format: `00-<trace_id>-<span_id>-01`) for key session lifecycle phases (`Handshake`, `Upgrade`, `Resume`, `ChainHop`). Wire-propagated across hops via optional `traceparent` fields on [`proto.Hello`](file:///root/remote-relay/internal/proto/messages.go), [`proto.Resume`](file:///root/remote-relay/internal/proto/messages.go), and chain frames, with optional asynchronous OTLP/HTTP JSON exporting (`--otel-endpoint`).
+1. **Zero-Dependency Native Prometheus Exporter (`/metrics`)**: Built in [`internal/obs`](../../internal/obs) using Go standard library and atomic primitives. Exposes dimensional gauges, counters, and histograms adhering strictly to Prometheus 0.0.4 text exposition format with zero third-party dependencies.
+2. **W3C OpenTelemetry Distributed Tracing**: Generates W3C TraceContext spans (`traceparent` header format: `00-<trace_id>-<span_id>-01`) for key session lifecycle phases (`Handshake`, `Upgrade`, `Resume`, `ChainHop`). Wire-propagated across hops via optional `traceparent` fields on [`proto.Hello`](../../internal/proto/messages.go), [`proto.Resume`](../../internal/proto/messages.go), and chain frames, with optional asynchronous OTLP/HTTP JSON exporting (`--otel-endpoint`).
 3. **Interactive Terminal TUI Dashboard (`relay top`)**: Real-time live metrics dashboard built with clean ANSI terminal control and `golang.org/x/term` alt-screen buffer. Displays server health, transport breakdowns, live upload/download transfer rates with Unicode sparklines (` ▂▃▄▅▆▇█`), ring buffer capacity gauges with backpressure alerts, and resiliency counters.
 4. **Instant Snapshot Subcommand (`relay stats`)**: Clean one-shot text summary command for scripts, automation, and remote SSH execution (`ssh server relay stats`).
 5. **Headless & Non-TTY Fallback**: Detects non-interactive environments (`!term.IsTerminal` or `--batch`) and gracefully emits plain-text snapshots without terminal escape codes.
@@ -59,7 +59,7 @@ sequenceDiagram
 
 ### 3.1 Prometheus Metrics Registry (`internal/obs/metrics.go`)
 
-The metrics collection in [`internal/obs`](file:///root/remote-relay/internal/obs) is completely self-contained and avoids heavy external dependencies:
+The metrics collection in [`internal/obs`](../../internal/obs) is completely self-contained and avoids heavy external dependencies:
 - **`Counter`**: Monotonically increasing counter with atomic `Inc()`, `Add(val float64)`, `Set(val float64)`, and `Get() float64`.
 - **`Gauge`**: Arbitrary numerical gauge with atomic `Set(val float64)`, `Inc()`, `Dec()`, `Add(val float64)`, and `Get() float64`.
 - **`Histogram`**: Tracks value distribution into configured upper-bound buckets (`le`), maintaining total observation count, cumulative sum, and `+Inf` bucket.
@@ -79,7 +79,7 @@ The metrics collection in [`internal/obs`](file:///root/remote-relay/internal/ob
 ### 3.2 OpenTelemetry Distributed Tracing (`internal/obs/tracer.go`)
 
 - **W3C TraceContext Specification**: Validates and serializes `00-<32 hex trace-id>-<16 hex span-id>-01`.
-- **Wire Propagation**: Added `Traceparent string json:"traceparent,omitempty"` to [`proto.Hello`](file:///root/remote-relay/internal/proto/messages.go), [`proto.Resume`](file:///root/remote-relay/internal/proto/messages.go), and [`proto.ChainHello`](file:///root/remote-relay/internal/proto/messages.go).
+- **Wire Propagation**: Added `Traceparent string json:"traceparent,omitempty"` to [`proto.Hello`](../../internal/proto/messages.go), [`proto.Resume`](../../internal/proto/messages.go), and [`proto.ChainHello`](../../internal/proto/messages.go).
 - **Session Lifecycle Spans**:
   - `Handshake`: Recorded during client connection negotiation and RBAC authorization.
   - `Upgrade`: Recorded when dynamic transport upgrade probes complete.
@@ -89,9 +89,9 @@ The metrics collection in [`internal/obs`](file:///root/remote-relay/internal/ob
 
 ### 3.3 Live Terminal Metrics TUI Dashboard (`internal/tui`)
 
-- **Prometheus Text Parser ([`internal/tui/parser.go`](file:///root/remote-relay/internal/tui/parser.go))**: Tokenizes comments, metric identifiers, label maps, and float64 values into a strongly typed `Snapshot`.
-- **Sparkline & Rate Tracker ([`internal/tui/sparkline.go`](file:///root/remote-relay/internal/tui/sparkline.go))**: Maintains moving history windows and renders 8-level Unicode sparklines (` ▂▃▄▅▆▇█`) for instantaneous upload and download transfer rates.
-- **Interactive Multi-Panel Dashboard ([`internal/tui/dashboard.go`](file:///root/remote-relay/internal/tui/dashboard.go))**:
+- **Prometheus Text Parser ([`internal/tui/parser.go`](../../internal/tui/parser.go))**: Tokenizes comments, metric identifiers, label maps, and float64 values into a strongly typed `Snapshot`.
+- **Sparkline & Rate Tracker ([`internal/tui/sparkline.go`](../../internal/tui/sparkline.go))**: Maintains moving history windows and renders 8-level Unicode sparklines (` ▂▃▄▅▆▇█`) for instantaneous upload and download transfer rates.
+- **Interactive Multi-Panel Dashboard ([`internal/tui/dashboard.go`](../../internal/tui/dashboard.go))**:
   - **Header & Health Panel**: Server uptime, status, PID, scrape latency, refresh rate, and paused indicator.
   - **Transport Breakdown**: Proportional visual bar and counts for `TCP`, `QUIC`, `KCP`, `WS`, plus active SOCKS streams and chain hops.
   - **Throughput Rates**: Upload and download transfer rates ($\text{KiB/s}$, $\text{MiB/s}$) with moving deltas and sparklines.

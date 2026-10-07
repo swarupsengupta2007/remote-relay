@@ -2,7 +2,7 @@
 
 ## 1. Executive Summary
 
-In high-throughput, multi-session network relays, session ring buffers ([`session.Ring`](file:///root/remote-relay/internal/session/ringbuf.go)) are typically backed by RAM slices. In `remote-relay`, buffer memory was previously bounded by a per-session cap (default 64 MiB) and a global process-wide budget ([`session.Budget`](file:///root/remote-relay/internal/session/budget.go), default 512 MiB). During prolonged carrier disconnections (e.g. 5–10 minutes) under massive bulk transfers (gigabytes of file copies, database dumps, or VM image syncs), RAM buffers fill to capacity rapidly. This forced upstream reads to pause, risked stalls across competing sessions, and exposed the process to OOM terminations on memory-constrained servers.
+In high-throughput, multi-session network relays, session ring buffers ([`session.Ring`](../../internal/session/ringbuf.go)) are typically backed by RAM slices. In `remote-relay`, buffer memory was previously bounded by a per-session cap (default 64 MiB) and a global process-wide budget ([`session.Budget`](../../internal/session/budget.go), default 512 MiB). During prolonged carrier disconnections (e.g. 5–10 minutes) under massive bulk transfers (gigabytes of file copies, database dumps, or VM image syncs), RAM buffers fill to capacity rapidly. This forced upstream reads to pause, risked stalls across competing sessions, and exposed the process to OOM terminations on memory-constrained servers.
 
 **FEAT-ROB-04** solves this by implementing **Tiered Disk-Spill Storage for Ring Buffers**. The ring buffer is architected into a hybrid tiered memory hierarchy:
 - **Tier 1 (L1 RAM Buffer)**: Low-latency in-memory circular slice bounded by `L1Cap` (default 8 MiB) and global RAM budget.
@@ -10,7 +10,7 @@ In high-throughput, multi-session network relays, session ring buffers ([`sessio
 - **Dynamic Spill Triggering**: Spills oldest RAM blocks to disk when unacknowledged bytes exceed `L1Cap` OR when the global memory `Budget` is exhausted. Spilling releases RAM budget immediately back to the global pool.
 - **Zero-Copy Resumption Streaming**: On `RESUME`, reads stream sequentially from the spill file with single-block caching without reloading backlogs into RAM.
 - **Block Reclamation & Truncation**: Reclaims disk space on-the-fly using `fallocate(FALLOC_FL_PUNCH_HOLE)` as ACKs advance, resetting files to 0 bytes when fully drained.
-- **Hot Restart Preservation**: Full compatibility with zero-downtime hot restart ([FEAT-ROB-02](.feat-impl/FEAT-ROB-02.md)) snapshotting and restore.
+- **Hot Restart Preservation**: Full compatibility with zero-downtime hot restart ([FEAT-ROB-02](FEAT-ROB-02.md)) snapshotting and restore.
 
 ---
 
@@ -91,13 +91,13 @@ no_spill = false                   # Explicitly disable disk spilling (pure RAM 
 
 | Test Case | Package | Location | Verification Focus | Status |
 |:---|:---|:---|:---|:---:|
-| `TestSpillFile_WriteRead` | `session` | [`spill_test.go`](file:///root/remote-relay/internal/session/spill_test.go#L16) | AES-256-GCM block encryption/decryption, padding & read cache | **PASS** |
-| `TestSpillFile_HolePunchAndReset` | `session` | [`spill_test.go`](file:///root/remote-relay/internal/session/spill_test.go#L60) | `fallocate` hole punching, truncation & block counter reset | **PASS** |
-| `TestTieredRing_BasicSpillAndResume` | `session` | [`spill_test.go`](file:///root/remote-relay/internal/session/spill_test.go#L94) | Dual-tier append, L1 threshold overflow & sequential read back | **PASS** |
-| `TestTieredRing_BudgetRelief` | `session` | [`spill_test.go`](file:///root/remote-relay/internal/session/spill_test.go#L137) | Global RAM budget relief under memory pressure | **PASS** |
-| `TestTieredRing_SliceStraddle` | `session` | [`spill_test.go`](file:///root/remote-relay/internal/session/spill_test.go#L187) | `Slice` reads seamlessly spanning disk Zone 1 and RAM Zone 2 | **PASS** |
-| `TestTieredRing_SnapshotRestoreWithSpill` | `session` | [`spill_test.go`](file:///root/remote-relay/internal/session/spill_test.go#L233) | Hot-restart snapshot and restore spanning disk and RAM | **PASS** |
-| `TestRelayTieredSpillResume` | `relay` | [`spill_test.go`](file:///root/remote-relay/internal/relay/spill_test.go#L19) | End-to-end carrier disconnection under 512 KiB load with 128 KiB L1 | **PASS** |
-| `TestRelaySpillCLIAndConfigFlags` | `relay` | [`spill_test.go`](file:///root/remote-relay/internal/relay/spill_test.go#L145) | CLI flag parsing and TOML overrides for spill options | **PASS** |
-| `TestRelayTieredSpillDirect` | `relay` | [`spill_test.go`](file:///root/remote-relay/internal/relay/spill_test.go#L207) | Live tiered ring spill state verification and hole punch drain | **PASS** |
+| `TestSpillFile_WriteRead` | `session` | [`spill_test.go`](../../internal/session/spill_test.go#L16) | AES-256-GCM block encryption/decryption, padding & read cache | **PASS** |
+| `TestSpillFile_HolePunchAndReset` | `session` | [`spill_test.go`](../../internal/session/spill_test.go#L60) | `fallocate` hole punching, truncation & block counter reset | **PASS** |
+| `TestTieredRing_BasicSpillAndResume` | `session` | [`spill_test.go`](../../internal/session/spill_test.go#L94) | Dual-tier append, L1 threshold overflow & sequential read back | **PASS** |
+| `TestTieredRing_BudgetRelief` | `session` | [`spill_test.go`](../../internal/session/spill_test.go#L137) | Global RAM budget relief under memory pressure | **PASS** |
+| `TestTieredRing_SliceStraddle` | `session` | [`spill_test.go`](../../internal/session/spill_test.go#L187) | `Slice` reads seamlessly spanning disk Zone 1 and RAM Zone 2 | **PASS** |
+| `TestTieredRing_SnapshotRestoreWithSpill` | `session` | [`spill_test.go`](../../internal/session/spill_test.go#L233) | Hot-restart snapshot and restore spanning disk and RAM | **PASS** |
+| `TestRelayTieredSpillResume` | `relay` | [`spill_test.go`](../../internal/relay/spill_test.go#L19) | End-to-end carrier disconnection under 512 KiB load with 128 KiB L1 | **PASS** |
+| `TestRelaySpillCLIAndConfigFlags` | `relay` | [`spill_test.go`](../../internal/relay/spill_test.go#L145) | CLI flag parsing and TOML overrides for spill options | **PASS** |
+| `TestRelayTieredSpillDirect` | `relay` | [`spill_test.go`](../../internal/relay/spill_test.go#L207) | Live tiered ring spill state verification and hole punch drain | **PASS** |
 | `Full Suite Race Verification` | `all` | `go test -race ./...` | Concurrency safety across all packages with race detector | **PASS** |

@@ -2,7 +2,7 @@
 
 ## 1. Executive Summary
 
-In heterogeneous networking environments (mobile networks, enterprise VPNs, cloud VPCs, and dual-stack ISPs), IPv6 connectivity is frequently impaired by route filtering, misconfigured NAT64/DNS64 gateways, or silent packet blackholes. Currently, `remote-relay` client connection establishment in [`clientHello`](file:///root/remote-relay/internal/relay/client.go) and UDP probing in [`upgrade.go`](file:///root/remote-relay/internal/relay/upgrade.go) resolve server hostnames sequentially or use standard `net.Dial`, which attempts resolved IP addresses sequentially with long OS-level timeouts (up to 20–30 seconds).
+In heterogeneous networking environments (mobile networks, enterprise VPNs, cloud VPCs, and dual-stack ISPs), IPv6 connectivity is frequently impaired by route filtering, misconfigured NAT64/DNS64 gateways, or silent packet blackholes. Currently, `remote-relay` client connection establishment in [`clientHello`](../../internal/relay/client.go) and UDP probing in [`upgrade.go`](../../internal/relay/upgrade.go) resolve server hostnames sequentially or use standard `net.Dial`, which attempts resolved IP addresses sequentially with long OS-level timeouts (up to 20–30 seconds).
 
 Furthermore, when probing UDP endpoints for transport upgrades (QUIC and KCP), resolving a hostname via `net.ResolveUDPAddr` returns only a single IP address (whichever the OS resolver prefers). If that address family has UDP traffic dropped or blocked by middleboxes while the alternate family functions normally, UDP upgrade stalls and fails completely, forcing the client into degraded TCP transport or failing under strict UDP policies.
 
@@ -23,7 +23,7 @@ Happy Eyeballs v2 applies to all client-initiated connection paths:
 - **HA Standby Carrier (`standbyManager`)**: Concurrently maintaining standby TCP connection under `--allow-ha`.
 - **UDP Carrier Upgrade (`tryUpgrade`)**: Probing UDP server reachability before dialing QUIC or KCP.
 
-Server-to-destination backend TCP dialing in [`server.go`](file:///root/remote-relay/internal/relay/server.go) remains managed by standard `net.Dialer` with `DialTimeout`.
+Server-to-destination backend TCP dialing in [`server.go`](../../internal/relay/server.go) remains managed by standard `net.Dialer` with `DialTimeout`.
 
 ---
 

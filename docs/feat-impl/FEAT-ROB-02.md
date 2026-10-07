@@ -2,7 +2,7 @@
 
 ## 1. Executive Summary
 
-As documented in [`README.md`](../README.md) and [`relay_feedback.md`](../relay_feedback.md) §5.1, `remote-relay` session hold state and destination TCP sockets live strictly in memory inside [`Server`](../internal/relay/server.go). Prior to **FEAT-ROB-02**, if the server process restarted for software upgrades or configuration updates, all active destination sockets were closed immediately. Reconnecting clients received `ERR_UNKNOWN_SESSION`, terminating developer SSH sessions.
+As documented in [`README.md`](../../README.md) and [`relay_feedback.md`](../dev-notes/relay_feedback.md) §5.1, `remote-relay` session hold state and destination TCP sockets live strictly in memory inside [`Server`](../../internal/relay/server.go). Prior to **FEAT-ROB-02**, if the server process restarted for software upgrades or configuration updates, all active destination sockets were closed immediately. Reconnecting clients received `ERR_UNKNOWN_SESSION`, terminating developer SSH sessions.
 
 **FEAT-ROB-02** introduces:
 1. **Zero-Downtime Hot Re-Exec on `SIGUSR2`**: Seamless process handover where the parent server forks/executes the updated `relay server` binary without dropping connections.
@@ -88,8 +88,8 @@ The IPC stream transmits a JSON header followed by file descriptors passed via `
 ## 3. Implementation Breakdown
 
 ### 3.1 Session Store & Ring Buffer Snapshotting
-- [`internal/session/store.go`](../internal/session/store.go): `Snapshot()` and `Restore()` methods to serialize/deserialize session tokens and cryptographically validated key bindings.
-- [`internal/session/ringbuf.go`](../internal/session/ringbuf.go): `Snapshot()` and `RestoreRing()` to preserve unacknowledged bytes in memory and restore exact base sequence numbers without allocation spikes.
+- [`internal/session/store.go`](../../internal/session/store.go): `Snapshot()` and `Restore()` methods to serialize/deserialize session tokens and cryptographically validated key bindings.
+- [`internal/session/ringbuf.go`](../../internal/session/ringbuf.go): `Snapshot()` and `RestoreRing()` to preserve unacknowledged bytes in memory and restore exact base sequence numbers without allocation spikes.
 
 ### 3.2 Handover Engine (`internal/relay/handover.go`)
 - `SendHandoverState(w io.Writer, unixConn *net.UnixConn, state HandoverState, fds []int) error`

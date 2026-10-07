@@ -9,7 +9,7 @@ Key capabilities delivered by **FEAT-SEC-02**:
 - **Port 443 & Reverse Proxy Multiplexing**: Relay server exposes WebSocket endpoints (`listen_ws` / `websocket_path`) that can run directly on TLS port 443 or sit behind reverse proxies (Nginx, Caddy, Cloudflare, Traefik, AWS ALB) alongside existing web applications (e.g., path multiplexing `/relay-stream` and `/health`).
 - **Enterprise HTTP CONNECT Proxy Traversal**: Transparent traversal of corporate outbound HTTP/HTTPS proxies using standard environment variables (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`), including `CONNECT` tunnels with `Proxy-Authorization: Basic` support and safe buffer preservation.
 - **Reverse Proxy Header Extraction**: Automatic extraction of real client IPs from `X-Forwarded-For` and `X-Real-IP` headers so rate limiting, IP connection limits (`max_conns_per_ip`), and audit logs remain accurate behind reverse proxies.
-- **End-to-End Cryptographic Security**: Seamlessly integrates with [FEAT-SEC-01](file:///root/remote-relay/.feat-impl/FEAT-SEC-01.md) mandatory KEX handshakes, host key verification, pinned fingerprints, and session resumption over WebSocket streams.
+- **End-to-End Cryptographic Security**: Seamlessly integrates with [FEAT-SEC-01](FEAT-SEC-01.md) mandatory KEX handshakes, host key verification, pinned fingerprints, and session resumption over WebSocket streams.
 - **Full Chaining Support**: Seamlessly participates in multi-hop jumphost chains (`-J hop1?transport=ws,hop2`) allowing arbitrary hops to use WebSocket transports.
 
 ---
@@ -49,14 +49,14 @@ flowchart LR
 
 ### 2.2 WebSocket Transport Adapter (`internal/transport/websocket.go`)
 
-- **`KindWebSocket`**: Added to [`transport.Kind`](file:///root/remote-relay/internal/transport/conn.go) (`Kind.String()` returns `"ws"`).
-- **`wsConn`**: Wraps underlying `*websocket.Conn` satisfying the [`transport.Conn`](file:///root/remote-relay/internal/transport/conn.go) interface. Reads and writes binary frames via buffered I/O (`*bufio.Reader` and `*bufio.Writer`).
+- **`KindWebSocket`**: Added to [`transport.Kind`](../../internal/transport/conn.go) (`Kind.String()` returns `"ws"`).
+- **`wsConn`**: Wraps underlying `*websocket.Conn` satisfying the [`transport.Conn`](../../internal/transport/conn.go) interface. Reads and writes binary frames via buffered I/O (`*bufio.Reader` and `*bufio.Writer`).
 - **Thread Safety**: Writes in `WriteFrame` flush buffered data synchronously. `Close()` closes the underlying connection without racing concurrent frame writes.
 - **DialWebSocket**:
   - Parses `ws://`, `wss://`, `http://`, or `https://` URLs.
   - Automatically infers standard default ports (`80` for `ws`/`http`, `443` for `wss`/`https`) when ports are omitted from target URLs.
   - Resolves proxy settings via `http.ProxyURL` / `ProxyFromEnvironment`.
-  - When proxying, dials the proxy via [`DialTCPWithDelayAndBind`](file:///root/remote-relay/internal/transport/dualstack.go), performs standard HTTP `CONNECT` handshake with base64 `Proxy-Authorization` headers, extracts any buffered bytes from `bufio.Reader`, and completes the WebSocket handshake directly over the established tunnel.
+  - When proxying, dials the proxy via [`DialTCPWithDelayAndBind`](../../internal/transport/tcp.go), performs standard HTTP `CONNECT` handshake with base64 `Proxy-Authorization` headers, extracts any buffered bytes from `bufio.Reader`, and completes the WebSocket handshake directly over the established tunnel.
   - Negotiates TLS via `crypto/tls` if `wss://` or `https://` scheme is specified, supporting custom `TLSConfig` and `--tls-insecure` flag for self-signed certificates.
 
 ### 2.3 Server-Side WebSocket Listener (`internal/relay/ws_server.go`)

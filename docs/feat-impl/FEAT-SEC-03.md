@@ -3,7 +3,7 @@
 ## 1. Executive Summary
 
 Prior to **FEAT-SEC-03**, `remote-relay` had two significant operational and security limitations:
-1. **Single Global Destination Policy**: [`allow_destinations`](file:///root/remote-relay/internal/config/config.go) was a global ACL. Any authenticated key possessed full access to all allowed destinations. Enterprise multi-tenant deployments could not restrict specific keys to particular bastion hosts, microservices, or admin ports.
+1. **Single Global Destination Policy**: [`allow_destinations`](../../internal/config/config.go) was a global ACL. Any authenticated key possessed full access to all allowed destinations. Enterprise multi-tenant deployments could not restrict specific keys to particular bastion hosts, microservices, or admin ports.
 2. **Cold Restarts Required for Policy Changes**: Adding or removing authorized user keys or updating allowed destinations required restarting the server daemon, dropping all active sessions, or triggering a process handover.
 
 **FEAT-SEC-03** delivers:
@@ -127,13 +127,13 @@ Implementation and tests strictly verify both happy paths and extensive sad path
 
 ## 5. Artifacts and Modified Files
 
-- [`internal/auth/auth.go`](file:///root/remote-relay/internal/auth/auth.go): Extended `Identity` with `PortForwardingBlocked bool` and `PermittedDestinations []string`.
-- [`internal/auth/ssh.go`](file:///root/remote-relay/internal/auth/ssh.go): Implemented `AuthorizedKeyEntry`, `ParseAuthorizedKeyOptions`, `LoadAuthorizedKeyEntries`, in-memory `entries` caching, and option validation in `Verify()`.
-- [`internal/config/config.go`](file:///root/remote-relay/internal/config/config.go): Enhanced `DestinationAllowed` with wildcards (`*:port`, `127.0.0.1:*`), CIDRs (`10.0.0.0/8`), and glob patterns; added `ConfigPath` to `Server` and `LoadServer`.
-- [`internal/session/store.go`](file:///root/remote-relay/internal/session/store.go): Stored per-session RBAC attributes (`PortForwardingBlocked`, `PermittedDestinations`).
-- [`internal/relay/server.go`](file:///root/remote-relay/internal/relay/server.go): Replaced `s.cfg` with `atomic.Pointer[config.Server]`; implemented `ReloadConfig()`, `getAuth()`, `setAuth()`, destination and per-user RBAC checks in `handleHello`.
-- [`internal/relay/server_unix.go`](file:///root/remote-relay/internal/relay/server_unix.go): Registered `syscall.SIGHUP` signal handler invoking `ReloadConfig()`.
-- [`internal/relay/socks_server.go`](file:///root/remote-relay/internal/relay/socks_server.go): Integrated RBAC enforcement on multiplexed SOCKS5 streams (`handleOpen`), drained queued writes on half-close.
-- [`internal/relay/socks_client.go`](file:///root/remote-relay/internal/relay/socks_client.go): Drained queued writes on half-close; returned underlying tunnel error on accept termination.
-- [`internal/relay/chain.go`](file:///root/remote-relay/internal/relay/chain.go): Enforced per-user RBAC on chained jumphost hops.
-- [`internal/relay/rbac_test.go`](file:///root/remote-relay/internal/relay/rbac_test.go): Comprehensive integration test suite for RBAC and SIGHUP hot reload.
+- [`internal/auth/auth.go`](../../internal/auth/auth.go): Extended `Identity` with `PortForwardingBlocked bool` and `PermittedDestinations []string`.
+- [`internal/auth/ssh.go`](../../internal/auth/ssh.go): Implemented `AuthorizedKeyEntry`, `ParseAuthorizedKeyOptions`, `LoadAuthorizedKeyEntries`, in-memory `entries` caching, and option validation in `Verify()`.
+- [`internal/config/config.go`](../../internal/config/config.go): Enhanced `DestinationAllowed` with wildcards (`*:port`, `127.0.0.1:*`), CIDRs (`10.0.0.0/8`), and glob patterns; added `ConfigPath` to `Server` and `LoadServer`.
+- [`internal/session/store.go`](../../internal/session/store.go): Stored per-session RBAC attributes (`PortForwardingBlocked`, `PermittedDestinations`).
+- [`internal/relay/server.go`](../../internal/relay/server.go): Replaced `s.cfg` with `atomic.Pointer[config.Server]`; implemented `ReloadConfig()`, `getAuth()`, `setAuth()`, destination and per-user RBAC checks in `handleHello`.
+- [`internal/relay/server_unix.go`](../../internal/relay/server_unix.go): Registered `syscall.SIGHUP` signal handler invoking `ReloadConfig()`.
+- [`internal/relay/socks_server.go`](../../internal/relay/socks_server.go): Integrated RBAC enforcement on multiplexed SOCKS5 streams (`handleOpen`), drained queued writes on half-close.
+- [`internal/relay/socks_client.go`](../../internal/relay/socks_client.go): Drained queued writes on half-close; returned underlying tunnel error on accept termination.
+- [`internal/relay/chain.go`](../../internal/relay/chain.go): Enforced per-user RBAC on chained jumphost hops.
+- [`internal/relay/rbac_test.go`](../../internal/relay/rbac_test.go): Comprehensive integration test suite for RBAC and SIGHUP hot reload.

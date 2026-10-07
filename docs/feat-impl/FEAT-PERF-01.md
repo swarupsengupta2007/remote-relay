@@ -220,18 +220,18 @@ Reverse Mode (Downstream):                 2.61 Gbps (1259.9 MB)
 
 | File | Type | Description |
 |:---|:---|:---|
-| [`internal/config/config.go`](file:///root/remote-relay/internal/config/config.go) | Modified | Added `Splice` field to `Server` and `Client` structs with Linux default |
-| [`internal/config/config_test.go`](file:///root/remote-relay/internal/config/config_test.go) | Modified | Added `TestSpliceConfig` unit test |
-| [`cmd/relay/main.go`](file:///root/remote-relay/cmd/relay/main.go) | Modified | Added `--splice` and `--no-splice` CLI flags to `server` and `client` |
-| [`internal/transport/conn.go`](file:///root/remote-relay/internal/transport/conn.go) | Modified | Added `TCPConnProvider`, `FrameHeaderReader`, and `DataFrameHeaderWriter` interfaces |
-| [`internal/transport/tcp.go`](file:///root/remote-relay/internal/transport/tcp.go) | Modified | Implemented `RawTCPConn()`, `ReadFrameHeader()`, `ReadPayload()`, `WriteDataFrameHeader()` |
-| [`internal/transport/happy_test.go`](file:///root/remote-relay/internal/transport/happy_test.go) | Modified | Resolved race condition in Happy Eyeballs IPv6 wins test |
-| [`internal/relay/splice_linux.go`](file:///root/remote-relay/internal/relay/splice_linux.go) | **Added** | Linux zero-copy engine (`pipePair`, `spliceSocketToSink`, atomic counters) |
-| [`internal/relay/splice_other.go`](file:///root/remote-relay/internal/relay/splice_other.go) | **Added** | Non-Linux stubs for macOS/Windows/BSD cross-compilation |
-| [`internal/relay/pump.go`](file:///root/remote-relay/internal/relay/pump.go) | Modified | NetReader zero-copy interception, pipe pair lifecycle, atomic `tryCloseWrite` |
-| [`internal/relay/client.go`](file:///root/remote-relay/internal/relay/client.go) | Modified | Pass `rawSrc`, `rawSink`, and `splice` option to pump |
-| [`internal/relay/server.go`](file:///root/remote-relay/internal/relay/server.go) | Modified | Pass `rawSrc`, `rawSink`, and `splice` option to pump |
-| [`internal/relay/obs.go`](file:///root/remote-relay/internal/relay/obs.go) | Modified | Published `spliced_bytes_in`, `spliced_bytes_out`, `splice_calls_total` to expvar |
-| [`internal/relay/splice_test.go`](file:///root/remote-relay/internal/relay/splice_test.go) | **Added** | Unit tests for OS pipe splicing, fallback, and zero calls when disabled |
-| [`scripts/test_perf_splice.py`](file:///root/remote-relay/scripts/test_perf_splice.py) | **Added** | Automated benchmark script running iperf3 across `--splice` and `--no-splice` |
-| [`.feat-impl/FEAT-PERF-01.md`](file:///root/remote-relay/.feat-impl/FEAT-PERF-01.md) | **Added** | Technical implementation and verification document |
+| [`internal/config/config.go`](../../internal/config/config.go) | Modified | Added `Splice` field to `Server` and `Client` structs with Linux default |
+| [`internal/config/config_test.go`](../../internal/config/config_test.go) | Modified | Added `TestSpliceConfig` unit test |
+| [`cmd/relay/main.go`](../../cmd/relay/main.go) | Modified | Added `--splice` and `--no-splice` CLI flags to `server` and `client` |
+| [`internal/transport/conn.go`](../../internal/transport/conn.go) | Modified | Added `TCPConnProvider`, `FrameHeaderReader`, and `DataFrameHeaderWriter` interfaces |
+| [`internal/transport/tcp.go`](../../internal/transport/tcp.go) | Modified | Implemented `RawTCPConn()`, `ReadFrameHeader()`, `ReadPayload()`, `WriteDataFrameHeader()` |
+| [`internal/transport/happy_test.go`](../../internal/transport/happy_test.go) | Modified | Resolved race condition in Happy Eyeballs IPv6 wins test |
+| [`internal/relay/splice_linux.go`](../../internal/relay/splice_linux.go) | **Added** | Linux zero-copy engine (`pipePair`, `spliceSocketToSink`, atomic counters) |
+| [`internal/relay/splice_other.go`](../../internal/relay/splice_other.go) | **Added** | Non-Linux stubs for macOS/Windows/BSD cross-compilation |
+| [`internal/relay/pump.go`](../../internal/relay/pump.go) | Modified | NetReader zero-copy interception, pipe pair lifecycle, atomic `tryCloseWrite` |
+| [`internal/relay/client.go`](../../internal/relay/client.go) | Modified | Pass `rawSrc`, `rawSink`, and `splice` option to pump |
+| [`internal/relay/server.go`](../../internal/relay/server.go) | Modified | Pass `rawSrc`, `rawSink`, and `splice` option to pump |
+| [`internal/relay/obs.go`](../../internal/relay/obs.go) | Modified | Published `spliced_bytes_in`, `spliced_bytes_out`, `splice_calls_total` to expvar |
+| [`internal/relay/splice_test.go`](../../internal/relay/splice_test.go) | **Added** | Unit tests for OS pipe splicing, fallback, and zero calls when disabled |
+| [`scripts/test_perf_splice.py`](../../scripts/test_perf_splice.py) | **Added** | Automated benchmark script running iperf3 across `--splice` and `--no-splice` |
+| [`.feat-impl/FEAT-PERF-01.md`](FEAT-PERF-01.md) | **Added** | Technical implementation and verification document |

@@ -67,29 +67,29 @@ sequenceDiagram
 ### 3.1 Wire Protocol Additions (`internal/proto`)
 
 Four new frame types and constants were introduced:
-- `TypeAgentRegister` (`0x17`): Payload [`AgentRegister`](file:///root/remote-relay/internal/proto/messages.go) carrying target name, client nonce, default destination, destination whitelist, and authentication offer.
-- `TypeAgentRegisterOK` (`0x18`): Payload [`AgentRegisterOK`](file:///root/remote-relay/internal/proto/messages.go) acknowledging reservation.
-- `TypeAgentBind` (`0x19`): Payload [`AgentBind`](file:///root/remote-relay/internal/proto/messages.go) dispatched by server over control channel to request reverse connection.
-- `TypeAgentBindOK` (`0x1A`): Payload [`AgentBindOK`](file:///root/remote-relay/internal/proto/messages.go) confirming local service dial and data leg establishment.
+- `TypeAgentRegister` (`0x17`): Payload [`AgentRegister`](../../internal/proto/messages.go) carrying target name, client nonce, default destination, destination whitelist, and authentication offer.
+- `TypeAgentRegisterOK` (`0x18`): Payload [`AgentRegisterOK`](../../internal/proto/messages.go) acknowledging reservation.
+- `TypeAgentBind` (`0x19`): Payload [`AgentBind`](../../internal/proto/messages.go) dispatched by server over control channel to request reverse connection.
+- `TypeAgentBindOK` (`0x1A`): Payload [`AgentBindOK`](../../internal/proto/messages.go) confirming local service dial and data leg establishment.
 - `RoleAgentData = "agent-data"`: Specialized session role identifying on-demand reverse data sessions.
 - `DestTargetPrefix = "target:"`: Standardized destination prefix identifying named reverse targets.
 
 ### 3.2 RBAC & `authorized_keys` (`internal/auth`)
 
-1. **Option Parsing**: Added `permitlisten="..."` option support in [`internal/auth/ssh.go`](file:///root/remote-relay/internal/auth/ssh.go), parsing comma-separated allowed targets or wildcard `*`.
-2. **Identity Struct**: Extended [`auth.Identity`](file:///root/remote-relay/internal/auth/auth.go) and `AuthorizedKeyEntry` with `PermittedTargets []string`.
+1. **Option Parsing**: Added `permitlisten="..."` option support in [`internal/auth/ssh.go`](../../internal/auth/ssh.go), parsing comma-separated allowed targets or wildcard `*`.
+2. **Identity Struct**: Extended [`auth.Identity`](../../internal/auth/auth.go) and `AuthorizedKeyEntry` with `PermittedTargets []string`.
 3. **Verification**: `Verify()` enforces that when `PermittedTargets` is specified, an agent registering target `name` must match one of the entries or `*`.
 
 ### 3.3 Server Agent Registry & Rendezvous (`internal/relay/agent_registry.go`)
 
-- Implemented [`AgentRegistry`](file:///root/remote-relay/internal/relay/agent_registry.go) tracking registered targets, pinned Ed25519 fingerprints, raw public keys, control connections, and pending binds.
+- Implemented [`AgentRegistry`](../../internal/relay/agent_registry.go) tracking registered targets, pinned Ed25519 fingerprints, raw public keys, control connections, and pending binds.
 - **Key Pinning & Grace Period**: When an agent disconnects, `OnControlDisconnect` begins a configurable grace period (`agent_hold_timeout`, default 15s). During this window, no other key may hijack the target name. If the same key reconnects, the target reservation is transparently restored.
 - **In-Memory Pipe (`memoryPipeConn`)**: Full `net.Conn` implementation backed by bidirectional Go `io.Pipe`, implementing `SetDeadline`, `CloseWrite`, and proper EOF propagation.
 - **Thread Safety (`safeConn`)**: Synchronized frame writer wrapper protecting control connections from concurrent heartbeat, ping, pong, and bind request/response writes.
 
 ### 3.4 Reverse Relay Agent Engine (`internal/relay/agent.go`)
 
-- [`RunAgent(ctx, cfg, log)`](file:///root/remote-relay/internal/relay/agent.go): Long-running daemon loop that connects to the relay server, registers the target, handles periodic heartbeats, and spawns `handleAgentBind` on bind requests.
+- [`RunAgent(ctx, cfg, log)`](../../internal/relay/agent.go): Long-running daemon loop that connects to the relay server, registers the target, handles periodic heartbeats, and spawns `handleAgentBind` on bind requests.
 - **Policy Enforcement**: Validates destination overrides against `cfg.AllowDestinations` (`agent.DestinationAllowed(dest)`). Disallowed overrides fail-closed with error messages sent back to server.
 - **Phase Cut Handling**: Strips outer crypto layers after `HELLO_OK` and starts the internal bidirectional IO pump bridging local destinations to the relay server.
 - **Exponential Backoff**: Automatically reconnects with exponential backoff if the control channel is severed.
@@ -111,10 +111,10 @@ Four new frame types and constants were introduced:
 ## 4. Verification & Testing
 
 Unit, integration, and soak test suites verified across the codebase:
-- [`TestAgentRegistrationAndReservation`](file:///root/remote-relay/internal/relay/agent_test.go): Verified agent registration, key pinning, and rejection of different keys attempting to claim existing targets.
-- [`TestAgentPermitListenRBAC`](file:///root/remote-relay/internal/relay/agent_test.go): Verified `permitlisten` enforcement and rejection of unpermitted target registrations.
-- [`TestAgentEndToEndDataTransfer`](file:///root/remote-relay/internal/relay/agent_test.go): Verified full bidirectional data exchange through inverted tunnel from client to target echo server.
-- [`TestAgentDestinationAllowedPolicy`](file:///root/remote-relay/internal/relay/agent_test.go): Verified agent destination whitelisting and fail-closed rejection of disallowed overrides.
-- [`TestAgentControlGracePeriodAndReconnect`](file:///root/remote-relay/internal/relay/agent_test.go): Verified 15-second grace period reservation hold and reconnection of dropped control connection.
+- [`TestAgentRegistrationAndReservation`](../../internal/relay/agent_test.go): Verified agent registration, key pinning, and rejection of different keys attempting to claim existing targets.
+- [`TestAgentPermitListenRBAC`](../../internal/relay/agent_test.go): Verified `permitlisten` enforcement and rejection of unpermitted target registrations.
+- [`TestAgentEndToEndDataTransfer`](../../internal/relay/agent_test.go): Verified full bidirectional data exchange through inverted tunnel from client to target echo server.
+- [`TestAgentDestinationAllowedPolicy`](../../internal/relay/agent_test.go): Verified agent destination whitelisting and fail-closed rejection of disallowed overrides.
+- [`TestAgentControlGracePeriodAndReconnect`](../../internal/relay/agent_test.go): Verified 15-second grace period reservation hold and reconnection of dropped control connection.
 - **Race Detector**: All agent tests pass cleanly with `go test -race -count=5 ./internal/relay/...`.
 - **Full Suite**: Complete repository test suite (`go test ./...`) and `go vet ./...` pass with 0 failures and 0 warnings.

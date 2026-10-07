@@ -1,6 +1,6 @@
 # Comprehensive Codebase Audit & Gap Analysis Report
 
-**Target Document:** [`features.md`](file:///root/remote-relay/features.md)  
+**Target Document:** [`features.md`](../features.md)  
 **Codebase:** `remote-relay` (Go 1.24)  
 **Date of Audit:** October 5, 2026  
 **Status:** Audit Completed  
@@ -9,7 +9,7 @@
 
 ## 1. Executive Summary
 
-A comprehensive architectural and source code probe was conducted against the 17 core features specified in [`features.md`](file:///root/remote-relay/features.md) and their respective design documents in `.feat-impl/`. The investigation evaluated functional correctness, protocol compliance, concurrency safety, edge-case resilience, and happy/sad path execution.
+A comprehensive architectural and source code probe was conducted against the 17 core features specified in [`features.md`](../features.md) and their respective design documents in `.feat-impl/`. The investigation evaluated functional correctness, protocol compliance, concurrency safety, edge-case resilience, and happy/sad path execution.
 
 While the core streaming engine, cryptographic handshake, and protocol multiplexing architectures are well-structured and pass baseline unit tests, the probe revealed **8 critical/high-severity vulnerabilities and functional bugs**, along with multiple protocol deviations and unhandled failure paths. Most notably, these issues include:
 1. **Child server crash on hot restart** when SOCKS5, reverse agent, or jumphost sessions are active.
@@ -23,21 +23,21 @@ While the core streaming engine, cryptographic handshake, and protocol multiplex
 
 | Feature Code | Feature Name | Spec Status | Code Quality | Critical Bugs / Deviations |
 | :--- | :--- | :--- | :--- | :--- |
-| **FEAT-ROB-01** | Sub-Second BFD & Dead-Peer Detection | Implemented | Needs Fix | Silent data loss on asymmetric UDP loss ([standby.go:72-84](file:///root/remote-relay/internal/relay/standby.go#L72-L84)) |
-| **FEAT-ROB-02** | Zero-Downtime Hot Restart & SCM_RIGHTS | Implemented | Critical | Child panic on non-TCP dest ([server.go:491](file:///root/remote-relay/internal/relay/server.go#L491)); premature listener close ([server_unix.go:125](file:///root/remote-relay/internal/relay/server_unix.go#L125)) |
-| **FEAT-ROB-03** | Dual-Stack Happy Eyeballs v2 (RFC 8305) | Implemented | Needs Fix | Hardcoded probe nonce collision on multi-address families ([udpmux.go:287](file:///root/remote-relay/internal/transport/udpmux.go#L287)) |
-| **FEAT-ROB-04** | Tiered Disk-Spill Storage for Ring Buffers | Implemented | Minor | Ignored disk read errors in snapshot ([ringbuf.go:566](file:///root/remote-relay/internal/session/ringbuf.go#L566)); startup deadlock risk ([ringbuf.go:590](file:///root/remote-relay/internal/session/ringbuf.go#L590)) |
+| **FEAT-ROB-01** | Sub-Second BFD & Dead-Peer Detection | Implemented | Needs Fix | Silent data loss on asymmetric UDP loss ([standby.go:72-84](../../internal/relay/standby.go#L72-L84)) |
+| **FEAT-ROB-02** | Zero-Downtime Hot Restart & SCM_RIGHTS | Implemented | Critical | Child panic on non-TCP dest ([server.go:491](../../internal/relay/server.go#L491)); premature listener close ([server_unix.go:125](../../internal/relay/server_unix.go#L125)) |
+| **FEAT-ROB-03** | Dual-Stack Happy Eyeballs v2 (RFC 8305) | Implemented | Needs Fix | Hardcoded probe nonce collision on multi-address families ([udpmux.go:287](../../internal/transport/udpmux.go#L287)) |
+| **FEAT-ROB-04** | Tiered Disk-Spill Storage for Ring Buffers | Implemented | Minor | Ignored disk read errors in snapshot ([ringbuf.go:566](../../internal/session/ringbuf.go#L566)); startup deadlock risk ([ringbuf.go:590](../../internal/session/ringbuf.go#L590)) |
 | **FEAT-UTL-01** | Native OpenSSH Agent Integration | Implemented | Solid | Unhandled sad path for encrypted PKCS#8 keys without `.pub` sidecars |
 | **FEAT-UTL-02** | Terminal Reconnection HUD & Notifications | Implemented | Solid | Compliant OSC 9 / OSC 777 implementation; minor raw mode edge cases |
-| **FEAT-UTL-03** | SOCKS5 Dynamic Forwarding (`relay socks`) | Implemented | Needs Fix | Multiplexer HOL blocking stalls all streams for 3s under backpressure ([socks_server.go:354](file:///root/remote-relay/internal/relay/socks_server.go#L354)) |
-| **FEAT-UTL-04** | Reverse Relay & NAT Gateway Agent | Implemented | Needs Fix | Permanent hang on dead agent connection ([server.go:2467](file:///root/remote-relay/internal/relay/server.go#L2467)); clients rejected during agent hold ([agent_registry.go:160](file:///root/remote-relay/internal/relay/agent_registry.go#L160)) |
+| **FEAT-UTL-03** | SOCKS5 Dynamic Forwarding (`relay socks`) | Implemented | Needs Fix | Multiplexer HOL blocking stalls all streams for 3s under backpressure ([socks_server.go:354](../../internal/relay/socks_server.go#L354)) |
+| **FEAT-UTL-04** | Reverse Relay & NAT Gateway Agent | Implemented | Needs Fix | Permanent hang on dead agent connection ([server.go:2467](../../internal/relay/server.go#L2467)); clients rejected during agent hold ([agent_registry.go:160](../../internal/relay/agent_registry.go#L160)) |
 | **FEAT-UTL-05** | Multi-Hop Jumphost Chaining (`-J`) | Implemented | Functional | Handover state omits nested hops during hot restart |
 | **FEAT-UTL-06** | Jumphost Rendezvous to NATed Agent | Implemented | Functional | Verified end-to-end rendezvous across intermediate proxies |
 | **FEAT-SEC-01** | Encrypted Control Plane (AEAD X25519) | Implemented | Solid | ChaCha20-Poly1305 with monotonic sequence numbers; clean phase-cut |
-| **FEAT-SEC-02** | WebSocket / HTTPS Port 443 Fallback | Implemented | Security Vuln | Unvalidated `X-Forwarded-For` allows IP spoofing and rate limit bypass ([websocket.go:404](file:///root/remote-relay/internal/transport/websocket.go#L404)) |
-| **FEAT-SEC-03** | Per-User RBAC & Live SIGHUP Reload | Implemented | Needs Fix | SIGHUP reload wipes CLI flag overrides ([main.go:154](file:///root/remote-relay/cmd/relay/main.go#L154), [server.go:170](file:///root/remote-relay/internal/relay/server.go#L170)) |
-| **FEAT-PERF-01**| Linux Kernel Zero-Copy Stream Splicing | Implemented | Critical | Retain pipe FD leak & use-after-free via GC finalizers on `os.NewFile` ([splice_linux.go:273](file:///root/remote-relay/internal/relay/splice_linux.go#L273)) |
-| **FEAT-PERF-02**| Adaptive KCP Dynamic ARQ Tuning | Implemented | Needs Fix | Process-global SNMP counter bleed corrupts tuning across concurrent sessions ([kcp_adaptive.go:93](file:///root/remote-relay/internal/transport/kcp_adaptive.go#L93)) |
+| **FEAT-SEC-02** | WebSocket / HTTPS Port 443 Fallback | Implemented | Security Vuln | Unvalidated `X-Forwarded-For` allows IP spoofing and rate limit bypass ([websocket.go:404](../../internal/transport/websocket.go#L404)) |
+| **FEAT-SEC-03** | Per-User RBAC & Live SIGHUP Reload | Implemented | Needs Fix | SIGHUP reload wipes CLI flag overrides ([main.go:154](../../cmd/relay/main.go#L154), [server.go:170](../../internal/relay/server.go#L170)) |
+| **FEAT-PERF-01**| Linux Kernel Zero-Copy Stream Splicing | Implemented | Critical | Retain pipe FD leak & use-after-free via GC finalizers on `os.NewFile` ([splice_linux.go:273](../../internal/relay/splice_linux.go#L273)) |
+| **FEAT-PERF-02**| Adaptive KCP Dynamic ARQ Tuning | Implemented | Needs Fix | Process-global SNMP counter bleed corrupts tuning across concurrent sessions ([kcp_adaptive.go:93](../../internal/transport/kcp_adaptive.go#L93)) |
 | **FEAT-PERF-03**| Fast 3-RTT Token Resumption | Implemented | Solid | 3-RTT fast path cleanly operational; fallback to challenge verified |
 | **FEAT-OBS-01** | Prometheus Metrics, Tracing & TUI | Implemented | Deviation | `relay_bytes_transferred_total` never incremented (TUI displays 0 B); missing `Upgrade` tracing span |
 
@@ -48,9 +48,9 @@ While the core streaming engine, cryptographic handshake, and protocol multiplex
 ### BUG-01: Child Server Panic on Hot Restart for Non-TCP Sessions
 - **Severity:** P0 (Fatal Crash / Service Interruption)
 - **Affected Files:**
-  - [`internal/relay/server.go:490-538`](file:///root/remote-relay/internal/relay/server.go#L490-L538)
-  - [`internal/relay/pump.go:610`](file:///root/remote-relay/internal/relay/pump.go#L610)
-  - [`internal/relay/handover.go:12-24`](file:///root/remote-relay/internal/relay/handover.go#L12-L24)
+  - [`internal/relay/server.go:490-538`](../../internal/relay/server.go#L490-L538)
+  - [`internal/relay/pump.go:610`](../../internal/relay/pump.go#L610)
+  - [`internal/relay/handover.go:12-24`](../../internal/relay/handover.go#L12-L24)
 - **Root Cause:**
   When `HotRestart()` executes on the parent server, it iterates through all live sessions. For direct TCP sessions, it duplicates the destination TCP socket descriptor. However, for SOCKS5 proxy sessions, reverse NAT agent sessions, or Jumphost chained hops, `l.dest` is `nil` (since data is bridged via in-memory pipes or virtual stream muxes). The handover payload marks `HasDestFD = false`.
   During state adoption in the newly spawned child process (`s.adoptHandover()`), if `hSess.HasDestFD` is false, `dtcp` remains `nil`. The child server proceeds to initialize `newPump` with:
@@ -78,9 +78,9 @@ While the core streaming engine, cryptographic handshake, and protocol multiplex
 ### BUG-02: File Descriptor Corruption & Use-After-Free in Linux Splice Retain
 - **Severity:** P0 (Resource Corruption / Silent Data Failure)
 - **Affected Files:**
-  - [`internal/relay/splice_linux.go:261-279`](file:///root/remote-relay/internal/relay/splice_linux.go#L261-L279)
+  - [`internal/relay/splice_linux.go:261-279`](../../internal/relay/splice_linux.go#L261-L279)
 - **Root Cause:**
-  In [`spliceSrcToSocket()`](file:///root/remote-relay/internal/relay/splice_linux.go#L261), when data is teed to `pRetain` so it can be stored into the in-memory ring buffer, line 273 executes:
+  In [`spliceSrcToSocket()`](../../internal/relay/splice_linux.go#L261), when data is teed to `pRetain` so it can be stored into the in-memory ring buffer, line 273 executes:
   ```go
   if _, rErr := io.ReadFull(os.NewFile(uintptr(rrfd), "retain"), buf); rErr == nil {
       retained = buf
@@ -110,10 +110,10 @@ While the core streaming engine, cryptographic handshake, and protocol multiplex
 ### BUG-03: Silent Data Loss & Sequence Gap on Asymmetric UDP BFD Failure
 - **Severity:** P1 (Data Loss / Connection Desynchronization)
 - **Affected Files:**
-  - [`internal/relay/standby.go:72-84`](file:///root/remote-relay/internal/relay/standby.go#L72-L84)
-  - [`internal/relay/server.go:1694-1702`](file:///root/remote-relay/internal/relay/server.go#L1694-L1702)
+  - [`internal/relay/standby.go:72-84`](../../internal/relay/standby.go#L72-L84)
+  - [`internal/relay/server.go:1694-1702`](../../internal/relay/server.go#L1694-L1702)
 - **Root Cause:**
-  In [`clientStandby`](file:///root/remote-relay/internal/relay/standby.go#L72), the reader loop on the standby TCP connection discards every frame that is not a BFD ping:
+  In [`clientStandby`](../../internal/relay/standby.go#L72), the reader loop on the standby TCP connection discards every frame that is not a BFD ping:
   ```go
   f, err := conn.ReadFrame()
   if err != nil {
@@ -130,19 +130,19 @@ While the core streaming engine, cryptographic handshake, and protocol multiplex
   ```
   In real network topologies, UDP packet drops are often asymmetric (e.g., client-to-server UDP works, but server-to-client UDP is blocked by a stateful NAT table timeout). When the server's BFD timer expires first, the server instantly promotes the standby TCP carrier and begins streaming downstream DATA and ACK frames over TCP.
   The client's UDP timer has not yet expired (up to 2.25s). Meanwhile, the client's standby loop **silently drops all incoming DATA frames** received over TCP. When the client finally switches, these frames are gone forever, resulting in unrecoverable `ERR_OFFSET_GAP`.
-  In contrast, the server side correctly handles this in [`server.go:1694-1701`](file:///root/remote-relay/internal/relay/server.go#L1694-L1701) by prefetching non-ping frames and promoting immediately.
+  In contrast, the server side correctly handles this in [`server.go:1694-1701`](../../internal/relay/server.go#L1694-L1701) by prefetching non-ping frames and promoting immediately.
 - **Impact:**
   Silent loss of downstream data bytes during carrier failover, leading to protocol desynchronization and broken sessions.
 - **Fix Required:**
-  Mirror the server's logic inside [`clientStandby`](file:///root/remote-relay/internal/relay/standby.go): when any non-ping frame is received on the standby connection, prefetch it into a buffered slice, cancel the active carrier context immediately, and promote the standby carrier to active.
+  Mirror the server's logic inside [`clientStandby`](../../internal/relay/standby.go): when any non-ping frame is received on the standby connection, prefetch it into a buffered slice, cancel the active carrier context immediately, and promote the standby carrier to active.
 
 ---
 
 ### BUG-04: UDP Probe Nonce Collision on Multi-Address Endpoints
 - **Severity:** P1 (Probe Failure / Transport Selection Degradation)
 - **Affected Files:**
-  - [`internal/transport/udpmux.go:287-289`](file:///root/remote-relay/internal/transport/udpmux.go#L287-L289)
-  - [`internal/transport/udpmux.go:232-267`](file:///root/remote-relay/internal/transport/udpmux.go#L232-L267)
+  - [`internal/transport/udpmux.go:287-289`](../../internal/transport/udpmux.go#L287-L289)
+  - [`internal/transport/udpmux.go:232-267`](../../internal/transport/udpmux.go#L232-L267)
 - **Root Cause:**
   In `internal/transport/udpmux.go`:
   ```go
@@ -169,8 +169,8 @@ While the core streaming engine, cryptographic handshake, and protocol multiplex
 ### BUG-05: SOCKS5 Head-of-Line Blocking Freezes All Multiplexed Streams
 - **Severity:** P1 (Performance Bottleneck / Cascading Stall)
 - **Affected Files:**
-  - [`internal/relay/socks_server.go:346-364`](file:///root/remote-relay/internal/relay/socks_server.go#L346-L364)
-  - [`internal/relay/socks_server.go:107-124`](file:///root/remote-relay/internal/relay/socks_server.go#L107-L124)
+  - [`internal/relay/socks_server.go:346-364`](../../internal/relay/socks_server.go#L346-L364)
+  - [`internal/relay/socks_server.go:107-124`](../../internal/relay/socks_server.go#L107-L124)
 - **Root Cause:**
   `socksServerMux.run()` runs a single sequential loop reading multiplexer frames from the client (`socks5.ReadMuxFrame(smux.toMuxR)`). When a `TypeStreamData` frame arrives, it synchronously calls `handleData(streamID, payload)`.
   Inside `handleData()`:
@@ -199,7 +199,7 @@ While the core streaming engine, cryptographic handshake, and protocol multiplex
 ### BUG-06: Unchecked `X-Forwarded-For` Client IP Spoofing in WebSocket Transport
 - **Severity:** P1 (Security Vulnerability / ACL Bypass)
 - **Affected Files:**
-  - [`internal/transport/websocket.go:404-415`](file:///root/remote-relay/internal/transport/websocket.go#L404-L415)
+  - [`internal/transport/websocket.go:404-415`](../../internal/transport/websocket.go#L404-L415)
 - **Root Cause:**
   `ExtractClientIP()` parses incoming HTTP requests for reverse proxy compatibility:
   ```go
@@ -225,9 +225,9 @@ While the core streaming engine, cryptographic handshake, and protocol multiplex
 ### BUG-07: Unbounded Agent Control Connection Leak on Silent Network Drops
 - **Severity:** P1 (Availability / Connection Hanging)
 - **Affected Files:**
-  - [`internal/relay/server.go:2454-2472`](file:///root/remote-relay/internal/relay/server.go#L2454-L2472)
+  - [`internal/relay/server.go:2454-2472`](../../internal/relay/server.go#L2454-L2472)
 - **Root Cause:**
-  In [`runAgentControlLoop()`](file:///root/remote-relay/internal/relay/server.go#L2454), the server loops reading frames from an agent's control connection:
+  In [`runAgentControlLoop()`](../../internal/relay/server.go#L2454), the server loops reading frames from an agent's control connection:
   ```go
   f, err := conn.ReadFrame()
   if err != nil {
@@ -246,9 +246,9 @@ While the core streaming engine, cryptographic handshake, and protocol multiplex
 ### BUG-08: Zero Throughput Metrics in `relay top` Dashboard
 - **Severity:** P2 (Observability Failure)
 - **Affected Files:**
-  - [`internal/obs/metrics.go:458, 499`](file:///root/remote-relay/internal/obs/metrics.go#L458-L499)
-  - [`internal/relay/pump.go`](file:///root/remote-relay/internal/relay/pump.go)
-  - [`internal/relay/splice_linux.go`](file:///root/remote-relay/internal/relay/splice_linux.go)
+  - [`internal/obs/metrics.go:458, 499`](../../internal/obs/metrics.go#L458-L499)
+  - [`internal/relay/pump.go`](../../internal/relay/pump.go)
+  - [`internal/relay/splice_linux.go`](../../internal/relay/splice_linux.go)
 - **Root Cause:**
   `relay_bytes_transferred_total` (`BytesTransferred` counter vector) is declared in `internal/obs/metrics.go` with labels `direction` (`up`/`down`) and `transport` (`tcp`/`quic`/`ws`).
   However, **nowhere in the entire relay data pipeline** (`pump.go`, `splice_linux.go`, `server.go`, or `client.go`) is `BytesTransferred.WithLabelValues(...).Add(n)` ever called. The only references to this metric exist in mock test assertions.
@@ -272,8 +272,8 @@ While the core streaming engine, cryptographic handshake, and protocol multiplex
   - Negotiable interval down to 250ms with 3-miss detection threshold (750ms failover).
   - Standby TCP connection maintained with zero data until failover.
 - **Implementation:**
-  - Package: [`internal/bfd`](file:///root/remote-relay/internal/bfd) implements RFC 5880 packet encoding and state machine.
-  - Relay glue: [`internal/relay/standby.go`](file:///root/remote-relay/internal/relay/standby.go) and [`internal/relay/server.go:1670-1740`](file:///root/remote-relay/internal/relay/server.go#L1670-L1740).
+  - Package: [`internal/bfd`](../../internal/bfd) implements RFC 5880 packet encoding and state machine.
+  - Relay glue: [`internal/relay/standby.go`](../../internal/relay/standby.go) and [`internal/relay/server.go:1670-1740`](../../internal/relay/server.go#L1670-L1740).
 - **Happy Path:**
   Client establishes UDP primary and TCP standby. Both exchange BFD packets with configured `TxInterval` (default 250ms). When primary carrier is healthy, zero application data passes over TCP.
 - **Sad Paths & Edge Cases:**
@@ -289,13 +289,13 @@ While the core streaming engine, cryptographic handshake, and protocol multiplex
   - Active TCP/UDP listening sockets and client destination FDs passed via Unix domain socket using `SCM_RIGHTS`.
   - In-flight ring buffers and session tokens transferred to child process without dropping connections.
 - **Implementation:**
-  - Modules: [`internal/relay/server_unix.go`](file:///root/remote-relay/internal/relay/server_unix.go), [`internal/relay/handover.go`](file:///root/remote-relay/internal/relay/handover.go).
+  - Modules: [`internal/relay/server_unix.go`](../../internal/relay/server_unix.go), [`internal/relay/handover.go`](../../internal/relay/handover.go).
 - **Happy Path:**
   Operator sends `kill -SIGUSR2 <pid>`. Parent serializes `HandoverState`, opens Unix socket, spawns child with `RELAY_HANDOVER_SOCK`. Child adopts listeners and destination FDs, sends ACK, parent exits cleanly.
 - **Sad Paths & Edge Cases:**
   - *Child Panic on Non-TCP Dest (Critical Bug):* Addressed in [BUG-01](#bug-01-child-server-panic-on-hot-restart-for-non-tcp-sessions).
-  - *Premature Listener Close (Unhandled Sad Path):* In [`server_unix.go:125-129`](file:///root/remote-relay/internal/relay/server_unix.go#L125-L129), parent closes listeners and drops client carriers **before** child process acknowledges adoption. If child initialization fails, all listening sockets are terminated.
-  - *RestoreTieredRing Deadlock Risk:* In [`internal/session/ringbuf.go:590`](file:///root/remote-relay/internal/session/ringbuf.go#L590), `RestoreTieredRing` calls `r.Append(context.Background(), data)`, which invokes `budget.Wait()`. If budget is full, the server blocks indefinitely during boot.
+  - *Premature Listener Close (Unhandled Sad Path):* In [`server_unix.go:125-129`](../../internal/relay/server_unix.go#L125-L129), parent closes listeners and drops client carriers **before** child process acknowledges adoption. If child initialization fails, all listening sockets are terminated.
+  - *RestoreTieredRing Deadlock Risk:* In [`internal/session/ringbuf.go:590`](../../internal/session/ringbuf.go#L590), `RestoreTieredRing` calls `r.Append(context.Background(), data)`, which invokes `budget.Wait()`. If budget is full, the server blocks indefinitely during boot.
 
 ---
 
@@ -305,7 +305,7 @@ While the core streaming engine, cryptographic handshake, and protocol multiplex
   - Staggered connection attempts with configurable `resolution_delay` (default 250ms).
   - Fast UDP probe racing across address families.
 - **Implementation:**
-  - Transport logic: [`internal/transport/happy_eyeballs.go`](file:///root/remote-relay/internal/transport/happy_eyeballs.go), [`internal/transport/udpmux.go`](file:///root/remote-relay/internal/transport/udpmux.go).
+  - Transport logic: [`internal/transport/happy.go`](../../internal/transport/happy.go), [`internal/transport/udpmux.go`](../../internal/transport/udpmux.go).
 - **Happy Path:**
   Client resolves hostname to dual-stack IPs. IPv6 connection starts immediately; IPv4 waits 250ms. Whichever completes handshake first becomes the active carrier; the other is canceled.
 - **Sad Paths & Edge Cases:**
@@ -321,11 +321,11 @@ While the core streaming engine, cryptographic handshake, and protocol multiplex
   - Automatic hole-punching via `fallocate(FALLOC_FL_PUNCH_HOLE)` to reclaim space upon ACK.
   - Enforced memory budgets per session.
 - **Implementation:**
-  - Ring buffer: [`internal/session/ringbuf.go`](file:///root/remote-relay/internal/session/ringbuf.go), [`internal/session/spill.go`](file:///root/remote-relay/internal/session/spill.go).
+  - Ring buffer: [`internal/session/ringbuf.go`](../../internal/session/ringbuf.go), [`internal/session/spill.go`](../../internal/session/spill.go).
 - **Happy Path:**
   Bursty incoming data exceeding `spill_l1_bytes` spills to encrypted temporary files in `spill_dir`. As peer ACKs advance, `PunchHole` frees filesystem blocks.
 - **Sad Paths & Edge Cases:**
-  - *Silent Corrupted Snapshot (Bug):* In [`ringbuf.go:566`](file:///root/remote-relay/internal/session/ringbuf.go#L566), `r.spill.ReadAt` errors are discarded (`_, _ = r.spill.ReadAt(...)`). On disk read failure, snapshot returns zeroed bytes without notifying the caller.
+  - *Silent Corrupted Snapshot (Bug):* In [`ringbuf.go:566`](../../internal/session/ringbuf.go#L566), `r.spill.ReadAt` errors are discarded (`_, _ = r.spill.ReadAt(...)`). On disk read failure, snapshot returns zeroed bytes without notifying the caller.
   - *ENOSPC on Disk Spill:* If disk is full, `spillOneBlockLocked` returns an error, which causes `pump.srcReader` to terminate the session instead of exerting backpressure on the sender.
 
 ---
@@ -336,7 +336,7 @@ While the core streaming engine, cryptographic handshake, and protocol multiplex
   - Support passphrase-protected keys loaded in agent without disk private keys.
   - Key matching and fallback order: explicit identities -> agent keys -> default disk files.
 - **Implementation:**
-  - Auth module: [`internal/auth/ssh.go:290-410`](file:///root/remote-relay/internal/auth/ssh.go#L290-L410).
+  - Auth module: [`internal/auth/ssh.go:290-410`](../../internal/auth/ssh.go#L290-L410).
 - **Happy Path:**
   Client detects `SSH_AUTH_SOCK`, queries available signers, extracts public keys, and signs server authentication challenges seamlessly.
 - **Sad Paths & Edge Cases:**
@@ -349,7 +349,7 @@ While the core streaming engine, cryptographic handshake, and protocol multiplex
   - Single-line status updates on stderr using `\r` during disconnection.
   - Desktop notifications via terminal OSC escape sequences (OSC 9 for iTerm2/WezTerm, OSC 777 for Ghostty/Alacritty) for disruptions exceeding `NotificationTimeout` (default 5s).
 - **Implementation:**
-  - Module: [`internal/relay/hud.go`](file:///root/remote-relay/internal/relay/hud.go).
+  - Module: [`internal/relay/hud.go`](../../internal/relay/hud.go).
 - **Happy Path:**
   On carrier drop, HUD displays retry counter and elapsed time on stderr. When connection is restored, HUD clears or prints success summary. If downtime exceeds 5s, OSC 9/777 notifications are dispatched.
 - **Sad Paths & Edge Cases:**
@@ -364,8 +364,8 @@ While the core streaming engine, cryptographic handshake, and protocol multiplex
   - Multiplexes multiple TCP streams over a single relay tunnel session.
   - Server enforces per-user RBAC and destination ACLs.
 - **Implementation:**
-  - Client side: [`internal/relay/socks_client.go`](file:///root/remote-relay/internal/relay/socks_client.go).
-  - Server side: [`internal/relay/socks_server.go`](file:///root/remote-relay/internal/relay/socks_server.go).
+  - Client side: [`internal/relay/socks_client.go`](../../internal/relay/socks_client.go).
+  - Server side: [`internal/relay/socks_server.go`](../../internal/relay/socks_server.go).
 - **Happy Path:**
   Browser connects to `127.0.0.1:1080`, issues SOCKS5 CONNECT request. Server validates destination ruleset, dials target, streams frames bidirectional.
 - **Sad Paths & Edge Cases:**
@@ -380,12 +380,12 @@ While the core streaming engine, cryptographic handshake, and protocol multiplex
   - Server holds agent registration during brief disconnects (`agent_hold_timeout`, default 15s).
   - Clients connect to named targets without knowing agent IP.
 - **Implementation:**
-  - Modules: [`internal/relay/agent_registry.go`](file:///root/remote-relay/internal/relay/agent_registry.go), [`internal/relay/server.go:2454-2485`](file:///root/remote-relay/internal/relay/server.go#L2454-L2485).
+  - Modules: [`internal/relay/agent_registry.go`](../../internal/relay/agent_registry.go), [`internal/relay/server.go:2454-2485`](../../internal/relay/server.go#L2454-L2485).
 - **Happy Path:**
   Agent registers with `AgentRegister`. Client dials `--target homelab`. Server sends `AgentBind` to agent, agent connects to local target and opens data pipe to server, server joins streams.
 - **Sad Paths & Edge Cases:**
   - *Agent Control Loop Hang (Bug):* Addressed in [BUG-07](#bug-07-unbounded-agent-control-connection-leak-on-silent-network-drops).
-  - *Immediate Client Rejection During Hold (Bug):* In [`agent_registry.go:160`](file:///root/remote-relay/internal/relay/agent_registry.go#L160), if an agent is within its 15s hold period (`ControlConn == nil`), client requests fail immediately instead of waiting for agent reconnect.
+  - *Immediate Client Rejection During Hold (Bug):* In [`agent_registry.go:160`](../../internal/relay/agent_registry.go#L160), if an agent is within its 15s hold period (`ControlConn == nil`), client requests fail immediately instead of waiting for agent reconnect.
 
 ---
 
@@ -395,7 +395,7 @@ While the core streaming engine, cryptographic handshake, and protocol multiplex
   - Nested hop-by-hop KEX authentication with independent resume tokens.
   - Per-hop hold and reconnect resilience.
 - **Implementation:**
-  - Module: [`internal/relay/chain.go`](file:///root/remote-relay/internal/relay/chain.go).
+  - Module: [`internal/relay/chain.go`](../../internal/relay/chain.go).
 - **Happy Path:**
   Client establishes session with Hop 1, sends `CHAIN` frame containing downstream hops. Hop 1 establishes KEX with Hop 2, forwarding challenges back to client. Data streams are bridged end-to-end.
 - **Sad Paths & Edge Cases:**
@@ -408,7 +408,7 @@ While the core streaming engine, cryptographic handshake, and protocol multiplex
   - Final hop in jumphost chain can be an agent target name rather than explicit `host:port`.
   - Intermediate jumphosts route to the final relay where the agent is registered.
 - **Implementation:**
-  - Verified across [`internal/relay/chain.go`](file:///root/remote-relay/internal/relay/chain.go) and [`internal/relay/chain_target_test.go`](file:///root/remote-relay/internal/relay/chain_target_test.go).
+  - Verified across [`internal/relay/chain.go`](../../internal/relay/chain.go) and [`internal/relay/chain_target_test.go`](../../internal/relay/chain_target_test.go).
 - **Happy Path:**
   Chain terminates at destination relay holding target agent; rendezvous bind executes cleanly.
 
@@ -420,7 +420,7 @@ While the core streaming engine, cryptographic handshake, and protocol multiplex
   - ChaCha20-Poly1305 AEAD wrapping for all control frames.
   - Strict anti-replay monotonic 64-bit sequence numbers.
 - **Implementation:**
-  - Cryptography: [`internal/crypto/kex`](file:///root/remote-relay/internal/crypto/kex).
+  - Cryptography: [`internal/crypto/kex`](../../internal/crypto/kex).
 - **Happy Path:**
   KEX handshake completes in 1 RTT. Subsequent HELLO/AUTH frames are encrypted and authenticated. Option A phase cut hands off cleanly to raw data plane.
 - **Sad Paths & Edge Cases:**
@@ -435,7 +435,7 @@ While the core streaming engine, cryptographic handshake, and protocol multiplex
   - HTTP CONNECT proxy traversal with Basic auth support.
   - Reverse proxy IP extraction (`X-Forwarded-For`).
 - **Implementation:**
-  - Transport: [`internal/transport/websocket.go`](file:///root/remote-relay/internal/transport/websocket.go).
+  - Transport: [`internal/transport/websocket.go`](../../internal/transport/websocket.go).
 - **Happy Path:**
   Client dials `wss://...`, completes HTTP upgrade, frames relay messages inside binary WebSocket frames.
 - **Sad Paths & Edge Cases:**
@@ -449,12 +449,12 @@ While the core streaming engine, cryptographic handshake, and protocol multiplex
   - Atomic config reload upon `SIGHUP` without disrupting active connections.
   - CLI flag precedence over reloaded TOML values.
 - **Implementation:**
-  - Parsing: [`internal/auth/ssh.go:490-580`](file:///root/remote-relay/internal/auth/ssh.go#L490-L580).
-  - Server reload: [`internal/relay/server.go:160-220`](file:///root/remote-relay/internal/relay/server.go#L160-L220).
+  - Parsing: [`internal/auth/ssh.go:490-580`](../../internal/auth/ssh.go#L490-L580).
+  - Server reload: [`internal/relay/server.go:160-220`](../../internal/relay/server.go#L160-L220).
 - **Happy Path:**
   Admin modifies `authorized_keys` or TOML and sends `kill -HUP <pid>`. Server re-parses keys and config atomically. Active connections remain uninterrupted.
 - **Sad Paths & Edge Cases:**
-  - *CLI Override Loss (Bug):* In [`cmd/relay/main.go:154`](file:///root/remote-relay/cmd/relay/main.go#L154), `srv.SetOptions(opts)` is never invoked. On `SIGHUP`, CLI flag overrides are wiped out by TOML values.
+  - *CLI Override Loss (Bug):* In [`cmd/relay/main.go:154`](../../cmd/relay/main.go#L154), `srv.SetOptions(opts)` is never invoked. On `SIGHUP`, CLI flag overrides are wiped out by TOML values.
   - *Malformed Key Lines:* Correctly ignored without failing valid keys in the file.
 
 ---
@@ -465,7 +465,7 @@ While the core streaming engine, cryptographic handshake, and protocol multiplex
   - Ring buffer tee retention for session recovery.
   - Non-blocking netpoller integration.
 - **Implementation:**
-  - Module: [`internal/relay/splice_linux.go`](file:///root/remote-relay/internal/relay/splice_linux.go).
+  - Module: [`internal/relay/splice_linux.go`](../../internal/relay/splice_linux.go).
 - **Happy Path:**
   Data splices directly from source socket to destination socket without copying into userspace memory.
 - **Sad Paths & Edge Cases:**
@@ -479,11 +479,11 @@ While the core streaming engine, cryptographic handshake, and protocol multiplex
   - Periodic sampling of loss rate, RTT, and queue depth.
   - Dynamic ARQ parameter adjustment (`normal`, `lossy`, `degraded`).
 - **Implementation:**
-  - Controller: [`internal/transport/kcp_adaptive.go`](file:///root/remote-relay/internal/transport/kcp_adaptive.go).
+  - Controller: [`internal/transport/kcp_adaptive.go`](../../internal/transport/kcp_adaptive.go).
 - **Happy Path:**
   Clean link operates at 30ms interval. Under loss, tuner drops interval to 15ms or 10ms with aggressive resend.
 - **Sad Paths & Edge Cases:**
-  - *SNMP Counter Bleed (Bug):* In [`kcp_adaptive.go:93`](file:///root/remote-relay/internal/transport/kcp_adaptive.go#L93), `defaultSampler` reads global `kcp.DefaultSnmp` counters. Loss spikes on one client cause all sessions to degrade.
+  - *SNMP Counter Bleed (Bug):* In [`kcp_adaptive.go:93`](../../internal/transport/kcp_adaptive.go#L93), `defaultSampler` reads global `kcp.DefaultSnmp` counters. Loss spikes on one client cause all sessions to degrade.
 
 ---
 
@@ -493,7 +493,7 @@ While the core streaming engine, cryptographic handshake, and protocol multiplex
   - Bypasses public key challenge negotiation down to 3 RTT (TCP conn -> KEX -> RESUME).
   - Cryptographic fallback to challenge if token is invalid or expired.
 - **Implementation:**
-  - Logic: [`internal/relay/server.go:1335-1362`](file:///root/remote-relay/internal/relay/server.go#L1335-L1362), [`internal/relay/upgrade.go:300-360`](file:///root/remote-relay/internal/relay/upgrade.go#L300-L360).
+  - Logic: [`internal/relay/server.go:1335-1362`](../../internal/relay/server.go#L1335-L1362), [`internal/relay/upgrade.go:300-360`](../../internal/relay/upgrade.go#L300-L360).
 - **Happy Path:**
   Client connects, performs KEX, sends RESUME with token. Server verifies token, skips challenge, returns RESUME_OK. Session resumes immediately in 3 RTT.
 - **Sad Paths & Edge Cases:**
@@ -507,12 +507,12 @@ While the core streaming engine, cryptographic handshake, and protocol multiplex
   - OpenTelemetry distributed tracing with `traceparent` propagation across hops (`Handshake`, `Resume`, `Upgrade`, `ChainHop`).
   - Terminal UI dashboard (`relay top`).
 - **Implementation:**
-  - Modules: [`internal/obs`](file:///root/remote-relay/internal/obs), [`internal/tui`](file:///root/remote-relay/internal/tui).
+  - Modules: [`internal/obs`](../../internal/obs), [`internal/tui`](../../internal/tui).
 - **Happy Path:**
   Prometheus scrapes `/metrics`. `relay top` displays live terminal UI. Trace spans record latency.
 - **Sad Paths & Edge Cases:**
   - *Zero Throughput Counters (Bug):* Addressed in [BUG-08](#bug-08-zero-throughput-metrics-in-relay-top-dashboard).
-  - *Missing Upgrade Span (Deviation):* `Upgrade` span promised in spec is never started in [`upgrade.go`](file:///root/remote-relay/internal/relay/upgrade.go).
+  - *Missing Upgrade Span (Deviation):* `Upgrade` span promised in spec is never started in [`upgrade.go`](../../internal/relay/upgrade.go).
 
 ---
 
@@ -535,28 +535,28 @@ While the core streaming engine, cryptographic handshake, and protocol multiplex
 
 ### Phase 1: High Priority Stability & Security Fixes (Immediate)
 1. **Fix Hot Restart Crash (BUG-01):**
-   Update [`adoptHandover()`](file:///root/remote-relay/internal/relay/server.go#L490) to check `hSess.HasDestFD`. If false, do not invoke `newPump` with nil sockets; instead, register sessions in held state awaiting client or agent reconnection.
+   Update [`adoptHandover()`](../../internal/relay/server.go#L490) to check `hSess.HasDestFD`. If false, do not invoke `newPump` with nil sockets; instead, register sessions in held state awaiting client or agent reconnection.
 2. **Fix Splice FD Leak & Corruption (BUG-02):**
-   Replace `io.ReadFull(os.NewFile(...))` in [`splice_linux.go:273`](file:///root/remote-relay/internal/relay/splice_linux.go#L273) with direct `unix.Read` syscalls.
+   Replace `io.ReadFull(os.NewFile(...))` in [`splice_linux.go:273`](../../internal/relay/splice_linux.go#L273) with direct `unix.Read` syscalls.
 3. **Fix Asymmetric Failover Data Loss (BUG-03):**
-   Update [`clientStandby`](file:///root/remote-relay/internal/relay/standby.go#L72) to prefetch non-ping frames and trigger immediate promotion.
+   Update [`clientStandby`](../../internal/relay/standby.go#L72) to prefetch non-ping frames and trigger immediate promotion.
 4. **Fix WebSocket IP Spoofing (BUG-06):**
-   Add `TrustedProxies []string` to `config.Server` and gate `X-Forwarded-For` parsing in [`websocket.go:404`](file:///root/remote-relay/internal/transport/websocket.go#L404).
+   Add `TrustedProxies []string` to `config.Server` and gate `X-Forwarded-For` parsing in [`websocket.go:404`](../../internal/transport/websocket.go#L404).
 
 ### Phase 2: Concurrency & Protocol Resilience
 1. **Fix UDP Probe Nonce Collisions (BUG-04):**
-   Use atomic counter for probe nonces in [`udpmux.go:287`](file:///root/remote-relay/internal/transport/udpmux.go#L287).
+   Use atomic counter for probe nonces in [`udpmux.go:287`](../../internal/transport/udpmux.go#L287).
 2. **Fix SOCKS5 HOL Blocking (BUG-05):**
-   Decouple frame dispatch from stream writing in [`socks_server.go:346`](file:///root/remote-relay/internal/relay/socks_server.go#L346).
+   Decouple frame dispatch from stream writing in [`socks_server.go:346`](../../internal/relay/socks_server.go#L346).
 3. **Set Deadlines on Agent Control Loops (BUG-07):**
-   Add heartbeat verification to [`server.go:2467`](file:///root/remote-relay/internal/relay/server.go#L2467).
+   Add heartbeat verification to [`server.go:2467`](../../internal/relay/server.go#L2467).
 4. **Preserve CLI Flag Overrides on SIGHUP (FEAT-SEC-03):**
-   Call `srv.SetOptions(opts)` in [`main.go:154`](file:///root/remote-relay/cmd/relay/main.go#L154).
+   Call `srv.SetOptions(opts)` in [`main.go:154`](../../cmd/relay/main.go#L154).
 
 ### Phase 3: Telemetry, Observability & Cleanup
 1. **Wire Up Throughput Metrics (BUG-08):**
-   Add `BytesTransferred.Add()` calls in [`pump.go`](file:///root/remote-relay/internal/relay/pump.go) and [`splice_linux.go`](file:///root/remote-relay/internal/relay/splice_linux.go).
+   Add `BytesTransferred.Add()` calls in [`pump.go`](../../internal/relay/pump.go) and [`splice_linux.go`](../../internal/relay/splice_linux.go).
 2. **Add Missing Tracing Spans (FEAT-OBS-01):**
-   Instrument transport upgrade sequence with `Upgrade` span in [`upgrade.go`](file:///root/remote-relay/internal/relay/upgrade.go).
+   Instrument transport upgrade sequence with `Upgrade` span in [`upgrade.go`](../../internal/relay/upgrade.go).
 3. **Per-Session KCP Metrics (FEAT-PERF-02):**
    Provide per-session KCP metric sampler to avoid global counter bleeding.
