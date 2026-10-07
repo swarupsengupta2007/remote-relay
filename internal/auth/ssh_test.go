@@ -715,9 +715,9 @@ func TestParseAuthorizedKeyOptions(t *testing.T) {
 		},
 		{
 			name:        "comma-separated permitopen",
-			options:   []string{`permitopen="127.0.0.1:22,10.0.0.1:80,192.168.1.*:*"`},
-			wantBlock: false,
-			wantPerm:  []string{"127.0.0.1:22", "10.0.0.1:80", "192.168.1.*:*"},
+			options:     []string{`permitopen="127.0.0.1:22,10.0.0.1:80,192.168.1.*:*"`},
+			wantBlock:   false,
+			wantPerm:    []string{"127.0.0.1:22", "10.0.0.1:80", "192.168.1.*:*"},
 			wantTargets: nil,
 		},
 		{

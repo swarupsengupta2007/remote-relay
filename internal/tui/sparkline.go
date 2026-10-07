@@ -54,10 +54,10 @@ func RenderSparkline(values []float64, maxLen int) string {
 
 // RateTracker tracks moving throughput rates and sparkline history.
 type RateTracker struct {
-	mu           sync.Mutex
-	maxSamples   int
-	lastTime     time.Time
-	lastUpBytes  uint64
+	mu            sync.Mutex
+	maxSamples    int
+	lastTime      time.Time
+	lastUpBytes   uint64
 	lastDownBytes uint64
 
 	currentUpRate   float64

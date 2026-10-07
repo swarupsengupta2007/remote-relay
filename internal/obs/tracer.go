@@ -20,10 +20,10 @@ const spanContextKey contextKey = "remote-relay.span"
 
 // TraceContext represents the parsed W3C TraceContext.
 type TraceContext struct {
-	Version  string
-	TraceID  string
-	SpanID   string
-	Flags    string
+	Version string
+	TraceID string
+	SpanID  string
+	Flags   string
 }
 
 // GenerateTraceID generates a 16-byte (32 hex char) random trace ID.

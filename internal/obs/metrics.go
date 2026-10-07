@@ -451,33 +451,33 @@ type Metrics struct {
 	Registry *Registry
 
 	// Metrics specified in FEAT-OBS-01
-	ActiveSessions    *MetricVec[*Gauge]     // relay_active_sessions{transport="quic|kcp|tcp|ws"}
-	ReconnectTotal    *MetricVec[*Counter]   // relay_reconnect_total{status="success|failure"}
-	ReconnectDuration *Histogram             // relay_reconnect_duration_seconds
-	HeldDuration      *Histogram             // relay_held_duration_seconds
-	BytesTransferred  *MetricVec[*Counter]   // relay_bytes_transferred_total{direction="up|down", transport="..."}
-	BufferUtilization *Gauge                 // relay_buffer_utilization_ratio
-	HopChainDepth     *Histogram             // relay_hop_chain_depth
-	SocksStreams      *Gauge                 // relay_socks_streams_active
-	RBACRejections    *MetricVec[*Counter]   // relay_rbac_rejections_total{reason="..."}
+	ActiveSessions    *MetricVec[*Gauge]   // relay_active_sessions{transport="quic|kcp|tcp|ws"}
+	ReconnectTotal    *MetricVec[*Counter] // relay_reconnect_total{status="success|failure"}
+	ReconnectDuration *Histogram           // relay_reconnect_duration_seconds
+	HeldDuration      *Histogram           // relay_held_duration_seconds
+	BytesTransferred  *MetricVec[*Counter] // relay_bytes_transferred_total{direction="up|down", transport="..."}
+	BufferUtilization *Gauge               // relay_buffer_utilization_ratio
+	HopChainDepth     *Histogram           // relay_hop_chain_depth
+	SocksStreams      *Gauge               // relay_socks_streams_active
+	RBACRejections    *MetricVec[*Counter] // relay_rbac_rejections_total{reason="..."}
 
 	// Additional operational metrics
-	AcceptsTotal      *Counter               // relay_accepts_total
-	RefusedTotal      *Counter               // relay_refused_total
-	SplicedBytes      *MetricVec[*Counter]   // relay_spliced_bytes_total{direction="in|out"}
-	SpliceCalls       *Counter               // relay_splice_calls_total
-	KCPSegments       *MetricVec[*Counter]   // relay_kcp_segments_total{type="out|retrans|lost|snd_queue"}
-	BFDDeadPeers      *Counter               // relay_bfd_dead_peer_total
-	ProcessUptime     *Gauge                 // relay_process_uptime_seconds
-	BufferBytesUsed   *Gauge                 // relay_buffer_bytes_used
-	BufferBytesTotal  *Gauge                 // relay_buffer_bytes_total
-	HeldSessions      *Gauge                 // relay_held_sessions_active
-	StandbyConns      *Gauge                 // relay_standby_conns_active
-	ChainSessions     *Gauge                 // relay_chain_sessions_active
-	ChainHopsTotal    *Counter               // relay_chain_hops_total
-	ChainAuthRelays   *Counter               // relay_chain_auth_relays_total
-	ChainRefused      *Counter               // relay_chain_refused_total
-	ChainAttestFails  *Counter               // relay_chain_attest_failures_total
+	AcceptsTotal     *Counter             // relay_accepts_total
+	RefusedTotal     *Counter             // relay_refused_total
+	SplicedBytes     *MetricVec[*Counter] // relay_spliced_bytes_total{direction="in|out"}
+	SpliceCalls      *Counter             // relay_splice_calls_total
+	KCPSegments      *MetricVec[*Counter] // relay_kcp_segments_total{type="out|retrans|lost|snd_queue"}
+	BFDDeadPeers     *Counter             // relay_bfd_dead_peer_total
+	ProcessUptime    *Gauge               // relay_process_uptime_seconds
+	BufferBytesUsed  *Gauge               // relay_buffer_bytes_used
+	BufferBytesTotal *Gauge               // relay_buffer_bytes_total
+	HeldSessions     *Gauge               // relay_held_sessions_active
+	StandbyConns     *Gauge               // relay_standby_conns_active
+	ChainSessions    *Gauge               // relay_chain_sessions_active
+	ChainHopsTotal   *Counter             // relay_chain_hops_total
+	ChainAuthRelays  *Counter             // relay_chain_auth_relays_total
+	ChainRefused     *Counter             // relay_chain_refused_total
+	ChainAttestFails *Counter             // relay_chain_attest_failures_total
 
 	startTime time.Time
 }
@@ -502,22 +502,22 @@ func NewMetrics() *Metrics {
 		SocksStreams:      NewGauge(),
 		RBACRejections:    NewCounterVec("relay_rbac_rejections_total", "Total RBAC connection rejections by reason", []string{"reason"}),
 
-		AcceptsTotal:      NewCounter(),
-		RefusedTotal:      NewCounter(),
-		SplicedBytes:      NewCounterVec("relay_spliced_bytes_total", "Total bytes spliced via kernel splice(2)", []string{"direction"}),
-		SpliceCalls:       NewCounter(),
-		KCPSegments:       NewCounterVec("relay_kcp_segments_total", "KCP SNMP segment counters", []string{"type"}),
-		BFDDeadPeers:      NewCounter(),
-		ProcessUptime:     NewGauge(),
-		BufferBytesUsed:   NewGauge(),
-		BufferBytesTotal:  NewGauge(),
-		HeldSessions:      NewGauge(),
-		StandbyConns:      NewGauge(),
-		ChainSessions:     NewGauge(),
-		ChainHopsTotal:    NewCounter(),
-		ChainAuthRelays:   NewCounter(),
-		ChainRefused:      NewCounter(),
-		ChainAttestFails:  NewCounter(),
+		AcceptsTotal:     NewCounter(),
+		RefusedTotal:     NewCounter(),
+		SplicedBytes:     NewCounterVec("relay_spliced_bytes_total", "Total bytes spliced via kernel splice(2)", []string{"direction"}),
+		SpliceCalls:      NewCounter(),
+		KCPSegments:      NewCounterVec("relay_kcp_segments_total", "KCP SNMP segment counters", []string{"type"}),
+		BFDDeadPeers:     NewCounter(),
+		ProcessUptime:    NewGauge(),
+		BufferBytesUsed:  NewGauge(),
+		BufferBytesTotal: NewGauge(),
+		HeldSessions:     NewGauge(),
+		StandbyConns:     NewGauge(),
+		ChainSessions:    NewGauge(),
+		ChainHopsTotal:   NewCounter(),
+		ChainAuthRelays:  NewCounter(),
+		ChainRefused:     NewCounter(),
+		ChainAttestFails: NewCounter(),
 
 		startTime: time.Now(),
 	}

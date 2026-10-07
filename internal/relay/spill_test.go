@@ -260,4 +260,3 @@ func TestRelayTieredSpillDirect(t *testing.T) {
 		t.Fatalf("expected disk spill to be drained, got SpillLen = %d", r.SpillLen())
 	}
 }
-

@@ -459,4 +459,3 @@ func TestRelayWebSocket_HostKeyVerification(t *testing.T) {
 		t.Logf("Got expected host key error: %v", err)
 	}
 }
-

@@ -44,12 +44,12 @@ type Ring struct {
 	budgeted int
 	notify   chan struct{}
 
-	spill           *spillFile
-	l1Cap           int    // L1 RAM capacity threshold
-	spillDir        string // directory for spill files
-	noSpill         bool   // disable L2 disk spilling
-	spillLen        int    // unacknowledged bytes stored on disk
-	spillBaseOffset uint64 // logical stream offset of block 0 in spill file
+	spill              *spillFile
+	l1Cap              int    // L1 RAM capacity threshold
+	spillDir           string // directory for spill files
+	noSpill            bool   // disable L2 disk spilling
+	spillLen           int    // unacknowledged bytes stored on disk
+	spillBaseOffset    uint64 // logical stream offset of block 0 in spill file
 	spillBlocksWritten uint64
 }
 
