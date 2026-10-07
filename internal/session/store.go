@@ -35,11 +35,22 @@ type Session struct {
 }
 
 type Store struct {
-	mu      sync.RWMutex
-	byID    map[string]*Session
-	byHash  map[[32]byte]string
-	expired map[string]time.Time
-	max     int
+	mu        sync.RWMutex
+	byID      map[string]*Session
+	byHash    map[[32]byte]string
+	expired   map[string]time.Time
+	completed map[string]completedSession
+	max       int
+}
+
+// completedSession remembers a cleanly finished session so a client that lost
+// the final BYE can still learn the outcome when it tries to resume.
+type completedSession struct {
+	at        time.Time
+	tokenHash [32]byte
+	prevHash  [32]byte
+	hasPrev   bool
+	final     proto.Completed
 }
 
 func NewStore(max int) *Store {
@@ -47,10 +58,11 @@ func NewStore(max int) *Store {
 		max = 1024
 	}
 	return &Store{
-		byID:    make(map[string]*Session),
-		byHash:  make(map[[32]byte]string),
-		expired: make(map[string]time.Time),
-		max:     max,
+		byID:      make(map[string]*Session),
+		byHash:    make(map[[32]byte]string),
+		expired:   make(map[string]time.Time),
+		completed: make(map[string]completedSession),
+		max:       max,
 	}
 }
 
@@ -90,6 +102,7 @@ func (s *Store) Add(sess *Session) error {
 	s.byID[sess.ID] = sess
 	s.byHash[sess.TokenHash] = sess.ID
 	delete(s.expired, sess.ID)
+	delete(s.completed, sess.ID)
 	return nil
 }
 
@@ -142,6 +155,63 @@ func (s *Store) pruneExpiredLocked(now time.Time) {
 			break
 		}
 		delete(s.expired, id)
+	}
+}
+
+// Complete removes a session that finished cleanly and keeps a tombstone with
+// its final offsets, answerable only to a holder of its resume token.
+func (s *Store) Complete(id string, final proto.Completed) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if sess, ok := s.byID[id]; ok {
+		s.completed[id] = completedSession{
+			at:        time.Now(),
+			tokenHash: sess.TokenHash,
+			prevHash:  sess.PrevHash,
+			hasPrev:   sess.hasPrev,
+			final:     final,
+		}
+	}
+	s.removeLocked(id)
+	s.pruneCompletedLocked(time.Now())
+}
+
+// Completed returns the final offsets of a cleanly finished session if plain
+// is its current or previous resume token.
+func (s *Store) Completed(id, plain string) (proto.Completed, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pruneCompletedLocked(time.Now())
+	c, ok := s.completed[id]
+	if !ok {
+		return proto.Completed{}, false
+	}
+	h, ok := hashToken(plain)
+	if !ok {
+		return proto.Completed{}, false
+	}
+	cur := subtle.ConstantTimeCompare(h[:], c.tokenHash[:])
+	prev := 0
+	if c.hasPrev {
+		prev = subtle.ConstantTimeCompare(h[:], c.prevHash[:])
+	}
+	if cur|prev != 1 {
+		return proto.Completed{}, false
+	}
+	return c.final, true
+}
+
+func (s *Store) pruneCompletedLocked(now time.Time) {
+	for id, c := range s.completed {
+		if now.Sub(c.at) > tombstoneTTL {
+			delete(s.completed, id)
+		}
+	}
+	for id := range s.completed {
+		if len(s.completed) <= maxTombstones {
+			break
+		}
+		delete(s.completed, id)
 	}
 }
 
@@ -347,4 +417,5 @@ func (s *Store) Restore(sess *Session) {
 		s.byHash[sess.PrevHash] = sess.ID
 	}
 	delete(s.expired, sess.ID)
+	delete(s.completed, sess.ID)
 }

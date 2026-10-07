@@ -167,6 +167,17 @@ type SessionState struct {
 type Fail struct {
 	Code string `json:"code"`
 	Msg  string `json:"msg"`
+	// Completed is set on a RESUME_FAIL for a session the server already
+	// finished cleanly. Older clients ignore it and see the plain code.
+	Completed *Completed `json:"completed,omitempty"`
+}
+
+// Completed carries a finished session's final offsets: UpFinal is the
+// client-to-server stream length the server received, DownFinal the
+// server-to-client length the client acknowledged.
+type Completed struct {
+	UpFinal   uint64 `json:"upFinal"`
+	DownFinal uint64 `json:"downFinal"`
 }
 
 type SwitchOffset struct {

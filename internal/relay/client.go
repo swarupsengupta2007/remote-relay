@@ -328,6 +328,13 @@ func RunClient(ctx context.Context, cfg config.Client, stdin io.Reader, stdout i
 			nconn, rok, rerr := clientResume(dialCtx, pathCfg, sessionID, token, p.delivered.Load())
 			dialCancel()
 			if rerr != nil {
+				var done *proto.CompletedError
+				if errors.As(rerr, &done) && p.finishFromCompleted(done.Final) {
+					// The server finished the session; only its BYE was lost.
+					hud.Clear()
+					log.Info("session completed while reconnecting", "upFinal", done.Final.UpFinal, "downFinal", done.Final.DownFinal)
+					return nil
+				}
 				if !reconnectable(rerr) && !errors.Is(rerr, context.DeadlineExceeded) {
 					hud.OnFailed(rerr.Error(), rerr)
 					return rerr

@@ -145,7 +145,7 @@ Frame := Type uint8 | PayloadLen uint32 (big-endian) | Payload [PayloadLen]byte
 | `0x02` | `HELLO_OK` | JSON `HelloOK` | S→C |
 | `0x03` | `RESUME` | JSON `Resume` | C→S |
 | `0x04` | `RESUME_OK` | JSON `ResumeOK` | S→C |
-| `0x05` | `RESUME_FAIL` | JSON `Fail{code,msg}` | S→C |
+| `0x05` | `RESUME_FAIL` | JSON `Fail{code,msg,completed?}` | S→C |
 | `0x06` | `SWITCH` | JSON `Switch{dir,from,offset}` | both |
 | `0x07` | `BYE` | JSON `Bye{code,msg}` | both |
 | `0x08` | `ERR` | JSON `Fail{code,msg}` | both |
@@ -375,6 +375,12 @@ Outcomes:
 - `RESUME` arrives with a valid token before expiry ⇒ timer cancelled, session
   continues, `heldMs` reported for observability.
 - Token invalid / unknown session ⇒ `RESUME_FAIL{ERR_BAD_TOKEN|ERR_UNKNOWN_SESSION}`.
+- Session already finished cleanly (both directions closed and acknowledged;
+  the client lost the link before reading `BYE`) and the token matches ⇒
+  `RESUME_FAIL{ERR_UNKNOWN_SESSION, completed:{upFinal, downFinal}}`. The
+  server keeps this record for 10 minutes. A client whose sent and delivered
+  offsets equal those values exits 0; any mismatch is still an error. Older
+  clients ignore the field and see the plain code.
 - Timer expires ⇒ `CLOSED`: destination closed, buffers freed, token zeroed,
   session-count metric decremented, one log line at `info`.
 - Client that gave up (retries exhausted) ⇒ it exits non-zero; the server cleans

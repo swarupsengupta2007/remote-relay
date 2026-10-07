@@ -1377,7 +1377,9 @@ func (s *Server) handleResume(ctx context.Context, conn transport.Conn, f proto.
 	l := s.lives[msg.SessionID]
 	s.livesMu.Unlock()
 	if l == nil {
-		if s.store.IsExpired(msg.SessionID) {
+		if final, ok := s.store.Completed(msg.SessionID, msg.ResumeToken); ok {
+			writeResumeCompleted(conn, final)
+		} else if s.store.IsExpired(msg.SessionID) {
 			failResume(proto.CodeExpired, "session expired")
 		} else {
 			failResume(proto.CodeUnknownSession, "unknown session")
@@ -1462,6 +1464,10 @@ func (s *Server) handleResume(ctx context.Context, conn transport.Conn, f proto.
 	}
 
 	if err := l.Offer(req); err != nil {
+		if final, ok := l.completedFinal(); ok {
+			writeResumeCompleted(conn, final)
+			return
+		}
 		var pe *proto.Error
 		if errors.As(err, &pe) {
 			failResume(pe.Code, pe.Msg)
@@ -1580,7 +1586,25 @@ func (l *live) markDead() {
 	}
 }
 
+// completedFinal reports the final offsets if both directions closed and were
+// acknowledged, i.e. the session ended cleanly rather than expiring.
+func (l *live) completedFinal() (proto.Completed, bool) {
+	if l.pump == nil || !l.bothDrained() {
+		return proto.Completed{}, false
+	}
+	return proto.Completed{UpFinal: l.inFinal.Load(), DownFinal: l.outFinal.Load()}, true
+}
+
 func (l *live) rejectAttach(req attachReq, err error) {
+	if final, ok := l.completedFinal(); ok && !req.standby {
+		writeResumeCompleted(req.conn, final)
+		_ = req.conn.Close()
+		select {
+		case req.done <- err:
+		default:
+		}
+		return
+	}
 	code, msg := proto.CodeExpired, "session expired"
 	var pe *proto.Error
 	if errors.As(err, &pe) {
@@ -2130,9 +2154,14 @@ func (l *live) cleanup(expired bool) {
 		l.releaseChain = nil
 	}
 	l.shutdown()
-	if expired || l.store.IsExpired(l.id) {
+	final, completed := l.completedFinal()
+	switch {
+	case expired || l.store.IsExpired(l.id):
 		l.store.Expire(l.id)
-	} else {
+	case completed:
+		// The client may still resume if the link dropped before it read BYE.
+		l.store.Complete(l.id, final)
+	default:
 		l.store.Remove(l.id)
 	}
 }

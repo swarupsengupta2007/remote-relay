@@ -444,7 +444,11 @@ resumeDone:
 		if fail.Code == "" {
 			fail.Code = proto.CodeInternal
 		}
-		return none, proto.NewError(fail.Code, fail.Msg)
+		perr := proto.NewError(fail.Code, fail.Msg)
+		if fail.Completed != nil {
+			return none, &proto.CompletedError{Err: perr, Final: *fail.Completed}
+		}
+		return none, perr
 	case proto.TypeResumeOK:
 	default:
 		return none, proto.NewError(proto.CodeProto, "expected RESUME_OK, got "+reply.Type.String())

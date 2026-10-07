@@ -198,3 +198,38 @@ func TestSessionSnapshotRestore(t *testing.T) {
 		t.Fatalf("rotToken should still verify after confirm: %v", err)
 	}
 }
+
+func TestCompletedTombstone(t *testing.T) {
+	st := NewStore(8)
+	sess, token, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Add(sess); err != nil {
+		t.Fatal(err)
+	}
+	next, err := st.RotateToken(sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := proto.Completed{UpFinal: 10, DownFinal: 20}
+	st.Complete(sess.ID, want)
+	if st.Get(sess.ID) != nil {
+		t.Fatal("live after complete")
+	}
+	if st.IsExpired(sess.ID) {
+		t.Fatal("completed session reported as expired")
+	}
+	for name, tok := range map[string]string{"current": next, "previous": token} {
+		got, ok := st.Completed(sess.ID, tok)
+		if !ok || got != want {
+			t.Fatalf("%s token: got %+v %v, want %+v", name, got, ok, want)
+		}
+	}
+	if _, ok := st.Completed(sess.ID, "AAAA"); ok {
+		t.Fatal("wrong token answered")
+	}
+	if _, ok := st.Completed("s-missing", next); ok {
+		t.Fatal("unknown session answered")
+	}
+}

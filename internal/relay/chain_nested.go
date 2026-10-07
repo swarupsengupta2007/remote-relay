@@ -282,6 +282,11 @@ func (n *nestedHop) run(ctx context.Context, first transport.Conn) {
 			nconn, rok, rerr := clientResumeHook(dialCtx, n.resumeCfg, n.sessionID, token, n.pump.delivered.Load(), "", n.relayResumeChallenge)
 			cancel()
 			if rerr != nil {
+				var done *proto.CompletedError
+				if errors.As(rerr, &done) && n.pump.finishFromCompleted(done.Final) {
+					err = nil
+					break
+				}
 				if !reconnectable(rerr) && !errors.Is(rerr, context.DeadlineExceeded) {
 					err = rerr
 					break

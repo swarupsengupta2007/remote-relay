@@ -1405,6 +1405,39 @@ func writeResumeFail(conn transport.Conn, code, msg string) {
 	_ = writeFrameDeadline(conn, fr)
 }
 
+// writeResumeCompleted answers a late RESUME for a cleanly finished session.
+// The code stays ERR_UNKNOWN_SESSION so older clients behave as before.
+func writeResumeCompleted(conn transport.Conn, final proto.Completed) {
+	fr, err := proto.MarshalFrame(proto.TypeResumeFail, proto.Fail{
+		Code:      proto.CodeUnknownSession,
+		Msg:       "session completed",
+		Completed: &final,
+	})
+	if err != nil {
+		return
+	}
+	_ = writeFrameDeadline(conn, fr)
+}
+
+// finishFromCompleted ends the session cleanly if the server's record of a
+// completed session matches what this side sent and delivered.
+func (p *pump) finishFromCompleted(final proto.Completed) bool {
+	if !p.outEOF.Load() || p.outFinal.Load() != final.UpFinal {
+		return false
+	}
+	if p.delivered.Load() != final.DownFinal {
+		return false
+	}
+	if p.inGotClose.Load() && p.inFinal.Load() != final.DownFinal {
+		return false
+	}
+	p.inFinal.Store(final.DownFinal)
+	p.inGotClose.Store(true)
+	p.tryCloseWrite()
+	p.finished.Store(true)
+	return true
+}
+
 func clampChunk(n int) int {
 	const max = proto.MaxFrameLen - 8
 	if n <= 0 {

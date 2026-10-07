@@ -62,3 +62,14 @@ var (
 	ErrChainLoop    = &Error{Code: CodeChainLoop, Msg: "chain loop detected"}
 	ErrHopForbidden = &Error{Code: CodeHopForbidden, Msg: "relay hop not allowed"}
 )
+
+// CompletedError is a resume failure for a session the server finished
+// cleanly. It unwraps to the plain *Error so existing code checks still apply.
+type CompletedError struct {
+	Err   *Error
+	Final Completed
+}
+
+func (e *CompletedError) Error() string { return e.Err.Error() }
+
+func (e *CompletedError) Unwrap() error { return e.Err }
