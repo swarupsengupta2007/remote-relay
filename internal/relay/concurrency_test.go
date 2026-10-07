@@ -202,7 +202,10 @@ func TestConcurrency64SessionsLeak(t *testing.T) {
 		}
 	}
 
-	waitUntil(t, 8*time.Second, func() bool { return srv.sessionCount() == 0 })
+	// A kill can take the client's final ACK with it after the client has
+	// everything and exits. The server cannot tell, so it holds that session
+	// until hold_timeout; wait that long before calling it a leak.
+	waitUntil(t, cfg.HoldTimeout.Duration()+5*time.Second, func() bool { return srv.sessionCount() == 0 })
 	if used := srv.budgetUsed(); used != 0 {
 		t.Fatalf("buffer leak: %d", used)
 	}
