@@ -1715,6 +1715,7 @@ func (l *live) runStandby(ctx context.Context, conn transport.Conn, sess *bfd.Se
 	runCtx, runCancel := context.WithCancel(ctx)
 	defer runCancel()
 
+	gate := newStandbyGate(conn)
 	var wg sync.WaitGroup
 	var prefetchedMu sync.Mutex
 	var prefetched []proto.Frame
@@ -1724,7 +1725,7 @@ func (l *live) runStandby(ctx context.Context, conn transport.Conn, sess *bfd.Se
 	go func() {
 		defer wg.Done()
 		for {
-			f, err := conn.ReadFrame()
+			f, err := gate.readFrame()
 			if err != nil {
 				if runCtx.Err() != nil {
 					return
@@ -1804,10 +1805,9 @@ func (l *live) runStandby(ctx context.Context, conn transport.Conn, sess *bfd.Se
 	select {
 	case <-promoteCh:
 		runCancel()
-		_ = conn.SetDeadline(time.Now())
+		gate.stop()
 		wg.Wait()
-		_ = conn.SetDeadline(time.Time{})
-		conn.ResetReader()
+		gate.release()
 		l.standbyMu.Lock()
 		prefetchedMu.Lock()
 		l.standbyPrefetched = append(l.standbyPrefetched, prefetched...)

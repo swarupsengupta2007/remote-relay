@@ -54,6 +54,15 @@ type FrameHeaderReader interface {
 	Buffered() int
 }
 
+// FrameWaiter is implemented by conns that can wait for the next frame to
+// start arriving without consuming any of it. A read deadline that interrupts
+// WaitFrame loses nothing, so a reader stopped that way leaves the stream
+// aligned on a frame boundary.
+type FrameWaiter interface {
+	WaitFrame() error
+	SetReadDeadline(time.Time) error
+}
+
 // DataFrameHeaderWriter allows writing only the 13-byte TypeData frame header before splicing payload bytes.
 type DataFrameHeaderWriter interface {
 	WriteDataFrameHeader(seq uint64, dataLen int) error

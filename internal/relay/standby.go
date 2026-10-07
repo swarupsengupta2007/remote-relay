@@ -2,6 +2,7 @@ package relay
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"time"
@@ -11,6 +12,93 @@ import (
 	"github.com/remote-relay/relay/internal/proto"
 	"github.com/remote-relay/relay/internal/transport"
 )
+
+// standbyGate stops a standby reader on a frame boundary. Promotion hands the
+// conn to the pump, so a reader cut off mid-frame (or a reset that drops
+// buffered bytes the peer sent after it promoted) leaves the pump misaligned
+// and the session dies with ERR_PROTO.
+//
+// On a FrameWaiter the reader waits for the next frame without consuming it,
+// and only that wait is interrupted. Other conns fall back to interrupting
+// whatever read is in flight.
+type standbyGate struct {
+	conn    transport.Conn
+	waiter  transport.FrameWaiter
+	mu      sync.Mutex
+	stopped bool
+	inFrame bool
+}
+
+var errStandbyStopped = errors.New("standby reader stopped")
+
+func newStandbyGate(conn transport.Conn) *standbyGate {
+	g := &standbyGate{conn: conn}
+	for c := conn; c != nil; {
+		if w, ok := c.(transport.FrameWaiter); ok {
+			g.waiter = w
+			break
+		}
+		u, ok := c.(interface{ Underlying() transport.Conn })
+		if !ok {
+			break
+		}
+		c = u.Underlying()
+	}
+	return g
+}
+
+// readFrame reads the next whole frame, or returns errStandbyStopped once
+// stop has been called and no frame is in progress.
+func (g *standbyGate) readFrame() (proto.Frame, error) {
+	if g.waiter != nil {
+		g.mu.Lock()
+		stopped := g.stopped
+		g.mu.Unlock()
+		if stopped {
+			return proto.Frame{}, errStandbyStopped
+		}
+		if err := g.waiter.WaitFrame(); err != nil {
+			return proto.Frame{}, err
+		}
+		g.mu.Lock()
+		if g.stopped {
+			g.mu.Unlock()
+			return proto.Frame{}, errStandbyStopped
+		}
+		g.inFrame = true
+		g.mu.Unlock()
+		defer func() {
+			g.mu.Lock()
+			g.inFrame = false
+			g.mu.Unlock()
+		}()
+	}
+	return g.conn.ReadFrame()
+}
+
+// stop makes the reader return at the next frame boundary. A reader waiting
+// between frames is woken by a read deadline; one inside a frame finishes it.
+func (g *standbyGate) stop() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.stopped = true
+	if g.waiter == nil {
+		_ = g.conn.SetDeadline(time.Now())
+		return
+	}
+	if !g.inFrame {
+		_ = g.waiter.SetReadDeadline(time.Now())
+	}
+}
+
+// release clears the deadline stop set so the pump can use the conn.
+func (g *standbyGate) release() {
+	if g.waiter == nil {
+		_ = g.conn.SetDeadline(time.Time{})
+		return
+	}
+	_ = g.waiter.SetReadDeadline(time.Time{})
+}
 
 type clientStandby struct {
 	mu           sync.Mutex
@@ -36,11 +124,15 @@ func (s *clientStandby) promote() (transport.Conn, *bfd.Session, []proto.Frame, 
 	promotedDone := s.promotedDone
 	conn := s.conn
 	sess := s.sess
-	prefetched := append([]proto.Frame(nil), s.prefetched...)
 	s.mu.Unlock()
 
 	close(promoteCh)
 	<-promotedDone
+	// Collect after the reader has stopped: it may finish a frame it was
+	// already inside when promotion began.
+	s.mu.Lock()
+	prefetched := append([]proto.Frame(nil), s.prefetched...)
+	s.mu.Unlock()
 	return conn, sess, prefetched, true
 }
 
@@ -60,6 +152,7 @@ func startClientStandby(ctx context.Context, conn transport.Conn, sess *bfd.Sess
 		onData:       onData,
 	}
 
+	gate := newStandbyGate(conn)
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -67,7 +160,7 @@ func startClientStandby(ctx context.Context, conn transport.Conn, sess *bfd.Sess
 	go func() {
 		defer wg.Done()
 		for {
-			f, err := conn.ReadFrame()
+			f, err := gate.readFrame()
 			if err != nil {
 				runCancel()
 				return
@@ -135,10 +228,9 @@ func startClientStandby(ctx context.Context, conn transport.Conn, sess *bfd.Sess
 		select {
 		case <-promoteCh:
 			runCancel()
-			_ = conn.SetDeadline(time.Now())
+			gate.stop()
 			wg.Wait()
-			_ = conn.SetDeadline(time.Time{})
-			conn.ResetReader()
+			gate.release()
 			close(promotedDone)
 			if log != nil {
 				log.Info("client standby promoted to active carrier", "transport", conn.Kind().String())
@@ -148,10 +240,9 @@ func startClientStandby(ctx context.Context, conn transport.Conn, sess *bfd.Sess
 			select {
 			case <-promoteCh:
 				runCancel()
-				_ = conn.SetDeadline(time.Now())
+				gate.stop()
 				wg.Wait()
-				_ = conn.SetDeadline(time.Time{})
-				conn.ResetReader()
+				gate.release()
 				close(promotedDone)
 				return
 			default:

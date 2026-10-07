@@ -163,6 +163,15 @@ func (c *tcpConn) Close() error {
 	return c.raw.Close()
 }
 
+func (c *tcpConn) WaitFrame() error {
+	_, err := c.br.Peek(1)
+	return err
+}
+
+func (c *tcpConn) SetReadDeadline(t time.Time) error {
+	return c.raw.SetReadDeadline(t)
+}
+
 func (c *tcpConn) ResetReader() {
 	c.br.Reset(c.raw)
 }
@@ -172,4 +181,5 @@ var (
 	_ TCPConnProvider       = (*tcpConn)(nil)
 	_ FrameHeaderReader     = (*tcpConn)(nil)
 	_ DataFrameHeaderWriter = (*tcpConn)(nil)
+	_ FrameWaiter           = (*tcpConn)(nil)
 )

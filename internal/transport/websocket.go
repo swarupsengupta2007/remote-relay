@@ -112,6 +112,17 @@ func (c *wsConn) Close() error {
 	return err
 }
 
+func (c *wsConn) WaitFrame() error {
+	_, err := c.br.Peek(1)
+	return err
+}
+
+func (c *wsConn) SetReadDeadline(t time.Time) error {
+	return c.ws.SetReadDeadline(t)
+}
+
+var _ FrameWaiter = (*wsConn)(nil)
+
 func (c *wsConn) ResetReader() {
 	c.br.Reset(c.ws)
 }
